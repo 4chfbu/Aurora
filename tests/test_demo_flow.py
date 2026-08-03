@@ -1,0 +1,1050 @@
+import os
+from pathlib import Path
+from datetime import timedelta
+
+os.environ["AURORA_DB_URL"] = "sqlite:////tmp/aurora_test.db"
+os.environ["AURORA_ARTIFACT_DIR"] = "/tmp/aurora_test_artifacts"
+
+db_path = Path("/tmp/aurora_test.db")
+if db_path.exists():
+    db_path.unlink()
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from aurora.api import create_app  # noqa: E402
+from aurora.db import engine  # noqa: E402
+from aurora.models import Attempt, ChallengeGroup, ChallengeGroupItem, DiscoveredTarget, Fact, ImportCandidate, Intent, LLMTrace, Project, Worker, WorkerEvent, now_utc  # noqa: E402
+from aurora.services.artifact_store import ArtifactStore  # noqa: E402
+from aurora.services.browser_interaction import BrowserInteractionService  # noqa: E402
+from aurora.services.flag_validator import FlagValidator  # noqa: E402
+from aurora.services.policy import PolicyEngine  # noqa: E402
+from aurora.services.result_processor import ResultProcessor  # noqa: E402
+from aurora.services.scheduler import Scheduler  # noqa: E402
+from aurora.services.worker_runtime import CodexHarnessRuntime  # noqa: E402
+from sqlmodel import Session, select  # noqa: E402
+
+
+def test_demo_flow_creates_blackboard_and_debug_traces() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "smoke",
+                "goal": "Verify the Aurora MVP loop.",
+                "allowed_hosts": ["127.0.0.1"],
+            },
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        demo = client.post(f"/api/projects/{project_id}/run-demo")
+        assert demo.status_code == 200
+        assert demo.json()["status"] == "completed"
+
+        blackboard = client.get(f"/api/projects/{project_id}/blackboard")
+        assert blackboard.status_code == 200
+        body = blackboard.json()
+        assert len(body["facts"]) >= 1
+        assert len(body["attempts"]) == 1
+        assert len(body["artifacts"]) >= 1
+        assert len(body["checkpoints"]) == 1
+        assert body["checkpoints"][0]["source"] == "fallback"
+
+        contexts = client.get(f"/api/projects/{project_id}/debug/context-snapshots")
+        assert contexts.status_code == 200
+        assert contexts.json()[0]["estimated_tokens"] > 0
+
+        traces = client.get(f"/api/projects/{project_id}/debug/llm-traces")
+        assert traces.status_code == 200
+        assert traces.json()[0]["decision_summary"]["next_tool_plan"] == ["sandbox.exec"]
+
+        tool_traces = client.get(f"/api/projects/{project_id}/debug/tool-traces")
+        assert tool_traces.status_code == 200
+        assert tool_traces.json()[0]["tool_name"] == "sandbox.exec"
+
+        artifact_id = body["artifacts"][0]["id"]
+        artifact_content = client.get(f"/api/artifacts/{artifact_id}/content")
+        assert artifact_content.status_code == 200
+        assert "Aurora Kali-first sandbox smoke test" in artifact_content.json()["content"]
+
+
+def test_deleting_project_removes_group_items_and_resets_import_candidate() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post("/api/projects", json={"name": "delete-project", "goal": "delete", "allowed_hosts": ["127.0.0.1"]})
+        project_id = created.json()["id"]
+        with Session(engine) as session:
+            group = ChallengeGroup(name="shared")
+            candidate = ImportCandidate(batch_id="batch_delete", title="candidate", challenge_url="https://example.test/task", project_id=project_id, confirmed=True)
+            session.add_all([group, candidate])
+            session.commit()
+            session.add(ChallengeGroupItem(group_id=group.id, project_id=project_id, position=1))
+            session.commit()
+            group_id = group.id
+            candidate_id = candidate.id
+
+        deleted = client.delete(f"/api/projects/{project_id}")
+        assert deleted.status_code == 200
+        assert deleted.json()["removed_group_items"] == 1
+        assert client.get(f"/api/projects/{project_id}").status_code == 404
+        with Session(engine) as session:
+            assert session.get(ChallengeGroup, group_id) is not None
+            assert not session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project_id)).all()
+            candidate = session.get(ImportCandidate, candidate_id)
+            assert candidate is not None and candidate.project_id is None and candidate.confirmed is False
+
+
+def test_deleting_group_cascades_projects_and_removes_shared_group_items() -> None:
+    client = TestClient(create_app())
+    with client:
+        first = client.post("/api/projects", json={"name": "group-first", "goal": "delete", "allowed_hosts": ["127.0.0.1"]}).json()["id"]
+        second = client.post("/api/projects", json={"name": "group-second", "goal": "delete", "allowed_hosts": ["127.0.0.1"]}).json()["id"]
+        with Session(engine) as session:
+            primary = ChallengeGroup(name="primary")
+            secondary = ChallengeGroup(name="secondary")
+            session.add_all([primary, secondary])
+            session.commit()
+            session.add_all([
+                ChallengeGroupItem(group_id=primary.id, project_id=first, position=1),
+                ChallengeGroupItem(group_id=primary.id, project_id=second, position=2),
+                ChallengeGroupItem(group_id=secondary.id, project_id=first, position=1),
+            ])
+            session.commit()
+            primary_id, secondary_id = primary.id, secondary.id
+
+        deleted = client.delete(f"/api/challenge-groups/{primary_id}")
+        assert deleted.status_code == 200
+        assert set(deleted.json()["deleted_project_ids"]) == {first, second}
+        assert client.get(f"/api/challenge-groups/{primary_id}").status_code == 404
+        assert client.get(f"/api/projects/{first}").status_code == 404
+        assert client.get(f"/api/projects/{second}").status_code == 404
+        with Session(engine) as session:
+            assert session.get(ChallengeGroup, secondary_id) is not None
+            assert not session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == secondary_id)).all()
+
+
+def test_manual_tool_execution_enforces_authorization_scope() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "policy",
+                "goal": "Verify policy checks.",
+                "allowed_hosts": ["127.0.0.1"],
+            },
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        denied = client.post(
+            f"/api/projects/{project_id}/tools/http.request/execute",
+            json={"request": {"url": "http://169.254.169.254/latest/meta-data/"}},
+        )
+        assert denied.status_code == 200
+        assert denied.json()["success"] is False
+        assert "denied" in denied.json()["summary"]
+
+        allowed = client.post(
+            f"/api/projects/{project_id}/tools/http.request/execute",
+            json={"request": {"url": "http://127.0.0.1/", "timeout_seconds": 1}},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["trace_id"].startswith("tool_")
+
+        tool_traces = client.get(f"/api/projects/{project_id}/debug/tool-traces")
+        assert tool_traces.status_code == 200
+        decisions = [trace["policy_decision"] for trace in tool_traces.json()]
+        assert "deny" in decisions
+        assert any(decision.startswith("allow") for decision in decisions)
+
+
+def test_fofa_query_requires_a_single_authorized_scope_anchor() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "fofa-policy", "goal": "Verify FOFA authorization.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        unanchored = client.post(
+            f"/api/projects/{project_id}/tools/fofa.search/execute",
+            json={"request": {"query": 'title="nginx"'}},
+        )
+        outside_scope = client.post(
+            f"/api/projects/{project_id}/tools/fofa.search/execute",
+            json={"request": {"query": 'host="example.com"'}},
+        )
+        assert unanchored.status_code == 200
+        assert unanchored.json()["success"] is False
+        assert "must be exactly" in unanchored.json()["summary"]
+        assert outside_scope.status_code == 200
+        assert outside_scope.json()["success"] is False
+        assert "outside authorization scope" in outside_scope.json()["summary"]
+
+
+def test_project_runtime_policy_requires_global_and_project_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_SUBAGENTS_ENABLED", "true")
+    from aurora.config import get_settings
+
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    with client:
+        disabled = client.post(
+            "/api/projects",
+            json={"name": "child-off", "goal": "Check child defaults.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        enabled = client.post(
+            "/api/projects",
+            json={"name": "child-on", "goal": "Check child opt-in.", "allowed_hosts": ["127.0.0.1"], "subagents_enabled": True},
+        )
+        assert disabled.status_code == 200
+        assert enabled.status_code == 200
+        off_policy = client.get(f"/api/projects/{disabled.json()['id']}/runtime-policy")
+        on_policy = client.get(f"/api/projects/{enabled.json()['id']}/runtime-policy")
+        assert off_policy.json()["subagents_enabled"] is False
+        assert on_policy.json()["subagents_enabled"] is True
+        assert on_policy.json()["max_subagents_concurrent"] == 2
+
+
+def test_scheduler_runs_semantic_intent_tool_request() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "semantic-intent",
+                "goal": "Verify semantic intent execution.",
+                "allowed_hosts": ["127.0.0.1"],
+            },
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Request the authorized local HTTP endpoint.",
+                "capability_tags": ["http.request"],
+                "priority": 2,
+                "risk_level": "low",
+                "tool_request": {"url": "http://127.0.0.1/", "timeout_seconds": 1},
+            },
+        )
+        assert intent.status_code == 200
+        intent_id = intent.json()["id"]
+
+        result = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert result.status_code == 200
+        assert result.json()["intent_id"] == intent_id
+
+        tool_traces = client.get(f"/api/projects/{project_id}/debug/tool-traces")
+        assert tool_traces.status_code == 200
+        assert tool_traces.json()[0]["tool_name"] == "http.request"
+
+        traces = client.get(f"/api/projects/{project_id}/debug/llm-traces")
+        assert traces.status_code == 200
+        assert traces.json()[0]["decision_summary"]["next_tool_plan"] == ["http.request"]
+
+
+def test_scheduler_runs_semantic_tool_intent() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "semantic-intent",
+                "goal": "Run a semantic HTTP intent through the scheduler.",
+                "allowed_hosts": ["127.0.0.1"],
+            },
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Fetch the authorized local HTTP target.",
+                "capability_tags": ["http.request"],
+                "priority": 2,
+                "risk_level": "low",
+                "tool_request": {"url": "http://127.0.0.1/", "timeout_seconds": 1},
+            },
+        )
+        assert intent.status_code == 200
+
+        run_next = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert run_next.status_code == 200
+        assert run_next.json()["status"] == "completed"
+
+        traces = client.get(f"/api/projects/{project_id}/debug/tool-traces")
+        assert traces.status_code == 200
+        first = traces.json()[0]
+        assert first["tool_name"] == "http.request"
+        assert first["policy_decision"] == "allow"
+        assert first["artifact_refs"]
+
+        llm_traces = client.get(f"/api/projects/{project_id}/debug/llm-traces")
+        assert llm_traces.status_code == 200
+        assert llm_traces.json()[0]["decision_summary"]["next_tool_plan"] == ["http.request"]
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        event_types = {event["event_type"] for event in events.json()}
+        assert {"worker.started", "context.built", "llm.completed", "tool.executed", "attempt.completed"}.issubset(event_types)
+
+
+def test_scheduler_heartbeat_and_reap_expired_leases() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "leases", "goal": "Verify lease lifecycle.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        with Session(engine) as session:
+            claimed = Scheduler().claim_next(session, project_id=project_id, lease_seconds=1)
+            assert claimed is not None
+            intent, worker = claimed
+
+        heartbeat = client.post(f"/api/workers/{worker.id}/heartbeat", json={"lease_seconds": 30})
+        assert heartbeat.status_code == 200
+        assert heartbeat.json()["id"] == worker.id
+
+        with Session(engine) as session:
+            session.add(Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id, status="RUNNING"))
+            running_intent = session.get(Intent, intent.id)
+            assert running_intent is not None
+            running_intent.lease_expires_at = now_utc() - timedelta(seconds=1)
+            session.add(running_intent)
+            session.commit()
+
+        reaped = client.post(f"/api/projects/{project_id}/scheduler/reap-expired")
+        assert reaped.status_code == 200
+        assert reaped.json()["reaped"] == 1
+
+        with Session(engine) as session:
+            timed_out_worker = session.get(Worker, worker.id)
+            timed_out_attempt = session.exec(select(Attempt).where(Attempt.worker_id == worker.id)).one()
+            retried_intent = session.get(Intent, intent.id)
+            assert timed_out_worker is not None and timed_out_worker.status == "TIMEOUT"
+            assert timed_out_attempt.status == "TIMEOUT"
+            assert timed_out_attempt.finished_at is not None
+            assert retried_intent is not None and retried_intent.status == "PENDING"
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        event_types = {event["event_type"] for event in events.json()}
+        assert "worker.heartbeat" in event_types
+        assert "intent.lease_expired" in event_types
+        assert {"worker.timed_out", "attempt.timed_out"}.issubset(event_types)
+
+
+def test_blackboard_suppresses_duplicate_intents_and_merges_facts() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "dedup", "goal": "Verify blackboard hygiene.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        payload = {
+            "objective": "Fetch the authorized local HTTP target.",
+            "capability_tags": ["http.request"],
+            "priority": 2,
+            "risk_level": "low",
+            "tool_request": {"url": "http://127.0.0.1/", "timeout_seconds": 1},
+        }
+        first = client.post(f"/api/projects/{project_id}/intents", json=payload)
+        second = client.post(f"/api/projects/{project_id}/intents", json=payload)
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["id"] == second.json()["id"]
+
+        intents = client.get(f"/api/projects/{project_id}/intents")
+        runnable_matches = [intent for intent in intents.json() if intent["objective"] == payload["objective"]]
+        assert len(runnable_matches) == 1
+
+        run_once = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        run_twice = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert run_once.status_code == 200
+        assert run_twice.status_code == 200
+
+        blackboard = client.get(f"/api/projects/{project_id}/blackboard")
+        assert blackboard.status_code == 200
+        statements = [fact["statement"].lower() for fact in blackboard.json()["facts"]]
+        assert len(statements) == len(set(statements))
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        event_types = {event["event_type"] for event in events.json()}
+        assert "intent.duplicate_suppressed" in event_types
+        assert "fact.merged" in event_types or "fact.created" in event_types
+
+
+def test_observer_escalates_policy_denial() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "observer-deny", "goal": "Verify observer denial detection.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        denied = client.post(
+            f"/api/projects/{project_id}/tools/http.request/execute",
+            json={"request": {"url": "http://169.254.169.254/latest/meta-data/"}},
+        )
+        assert denied.status_code == 200
+        assert denied.json()["success"] is False
+
+        observer = client.post(f"/api/projects/{project_id}/observer/run")
+        assert observer.status_code == 200
+        assert observer.json()["decision"] == "ESCALATE"
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        assert "observer.decision" in {event["event_type"] for event in events.json()}
+
+
+def test_observer_redirects_duplicate_tool_calls() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "observer-duplicate", "goal": "Verify observer duplicate detection.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+        payload = {"request": {"command": "printf 'repeat\\n'", "cwd": ".", "timeout_seconds": 5}}
+
+        first = client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=payload)
+        second = client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=payload)
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        observer = client.post(f"/api/projects/{project_id}/observer/run")
+        assert observer.status_code == 200
+        assert observer.json()["decision"] == "REDIRECT"
+
+
+def test_manager_generates_intent_from_url_hint_without_duplicates() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "manager-hint",
+                "goal": "Verify manager hint planning.",
+                "allowed_hosts": ["127.0.0.1"],
+                "hint": "Start with http://127.0.0.1/ and inspect the response.",
+            },
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        first = client.post(f"/api/projects/{project_id}/manager/run")
+        second = client.post(f"/api/projects/{project_id}/manager/run")
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["status"] == "PROPOSED"
+
+        intents = client.get(f"/api/projects/{project_id}/intents")
+        assert intents.status_code == 200
+        hint_intents = [intent for intent in intents.json() if "http://127.0.0.1/" in intent["objective"]]
+        assert len(hint_intents) == 1
+        assert hint_intents[0]["capability_tags"] == ["http.request"]
+        assert hint_intents[0]["budget"]["tool_request"]["url"] == "http://127.0.0.1/"
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        assert "manager.decision" in {event["event_type"] for event in events.json()}
+
+
+def test_post_creation_hint_is_consumed_by_manager() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "hint-injection", "goal": "Verify injected hints.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        hint = client.post(
+            f"/api/projects/{project_id}/hints",
+            json={"content": "New target appeared at http://127.0.0.1/", "source": "user"},
+        )
+        assert hint.status_code == 200
+        assert hint.json()["consumed"] is False
+
+        hints_before = client.get(f"/api/projects/{project_id}/hints")
+        assert hints_before.status_code == 200
+        assert len(hints_before.json()) == 1
+
+        manager = client.post(f"/api/projects/{project_id}/manager/run")
+        assert manager.status_code == 200
+        assert manager.json()["status"] == "PROPOSED"
+
+        hints_after = client.get(f"/api/projects/{project_id}/hints")
+        assert hints_after.status_code == 200
+        assert hints_after.json()[0]["consumed"] is True
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        event_types = {event["event_type"] for event in events.json()}
+        assert "hint.created" in event_types
+        assert "manager.decision" in event_types
+
+
+def test_candidate_flag_creates_finding_and_completes_project() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "flag-flow", "goal": "Recover a candidate flag.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Emit a candidate flag for validation.",
+                "capability_tags": ["sandbox.exec"],
+                "priority": 5,
+                "risk_level": "low",
+                "tool_request": {"command": "printf 'flag{aurora_demo}'", "cwd": ".", "timeout_seconds": 5},
+            },
+        )
+        assert intent.status_code == 200
+
+        run_next = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert run_next.status_code == 200
+        assert run_next.json()["status"] == "completed"
+
+        project = client.get(f"/api/projects/{project_id}")
+        assert project.status_code == 200
+        assert project.json()["status"] == "COMPLETED"
+
+        findings = client.get(f"/api/projects/{project_id}/findings")
+        assert findings.status_code == 200
+        assert findings.json()[0]["title"] == "Candidate flag: flag{aurora_demo}"
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        event_types = {event["event_type"] for event in events.json()}
+        assert "finding.flag_candidate" in event_types
+        assert "project.completed" in event_types
+
+
+def test_derived_competition_prefixed_flag_is_archived() -> None:
+    """Computed flags need not occur verbatim in their source artifact."""
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "derived-flag", "goal": "Archive a decoded flag.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        with Session(engine) as session:
+            intent = Intent(project_id=project_id, objective="Decode the ciphertext", status="RUNNING")
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="RUNNING")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+            trace = LLMTrace(project_id=project_id, worker_id=worker.id, intent_id=intent.id, context_snapshot_id="ctx_test", prompt_hash="test")
+            session.add_all([intent, worker, attempt, trace])
+            session.commit()
+            source = ArtifactStore().write_text(
+                session,
+                project_id=project_id,
+                source_attempt_id=attempt.id,
+                artifact_type="sandbox-result",
+                summary="ROT13 ciphertext",
+                content="Fhfpgs{3r811r068s5pr27ro4op1p37723q7rr2}",
+            )
+
+            value = "Susctf{3e811e068f5ce27eb4bc1c37723d7ee2}"
+            ResultProcessor().apply(
+                session,
+                attempt=attempt,
+                llm_trace=trace,
+                output={
+                    "status": "success",
+                    "artifact_refs": [source.id],
+                    "candidate_flags": [value],
+                    "fact_candidates": [{"statement": f"ROT13 decode yields {value}", "evidence_refs": [source.id]}],
+                },
+            )
+
+        project = client.get(f"/api/projects/{project_id}")
+        assert project.json()["status"] == "COMPLETED"
+        findings = client.get(f"/api/projects/{project_id}/findings")
+        assert findings.json()[0]["title"] == f"Candidate flag: {value}"
+
+
+def test_event_specific_prefix_flag_completes_without_trusted_transcript_evidence() -> None:
+    """A meaningful event prefix such as qwxf is a valid flag prefix."""
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "event-prefix", "goal": "Accept the recovered event flag.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+
+        with Session(engine) as session:
+            intent = Intent(project_id=project_id, objective="Recover flag", status="RUNNING")
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="RUNNING")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+            trace = LLMTrace(project_id=project_id, worker_id=worker.id, intent_id=intent.id, context_snapshot_id="ctx_test", prompt_hash="test")
+            session.add_all([intent, worker, attempt, trace])
+            session.commit()
+            ResultProcessor().apply(
+                session,
+                attempt=attempt,
+                llm_trace=trace,
+                output={"status": "success", "candidate_flags": ["qwxf{you_say_chick_beautiful?}"]},
+            )
+
+        assert client.get(f"/api/projects/{project_id}").json()["status"] == "COMPLETED"
+        assert client.get(f"/api/projects/{project_id}/findings").json()[0]["title"] == "Candidate flag: qwxf{you_say_chick_beautiful?}"
+
+
+def test_decoy_flag_returns_continue_feedback_and_deep_investigation_intent() -> None:
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "decoy-flag", "goal": "Find the real flag.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        value = "qwxf{this_is_a_fake_flag}"
+
+        with Session(engine) as session:
+            intent = Intent(project_id=project_id, objective="Validate candidate", status="RUNNING")
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="RUNNING")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+            trace = LLMTrace(project_id=project_id, worker_id=worker.id, intent_id=intent.id, context_snapshot_id="ctx_test", prompt_hash="test")
+            session.add_all([intent, worker, attempt, trace])
+            session.commit()
+            ResultProcessor().apply(
+                session,
+                attempt=attempt,
+                llm_trace=trace,
+                output={
+                    "status": "success",
+                    "candidate_flags": [value],
+                    "fact_candidates": [{"statement": f"Challenge solved with {value}", "confidence": 1.0}],
+                },
+            )
+            session.refresh(attempt)
+            assert attempt.status == "PARTIAL"
+            assert "Do not submit it again" in (attempt.result_summary or "")
+
+        board = client.get(f"/api/projects/{project_id}/blackboard").json()
+        assert board["project"]["status"] == "ACTIVE"
+        assert client.get(f"/api/projects/{project_id}/findings").json() == []
+        feedback = [fact for fact in board["facts"] if fact["category"] == "flag_validation_feedback"]
+        assert len(feedback) == 1
+        assert value in feedback[0]["statement"] and "continue investigating" in feedback[0]["statement"]
+        assert not any("Challenge solved" in fact["statement"] for fact in board["facts"])
+        deep_intents = [intent for intent in board["intents"] if value in intent["objective"]]
+        assert len(deep_intents) == 1 and deep_intents[0]["status"] == "PENDING"
+        events = client.get(f"/api/projects/{project_id}/events").json()
+        decoy_event = next(event for event in events if event["event_type"] == "finding.flag_candidate_decoy")
+        assert decoy_event["payload_json"]["continue"] is True
+
+
+def test_harness_parses_final_result_after_progress_logs() -> None:
+    value = "Susctf{3e811e068f5ce27eb4bc1c37723d7ee2}"
+    output = f'''progress: decoded ciphertext
+```json
+{{
+  "status": "success",
+  "summary": "Recovered {value}",
+  "candidate_flags": ["{value}"],
+  "fact_candidates": [{{"statement": "Decoded {value}"}}],
+  "decision_summary": {{"selected_intent": "decode", "reason_summary": "ROT13", "next_tool_plan": []}}
+}}
+```
+'''
+
+    parsed = CodexHarnessRuntime()._parse_json(output)
+
+    assert parsed["candidate_flags"] == [value]
+    assert parsed["fact_candidates"][0]["statement"] == f"Decoded {value}"
+
+
+def test_completed_project_cancels_pending_intents_and_blocks_run_next() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "completion-guard", "goal": "Stop after flag.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        flag_intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Emit a candidate flag.",
+                "capability_tags": ["sandbox.exec"],
+                "priority": 10,
+                "risk_level": "low",
+                "tool_request": {"command": "printf 'flag{stop_now}'", "cwd": ".", "timeout_seconds": 5},
+            },
+        )
+        extra_intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "This should be cancelled after completion.",
+                "capability_tags": ["sandbox.exec"],
+                "priority": 1,
+                "risk_level": "low",
+                "tool_request": {"command": "printf 'should not run'", "cwd": ".", "timeout_seconds": 5},
+            },
+        )
+        assert flag_intent.status_code == 200
+        assert extra_intent.status_code == 200
+
+        run_flag = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert run_flag.status_code == 200
+        assert run_flag.json()["status"] == "completed"
+
+        run_again = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert run_again.status_code == 200
+        assert run_again.json()["status"] == "project_completed"
+
+        intents = client.get(f"/api/projects/{project_id}/intents")
+        assert intents.status_code == 200
+        statuses = {intent["objective"]: intent["status"] for intent in intents.json()}
+        assert statuses["This should be cancelled after completion."] == "CANCELLED"
+
+        events = client.get(f"/api/projects/{project_id}/events")
+        assert events.status_code == 200
+        completed_events = [event for event in events.json() if event["event_type"] == "project.completed"]
+        assert completed_events
+        assert extra_intent.json()["id"] in completed_events[0]["payload_json"]["cancelled_intent_ids"]
+
+
+def test_completed_project_rejects_new_intents_and_hints() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "mutation-guard", "goal": "Complete then reject mutation.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Emit a candidate flag.",
+                "capability_tags": ["sandbox.exec"],
+                "priority": 10,
+                "risk_level": "low",
+                "tool_request": {"command": "printf 'flag{locked}'", "cwd": ".", "timeout_seconds": 5},
+            },
+        )
+        assert intent.status_code == 200
+        assert client.post(f"/api/projects/{project_id}/scheduler/run-next").status_code == 200
+
+        new_intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={"objective": "Should fail", "capability_tags": ["sandbox.exec"]},
+        )
+        new_hint = client.post(f"/api/projects/{project_id}/hints", json={"content": "Should fail"})
+        assert new_intent.status_code == 409
+        assert new_hint.status_code == 409
+
+
+def test_project_summary_supports_acceptance_review() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "summary", "goal": "Review final summary.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+
+        intent = client.post(
+            f"/api/projects/{project_id}/intents",
+            json={
+                "objective": "Emit a candidate flag for summary.",
+                "capability_tags": ["sandbox.exec"],
+                "priority": 10,
+                "risk_level": "low",
+                "tool_request": {"command": "printf 'ctf{summary}'", "cwd": ".", "timeout_seconds": 5},
+            },
+        )
+        assert intent.status_code == 200
+        assert client.post(f"/api/projects/{project_id}/scheduler/run-next").status_code == 200
+
+        summary = client.get(f"/api/projects/{project_id}/summary")
+        assert summary.status_code == 200
+        body = summary.json()
+        assert body["project"]["status"] == "COMPLETED"
+        assert body["counts"]["findings"] == 1
+        assert body["counts"]["events_returned"] >= 1
+        assert body["findings"][0]["title"] == "Candidate flag: ctf{summary}"
+        assert body["latest_context_snapshot"] is not None
+
+
+def test_placeholder_flag_from_transcript_cannot_complete_a_project() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "placeholder", "goal": "Reject schema placeholders.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            assert project is not None
+            intent = Intent(project_id=project_id, objective="Validate a flag", status="RUNNING")
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="RUNNING")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+            trace = LLMTrace(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                context_snapshot_id="ctx_test",
+                prompt_hash="test",
+            )
+            session.add_all([intent, worker, attempt, trace])
+            session.commit()
+
+            transcript = ArtifactStore().write_text(
+                session,
+                project_id=project_id,
+                source_attempt_id=attempt.id,
+                artifact_type="codex-transcript",
+                summary="output schema",
+                content='{"candidate_flags": ["flag{...}"]}',
+            )
+            assert FlagValidator().extract_candidate_flags(session, artifact_refs=[transcript.id]) == []
+
+            ResultProcessor().apply(
+                session,
+                attempt=attempt,
+                llm_trace=trace,
+                output={"status": "partial", "candidate_flags": [{"value": "flag{...}", "artifact_ref": transcript.id}]},
+            )
+            session.refresh(project)
+            assert project.status == "ACTIVE"
+            assert client.get(f"/api/projects/{project_id}/findings").json() == []
+
+
+def test_masked_flag_cannot_be_extracted_or_submitted() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "masked-flag", "goal": "Reject masked flag output.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            assert project is not None
+            intent = Intent(project_id=project_id, objective="Validate a masked flag", status="RUNNING")
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="RUNNING")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+            trace = LLMTrace(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                context_snapshot_id="ctx_masked_test",
+                prompt_hash="masked-test",
+            )
+            session.add_all([intent, worker, attempt, trace])
+            session.commit()
+
+            artifact = ArtifactStore().write_text(
+                session,
+                project_id=project_id,
+                source_attempt_id=attempt.id,
+                artifact_type="tool-output",
+                summary="masked tool output",
+                content="observed flag{*****}",
+            )
+            assert FlagValidator().extract_candidate_flags(session, artifact_refs=[artifact.id]) == []
+
+            ResultProcessor().apply(
+                session,
+                attempt=attempt,
+                llm_trace=trace,
+                output={"status": "success", "candidate_flags": [{"value": "flag{*****}", "artifact_ref": artifact.id}]},
+            )
+            session.refresh(project)
+            assert project.status == "ACTIVE"
+            events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
+            assert any(event.event_type == "finding.flag_candidate_rejected" for event in events)
+            assert not any(event.event_type == "finding.flag_candidate" for event in events)
+            feedback = session.exec(
+                select(Fact).where(Fact.project_id == project_id, Fact.category == "flag_validation_feedback")
+            ).all()
+            assert len(feedback) == 1
+            assert "flag{*****}" in feedback[0].statement
+            follow_up = session.exec(
+                select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+            ).all()
+            assert any("flag{*****}" in item.objective for item in follow_up)
+            session.refresh(attempt)
+            assert attempt.status == "PARTIAL"
+            assert client.get(f"/api/projects/{project_id}/findings").json() == []
+
+
+def test_evidence_conclusion_runtime_warning_and_rethink(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "aurora.api.autorun_registry.start",
+        lambda **kwargs: SimpleNamespace(project_id=kwargs["project_id"], status="running"),
+    )
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "rethink", "goal": "Reason from retained evidence.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        artifact = client.post(
+            f"/api/projects/{project_id}/tools/sandbox.exec/execute",
+            json={"request": {"command": "printf 'observed header: X-Test'", "cwd": ".", "timeout_seconds": 5}},
+        )
+        assert artifact.status_code == 200
+        artifact_id = artifact.json()["artifact_refs"][0]
+
+        derived = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={"statement": "The target exposes an X-Test response header.", "evidence_refs": [artifact_id], "confidence": 0.8, "category": "web"},
+        )
+        assert derived.status_code == 200
+        assert derived.json()["evidence_refs"] == [artifact_id]
+
+        with Session(engine) as session:
+            warning = WorkerEvent(project_id=project_id, event_type="runtime.error", payload_json={"error": "container exited 1"})
+            session.add(warning)
+            session.commit()
+            session.refresh(warning)
+            warning_id = warning.id
+
+        warnings = client.get(f"/api/projects/{project_id}/warnings")
+        assert warnings.status_code == 200
+        assert [item["id"] for item in warnings.json()] == [warning_id]
+        assert client.post(f"/api/projects/{project_id}/warnings/{warning_id}/acknowledge").status_code == 200
+        assert client.get(f"/api/projects/{project_id}/warnings").json() == []
+
+        with Session(engine) as session:
+            session.add(WorkerEvent(project_id=project_id, event_type="runtime.error", payload_json={"error": "stale worker failure"}))
+            session.commit()
+
+        reset = client.post(f"/api/projects/{project_id}/rethink")
+        assert reset.status_code == 200
+        assert reset.json()["status"] == "working"
+        assert reset.json()["autorun"]["status"] == "running"
+        board = client.get(f"/api/projects/{project_id}/blackboard").json()
+        assert board["project"]["status"] == "WORKING"
+        assert board["facts"] == []
+        assert len(board["artifacts"]) == 1
+        assert board["artifacts"][0]["id"] == artifact_id
+        assert board["artifacts"][0]["source_attempt_id"] is None
+        assert len(board["intents"]) == 1
+        assert board["intents"][0]["status"] == "PENDING"
+        assert client.get(f"/api/projects/{project_id}/warnings").json() == []
+        event_types = {event["event_type"] for event in client.get(f"/api/projects/{project_id}/events").json()}
+        assert "fact.derived_from_evidence" in event_types
+        assert "project.rethought" in event_types
+
+
+def test_rethink_returns_immediately_while_autorun_is_stopping(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "async-rethink", "goal": "restart active solve", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        monkeypatch.setattr("aurora.api.autorun_registry.status", lambda _project_id: {"status": "running"})
+        monkeypatch.setattr(
+            "aurora.api.project_rethink_registry.start",
+            lambda **kwargs: SimpleNamespace(project_id=kwargs["project_id"], status="stopping"),
+        )
+
+        response = client.post(f"/api/projects/{project_id}/rethink")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "working"
+        assert response.json()["phase"] == "stopping"
+
+
+def test_rethink_stop_catches_container_created_after_stop_request(monkeypatch) -> None:
+    from aurora.services.project_rethink_registry import ProjectRethinkRegistry, ProjectRethinkState
+
+    statuses = iter([{"status": "stopping"}, {"status": "stopped"}])
+    container_scans = iter([
+        {"stopped": [], "errors": []},
+        {"stopped": ["late-container"], "errors": []},
+    ])
+    monkeypatch.setattr("aurora.services.project_rethink_registry.autorun_registry.stop", lambda _project_id: None)
+    monkeypatch.setattr("aurora.services.project_rethink_registry.autorun_registry.status", lambda _project_id: next(statuses))
+    monkeypatch.setattr("aurora.services.project_rethink_registry.stop_project_containers", lambda _project_id: next(container_scans))
+    monkeypatch.setattr("aurora.services.project_rethink_registry.time.sleep", lambda _seconds: None)
+
+    stopped = ProjectRethinkRegistry()._stop_active_autorun("proj_race", ProjectRethinkState(project_id="proj_race"))
+
+    assert stopped == {"stopped": ["late-container"], "errors": []}
+
+
+def test_discovered_target_is_filtered_and_temporarily_authorized() -> None:
+    assert BrowserInteractionService._labeled_target_urls(
+        "题目地址：8.8.8.8:18080\nTarget URL: https://ctf.example/challenge/1\n靶机地址: http://1.1.1.1:8080/",
+        "ctf.example",
+    ) == ["http://8.8.8.8:18080", "http://1.1.1.1:8080/"]
+    assert BrowserInteractionService._target_urls(
+        [
+            "https://ctf.example/challenge/1",
+            "http://8.8.8.8:18080/",
+            "http://169.254.169.254/latest/meta-data",
+            "http://localhost:8080/",
+        ],
+        "ctf.example",
+    ) == ["http://8.8.8.8:18080/"]
+
+    client = TestClient(create_app())
+    with client:
+        project = client.post(
+            "/api/projects",
+            json={"name": "dynamic-target", "goal": "Use a provisioned target.", "allowed_hosts": ["ctf.example"]},
+        ).json()
+        project_id = project["id"]
+        with Session(engine) as session:
+            denied = PolicyEngine().check_tool_request(session, project_id=project_id, tool_name="http.request", request={"url": "http://8.8.8.8:18080/"})
+            assert denied.allowed is False
+            session.add(DiscoveredTarget(project_id=project_id, url="http://8.8.8.8:18080/", host="8.8.8.8"))
+            session.commit()
+            allowed = PolicyEngine().check_tool_request(session, project_id=project_id, tool_name="http.request", request={"url": "http://8.8.8.8:18080/"})
+            assert allowed.allowed is True
+
+        targets = client.get(f"/api/projects/{project_id}/targets")
+        assert targets.status_code == 200
+        assert targets.json()[0]["host"] == "8.8.8.8"
+        session_update = client.post(
+            f"/api/projects/{project_id}/browser/session",
+            json={"source_url": "https://ctf.example/challenge/1", "cookie": "session=test"},
+        )
+        assert session_update.status_code == 200
+        assert "test" not in session_update.text

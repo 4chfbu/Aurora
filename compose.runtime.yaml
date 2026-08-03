@@ -1,0 +1,26 @@
+services:
+  cc-switch:
+    build:
+      context: .
+      dockerfile: container/cc-switch/Dockerfile
+    image: aurora-cc-switch:5.9.3
+    container_name: aurora-cc-switch
+    restart: unless-stopped
+    environment:
+      CC_SWITCH_LISTEN_PORT: "15723"
+      AURORA_LLM_BASE_URL: ${AURORA_LLM_BASE_URL:?set AURORA_LLM_BASE_URL in .env}
+      AURORA_LLM_API_KEY: ${AURORA_LLM_API_KEY:?set AURORA_LLM_API_KEY in .env}
+      AURORA_LLM_MODEL: ${AURORA_LLM_MODEL:?set AURORA_LLM_MODEL in .env}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:15723/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      - runtime
+
+networks:
+  runtime:
+    name: aurora-runtime
+    driver: bridge
