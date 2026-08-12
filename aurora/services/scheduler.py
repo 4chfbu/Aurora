@@ -5,12 +5,13 @@ from datetime import timedelta
 from sqlmodel import Session, select
 
 from aurora.models import Attempt, Intent, Project, Worker, WorkerEvent, now_utc, new_id
+from aurora.services.round_summary import RoundReflectionService
 
 
 class Scheduler:
     def claim_next(self, session: Session, *, project_id: str, lease_seconds: int = 300) -> tuple[Intent, Worker] | None:
         project = session.get(Project, project_id)
-        if project is None or project.status in {"COMPLETED", "CANCELLED", "FAILED"}:
+        if project is None or project.status in {"COMPLETED", "CANCELLED", "FAILED", "FLAG_READY", "AWAITING_MANUAL_VALIDATION"}:
             return None
         intent = session.exec(
             select(Intent)
@@ -109,6 +110,7 @@ class Scheduler:
                 Intent.lease_expires_at < now_utc(),
             )
         ).all()
+        timed_out_primary_attempts: list[tuple[Attempt, dict]] = []
         for intent in expired:
             previous_status = intent.status
             intent.status = "PENDING" if intent.retry_count < intent.max_retries else "FAILED"
@@ -162,7 +164,23 @@ class Scheduler:
                             payload_json={"reason": "worker lease expired", "status": "TIMEOUT"},
                         )
                     )
+                    if worker is not None and worker.execution_kind == "primary":
+                        timed_out_primary_attempts.append((attempt, worker.budgets or {}))
         session.commit()
+        for attempt, budget in timed_out_primary_attempts:
+            RoundReflectionService().create(
+                session,
+                attempt=attempt,
+                output={
+                    "status": "failed",
+                    "summary": attempt.failure_reason or "Solver round timed out.",
+                    "failed_attempts": [{"reason": attempt.failure_reason or "worker lease expired"}],
+                    "hypotheses": [],
+                    "suggested_intents": [],
+                    "decision_summary": {"next_tool_plan": []},
+                },
+                budget=budget,
+            )
         return len(expired)
 
     def reap_all_expired(self, session: Session) -> int:

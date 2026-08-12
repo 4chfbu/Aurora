@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from sqlmodel import Session, select
 
@@ -19,12 +19,15 @@ from aurora.config import Settings, get_settings
 from aurora.models import Artifact, ChallengeGroup, ChallengeGroupItem, Fact, ImportArtifact, ImportBatch, ImportCandidate, WorkerEvent, now_utc, new_id
 from aurora.services.demo import create_project_with_bootstrap
 from aurora.services.prompt_renderer import PromptRenderer
+from aurora.services.network_proxy import network_proxy_registry
 
 
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+MIN_VERIFIED_CANDIDATE_CONFIDENCE = 0.8
 ATTACHMENT_EXTENSIONS = {".7z", ".bin", ".cap", ".gz", ".iso", ".jar", ".pcap", ".pcapng", ".pdf", ".rar", ".tar", ".tgz", ".txt", ".zip"}
 FetchText = Callable[[str], tuple[str, str]]
 FetchBytes = Callable[[str, int], tuple[bytes, str | None]]
+FetchJson = Callable[[str, str | None], dict[str, Any]]
 PostJson = Callable[[str, dict[str, Any], str | None], dict[str, Any]]
 Cataloger = Callable[[dict[str, Any]], dict[str, Any]]
 ProgressCallback = Callable[[str, str], None]
@@ -34,6 +37,7 @@ AttachmentCollector = Callable[[list[dict[str, Any]], str | None], None]
 class AuthenticatedFetcher(Protocol):
     def fetch_text(self, url: str) -> tuple[str, str]: ...
     def fetch_bytes(self, url: str, max_bytes: int) -> tuple[bytes, str | None]: ...
+    def fetch_json(self, url: str) -> dict[str, Any]: ...
     def close(self) -> None: ...
 
 
@@ -92,6 +96,17 @@ class ScanResult:
     candidates: list[ImportCandidate]
 
 
+@dataclass
+class CollectionResult:
+    inventory: dict[str, Any]
+    candidates: list[dict[str, Any]]
+    summary: str
+    platform: str
+    strategy: str
+    pages_scanned: int = 1
+    diagnostics: list[dict[str, Any]] | None = None
+
+
 class HandsFreeService:
     """Collects challenge metadata and files without entering the Solver execution path."""
 
@@ -100,6 +115,7 @@ class HandsFreeService:
         settings: Settings | None = None,
         fetch_text: FetchText | None = None,
         fetch_bytes: FetchBytes | None = None,
+        fetch_json: FetchJson | None = None,
         post_json: PostJson | None = None,
         cataloger: Cataloger | None = None,
         authenticated_fetcher_factory: AuthenticatedFetcherFactory | None = None,
@@ -108,6 +124,7 @@ class HandsFreeService:
         self.settings = settings or get_settings()
         self.fetch_text = fetch_text or self._fetch_text
         self.fetch_bytes = fetch_bytes or self._fetch_bytes
+        self.fetch_json = fetch_json or self._fetch_json
         self.post_json = post_json or self._post_json
         self.cataloger = cataloger
         self.authenticated_fetcher_factory = authenticated_fetcher_factory or self._authenticated_fetcher
@@ -117,8 +134,6 @@ class HandsFreeService:
 
     def create_batch(self, session: Session, source_url: str, *, cookie: str | None = None, username: str | None = None, password: str | None = None) -> ImportBatch:
         source_url = self._safe_url(source_url)
-        if not self.settings.cataloger_configured and self.cataloger is None and not self._is_ctfplus_problem_bank(source_url):
-            raise ValueError("cataloger Agent is not configured; set AURORA_CATALOGER_LLM_API_KEY")
         auth_method = self._auth_method(cookie, username, password)
         batch = ImportBatch(source_url=source_url, auth_method=auth_method)
         session.add(batch)
@@ -166,33 +181,37 @@ class HandsFreeService:
             self._progress(progress, "FETCHING", "正在访问题目列表页面。")
             fetch_text = self.fetch_text
             fetch_bytes = self.fetch_bytes
+            fetch_json: Callable[[str], dict[str, Any]] = lambda url: self.fetch_json(url, cookie)
             if self._auth_method(cookie, username, password):
                 fetcher = self.authenticated_fetcher_factory(batch.source_url, cookie, username, password, login_url)
                 fetch_text = fetcher.fetch_text
                 fetch_bytes = fetcher.fetch_bytes
+                authenticated_json = getattr(fetcher, "fetch_json", None)
+                if callable(authenticated_json):
+                    fetch_json = authenticated_json
             html, final_url = fetch_text(batch.source_url)
             final_url = self._safe_url(final_url)
             if self._looks_like_login_page(html, final_url):
                 raise NeedsSessionError("Login is required. Provide a valid Cookie to continue.", urlparse(final_url).hostname)
             inventory = self._inventory(html, final_url)
+            self._progress(progress, "DETECTING", "正在识别题目平台和数据来源。")
             if self._is_ctfplus_problem_bank(final_url):
                 self._progress(progress, "CATALOGING", "正在通过 CTF+ 题库 API 识别当前页题目。")
                 inventory, candidates, model_result = self._ctfplus_problem_bank(final_url, cookie=cookie, inventory=inventory)
+                collection = CollectionResult(inventory, candidates, str(model_result.get("summary", "")), "ctfplus", "platform_api", int(model_result.get("pages_scanned", 1)))
+            elif self._is_ctfd_page(html, inventory):
+                self._progress(progress, "CATALOGING", "检测到 CTFd，正在读取题目 API 和详情。")
+                collection = self._ctfd_collection(final_url, inventory, fetch_json)
             else:
-                self._progress(progress, "CATALOGING", "正在归集题目链接并调用 Cataloger Agent。")
-                model_result = self._catalog(inventory)
-                candidates = self._validated_candidates(model_result, inventory)
-                if not candidates and fetcher is None:
-                    browser_inventory = self._browser_inventory(final_url)
-                    if browser_inventory is not None:
-                        inventory = browser_inventory
-                        model_result = self._catalog(inventory)
-                        candidates = self._validated_candidates(model_result, inventory)
-                if not candidates:
-                    candidates = self._heuristic_candidates(inventory)
-                if candidates:
-                    self._progress(progress, "DETAILS", f"正在检查 {len(candidates)} 个题目详情页中的附件。")
-                    self._enrich_candidate_attachments(candidates, fetch_text)
+                self._progress(progress, "CATALOGING", "正在归集静态页面和浏览器响应。")
+                collection = self._generic_collection(final_url, inventory, cookie=cookie, fetcher=fetcher, progress=progress)
+            inventory = collection.inventory
+            self._progress(progress, "VALIDATING", "正在验证题目身份、来源并去重。")
+            candidates = self._deduplicate_candidates(collection.candidates)
+            model_result = {"summary": collection.summary}
+            if candidates:
+                self._progress(progress, "DETAILS", f"正在检查 {len(candidates)} 个题目详情页中的附件。")
+                self._enrich_candidate_attachments(candidates, fetch_text)
             if candidates:
                 self._progress(progress, "DETAILS", f"正在从 {len(candidates)} 个题目详情页补全浏览器下载附件。")
                 collect_in_session = getattr(fetcher, "collect_attachments", None) if fetcher is not None else None
@@ -206,6 +225,10 @@ class HandsFreeService:
             persisted = self._persist_candidates(session, batch, candidates, inventory, fetch_bytes)
             batch.title = inventory["title"] or None
             batch.summary = str(model_result.get("summary", ""))[:1000]
+            batch.platform = collection.platform
+            batch.extraction_strategy = collection.strategy
+            batch.pages_scanned = collection.pages_scanned
+            batch.diagnostics_json = collection.diagnostics or ([] if candidates else [{"code": "NO_VERIFIED_CANDIDATES", "message": "未发现具有题目身份依据的候选；导航、静态资源和站点链接已被过滤。"}])
             batch.status = "READY"
             batch.updated_at = now_utc()
             session.add(batch)
@@ -277,7 +300,7 @@ class HandsFreeService:
         results: list[dict[str, str]] = []
         for position, candidate in enumerate(candidates, start=1):
             if candidate.project_id:
-                session.add(ChallengeGroupItem(group_id=group.id, project_id=candidate.project_id, position=position))
+                session.add(ChallengeGroupItem(group_id=group.id, project_id=candidate.project_id, position=position, competition_meta=candidate.source_metadata_json))
                 session.commit()
                 results.append({"candidate_id": candidate.id, "project_id": candidate.project_id, "status": "existing", "group_id": group.id})
                 continue
@@ -308,21 +331,385 @@ class HandsFreeService:
             session.add(WorkerEvent(
                 project_id=project.id,
                 event_type="import.confirmed",
-                payload_json={"batch_id": batch_id, "candidate_id": candidate.id, "source_url": batch.source_url, "artifact_refs": artifacts},
+                payload_json={"batch_id": batch_id, "candidate_id": candidate.id, "source_url": batch.source_url, "source_metadata": candidate.source_metadata_json, "artifact_refs": artifacts},
             ))
             candidate.project_id = project.id
             candidate.confirmed = True
             candidate.updated_at = now_utc()
             session.add(candidate)
-            session.add(ChallengeGroupItem(group_id=group.id, project_id=project.id, position=position))
+            session.add(ChallengeGroupItem(group_id=group.id, project_id=project.id, position=position, competition_meta=candidate.source_metadata_json))
             session.commit()
-            results.append({"candidate_id": candidate.id, "project_id": project.id, "status": "created", "group_id": group.id, "challenge_url": candidate.challenge_url})
+            results.append({"candidate_id": candidate.id, "project_id": project.id, "status": "created", "group_id": group.id, "challenge_url": candidate.challenge_url, "source_metadata": candidate.source_metadata_json})
         return results
 
     @staticmethod
     def _is_ctfplus_problem_bank(url: str) -> bool:
         parsed = urlparse(url)
         return (parsed.hostname or "").lower().rstrip(".") in {"ctfplus.cn", "www.ctfplus.cn"} and parsed.path.rstrip("/") == "/learning/problem/problem-bank"
+
+    @staticmethod
+    def _is_ctfd_page(html: str, inventory: dict[str, Any]) -> bool:
+        sample = f"{html[:200_000]} {inventory.get('text', '')}"
+        return bool(re.search(r"(?:Powered by CTFd|x-data=[\"']ChallengeBoard|/api/v1/challenges|ctfd\.io)", sample, re.IGNORECASE))
+
+    def _ctfd_collection(
+        self,
+        source_url: str,
+        inventory: dict[str, Any],
+        fetch_json: Callable[[str], dict[str, Any]],
+    ) -> CollectionResult:
+        parsed = urlparse(source_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        list_url = f"{origin}/api/v1/challenges"
+        payload = fetch_json(list_url)
+        if not payload.get("success") or not isinstance(payload.get("data"), list):
+            message = str(payload.get("message") or payload.get("errors") or "CTFd challenge API returned an invalid response")
+            if re.search(r"login|auth|permission|unauthorized|forbidden", message, re.IGNORECASE):
+                raise NeedsSessionError("CTFd requires a valid login session. Provide a valid Cookie to continue.", parsed.hostname)
+            raise ValueError(message)
+        candidates: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
+        for raw in payload["data"][: self.settings.cataloger_max_candidates]:
+            if not isinstance(raw, dict) or raw.get("id") is None or not str(raw.get("name") or "").strip():
+                continue
+            challenge_id = str(raw["id"])
+            detail_url = f"{origin}/api/v1/challenges/{challenge_id}"
+            detail = raw
+            try:
+                detail_payload = fetch_json(detail_url)
+                if detail_payload.get("success") and isinstance(detail_payload.get("data"), dict):
+                    detail = {**raw, **detail_payload["data"]}
+                else:
+                    diagnostics.append({"code": "DETAIL_UNAVAILABLE", "challenge_id": challenge_id, "message": "CTFd detail API did not return a usable object."})
+            except NeedsSessionError:
+                raise
+            except Exception as exc:
+                diagnostics.append({"code": "DETAIL_UNAVAILABLE", "challenge_id": challenge_id, "message": str(exc)[:300]})
+            candidate = self._ctfd_candidate(detail, source_url, detail_url)
+            if candidate is not None:
+                candidates.append(candidate)
+        summary = f"CTFd API identified {len(candidates)} challenge(s) visible in the current session."
+        return CollectionResult(inventory, candidates, summary, "ctfd", "platform_api", 1, diagnostics)
+
+    @classmethod
+    def _ctfd_candidate(cls, item: dict[str, Any], source_url: str, detail_url: str) -> dict[str, Any] | None:
+        challenge_id = str(item.get("id") or "").strip()
+        title = str(item.get("name") or "").strip()
+        if not challenge_id or not title:
+            return None
+        category = str(item.get("category") or "unknown")
+        file_attachments: list[str] = []
+        for raw in item.get("files", []) if isinstance(item.get("files"), list) else []:
+            value = raw if isinstance(raw, str) else next((raw.get(key) for key in ("url", "location", "path") if isinstance(raw, dict) and raw.get(key)), None)
+            if isinstance(value, str) and value.strip():
+                try:
+                    file_attachments.append(cls._safe_url(urljoin(source_url, value)))
+                except ValueError:
+                    continue
+        description_value = str(item.get("description") or item.get("view") or "")
+        description_attachments = cls._ctfd_description_attachment_urls(description_value, source_url)
+        attachments = list(dict.fromkeys([*file_attachments, *description_attachments]))
+        trusted_external = list(dict.fromkeys([
+            *file_attachments,
+            *(url for url in description_attachments if cls._is_direct_description_attachment(url)),
+        ]))
+        tags = [str(tag.get("value") or tag.get("name")) for tag in item.get("tags", []) if isinstance(tag, dict) and (tag.get("value") or tag.get("name"))]
+        description = cls._plain_text(description_value)
+        details = [description]
+        if item.get("value") is not None:
+            details.append(f"Points: {item['value']}")
+        if tags:
+            details.append(f"Tags: {', '.join(tags)}")
+        return {
+            "title": title[:500],
+            "description": "\n".join(part for part in details if part)[:3000],
+            "challenge_url": f"{source_url.split('#', 1)[0]}#challenge-{challenge_id}",
+            "challenge_type": cls._challenge_type(category, tags),
+            "confidence": 1.0,
+            "attachment_urls": attachments,
+            # CTFd challenge details are authoritative input. Exact external URLs
+            # can be fetched without forwarding the platform session to the host.
+            "_trusted_external_attachment_urls": trusted_external,
+            "source_metadata": {
+                "platform": "ctfd",
+                "challenge_id": challenge_id,
+                "detail_api_url": detail_url,
+                "page_url": source_url.split("#", 1)[0],
+                "locator": {"selector": f'button.challenge-button[value="{challenge_id}"]'},
+                "provenance": "platform_api",
+            },
+        }
+
+    @classmethod
+    def _ctfd_description_attachment_urls(cls, description: str, source_url: str) -> list[str]:
+        """Extract links that CTFd challenge authors placed in an Attachments section."""
+        if not description:
+            return []
+        heading_pattern = re.compile(
+            r"(?im)(?:^|\s)(?:#{1,6}\s*([^\n<]+)|<h[1-6][^>]*>\s*(.*?)\s*</h[1-6]>)"
+        )
+        headings = [
+            (match.start(), cls._plain_text(match.group(1) or match.group(2) or "").strip().lower())
+            for match in heading_pattern.finditer(description)
+        ]
+        link_pattern = re.compile(
+            r"\[([^\]]{1,300})\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+['\"][^)]*['\"])?\s*\)"
+            r"|<a\b[^>]*\bhref\s*=\s*(['\"])(.*?)\4[^>]*>(.*?)</a>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        urls: list[str] = []
+        for match in link_pattern.finditer(description):
+            label = cls._plain_text(match.group(1) or match.group(6) or "")
+            raw_url = match.group(2) or match.group(3) or match.group(5) or ""
+            preceding = [heading for heading in headings if heading[0] < match.start()]
+            section = preceding[-1][1] if preceding else ""
+            if not re.search(r"\battachments?\b|附件|下载", section, re.IGNORECASE) and not re.search(
+                r"\battachments?\b|download|附件|下载", label, re.IGNORECASE
+            ):
+                continue
+            try:
+                urls.append(cls._safe_url(urljoin(source_url, raw_url.strip())))
+            except ValueError:
+                continue
+        return list(dict.fromkeys(urls))
+
+    @staticmethod
+    def _is_direct_description_attachment(url: str) -> bool:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        suffix = Path(parsed.path).suffix.lower()
+        if suffix and suffix not in {".htm", ".html", ".php", ".asp", ".aspx", ".jsp"}:
+            return True
+        return hostname == "amazonaws.com" or hostname.endswith(".amazonaws.com")
+
+    def _generic_collection(
+        self,
+        source_url: str,
+        inventory: dict[str, Any],
+        *,
+        cookie: str | None,
+        fetcher: AuthenticatedFetcher | None,
+        progress: ProgressCallback | None,
+    ) -> CollectionResult:
+        diagnostics: list[dict[str, Any]] = []
+        if self.cataloger is not None or self.settings.cataloger_configured:
+            result = self._catalog(inventory)
+            candidates = self._validated_candidates(result, inventory)
+            if candidates:
+                return CollectionResult(inventory, candidates, str(result.get("summary", "")), "generic", "cataloger_static", 1, diagnostics)
+            diagnostics.append({"code": "STATIC_CATALOG_EMPTY", "message": str(result.get("summary") or "Cataloger found no evidence-backed static candidates.")[:500]})
+        else:
+            diagnostics.append({"code": "CATALOGER_UNAVAILABLE", "message": "Cataloger LLM is not configured; deterministic collection remains available."})
+
+        self._progress(progress, "BROWSING", "正在通过隔离浏览器检查动态数据。")
+        collector = getattr(fetcher, "collect_catalog", None) if fetcher is not None else None
+        browser_result = collector(self) if callable(collector) else self._browser_collection(source_url, cookie)
+        if browser_result is not None:
+            browser_result.diagnostics = [*diagnostics, *(browser_result.diagnostics or [])]
+            return browser_result
+        diagnostics.append({"code": "BROWSER_UNAVAILABLE", "message": "Playwright browser collection was unavailable or failed."})
+        return CollectionResult(inventory, [], "No verified challenge candidates were found.", "generic", "deterministic_only", 1, diagnostics)
+
+    def _browser_collection(self, source_url: str, cookie: str | None) -> CollectionResult | None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return None
+        try:
+            with sync_playwright() as playwright:
+                proxy = network_proxy_registry.get().playwright_proxy()
+                browser = playwright.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
+                context = browser.new_context()
+                try:
+                    if cookie and cookie.strip():
+                        context.add_cookies(self._parse_browser_cookie(cookie, urlparse(source_url).hostname or ""))
+                    return self._browser_collection_context(context, source_url)
+                finally:
+                    context.close()
+                    browser.close()
+        except Exception:
+            return None
+
+    def _browser_collection_context(self, context: Any, source_url: str) -> CollectionResult:
+        page = context.new_page()
+        responses: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
+        source_host = (urlparse(source_url).hostname or "").lower().rstrip(".")
+
+        def capture(response: Any) -> None:
+            try:
+                response_host = (urlparse(response.url).hostname or "").lower().rstrip(".")
+                content_type = str(response.headers.get("content-type") or "").lower()
+                if response_host != source_host or "json" not in content_type:
+                    return
+                body = response.body()
+                if len(body) > self.settings.cataloger_max_response_bytes:
+                    diagnostics.append({"code": "RESPONSE_SKIPPED", "url": response.url, "message": "JSON response exceeded collection limit."})
+                    return
+                parsed = json.loads(body.decode("utf-8", errors="replace"))
+                responses.append({"id": f"response_{len(responses)}", "url": response.url, "status": response.status, "body": parsed})
+            except Exception:
+                return
+
+        page.on("response", capture)
+        try:
+            page.goto(source_url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(1_500)
+            inventory = self._inventory(page.content(), self._safe_url(page.url))
+            candidates = self._observed_json_candidates(responses, inventory["page_url"])
+            if candidates:
+                return CollectionResult(inventory, candidates, f"Browser responses identified {len(candidates)} challenge(s).", "generic", "observed_json", 1, diagnostics)
+            if not self.settings.cataloger_agent_enabled or (self.cataloger is None and not self.settings.cataloger_configured):
+                return CollectionResult(inventory, [], "Browser collection found no verified challenge objects.", "generic", "browser_observation", 1, diagnostics)
+            candidates, pages, trace = self._run_cataloger_agent(page, responses, inventory)
+            diagnostics.extend(trace)
+            return CollectionResult(inventory, candidates, f"Cataloger Agent identified {len(candidates)} verified challenge(s).", "generic", "browser_agent", pages, diagnostics)
+        finally:
+            page.close()
+
+    def _run_cataloger_agent(self, page: Any, responses: list[dict[str, Any]], inventory: dict[str, Any]) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+        trace: list[dict[str, Any]] = []
+        pages = 1
+        for step in range(self.settings.cataloger_max_agent_steps):
+            elements = self._agent_elements(page)
+            observation = {
+                **inventory,
+                "agent_mode": True,
+                "agent_elements": elements,
+                "observed_json": [{"id": item["id"], "url": item["url"], "body": item["body"]} for item in responses[-20:]],
+                "agent_contract": "Return candidates backed by challenge_url from collected_links, or one action using an element_ref. Never return a raw navigation URL.",
+            }
+            result = self._catalog(observation)
+            candidates = self._validated_candidates(result, inventory)
+            if candidates:
+                return candidates, pages, trace
+            action = result.get("action") if isinstance(result.get("action"), dict) else None
+            if not action or action.get("type") == "finish":
+                trace.append({"code": "AGENT_FINISHED", "step": step + 1, "message": str(result.get("summary") or "Agent finished without verified candidates.")[:500]})
+                break
+            element_ref = str(action.get("element_ref") or "")
+            element = next((item for item in elements if item["ref"] == element_ref), None)
+            if action.get("type") not in {"click", "navigate", "scroll"} or (action.get("type") != "scroll" and not self._agent_control_allowed(element)):
+                trace.append({"code": "AGENT_ACTION_DENIED", "step": step + 1, "action": action.get("type"), "element_ref": element_ref})
+                break
+            before_url = page.url
+            if action["type"] == "scroll":
+                page.mouse.wheel(0, 1200)
+            else:
+                controls = page.locator("a, button, [role='button']")
+                controls.nth(int(element["index"])).click(timeout=10_000)
+            page.wait_for_timeout(1_000)
+            inventory = self._inventory(page.content(), self._safe_url(page.url))
+            pages += 1 if page.url != before_url or action["type"] == "click" else 0
+            trace.append({"code": "AGENT_ACTION", "step": step + 1, "action": action["type"], "element_ref": element_ref})
+            candidates = self._observed_json_candidates(responses, inventory["page_url"])
+            if candidates:
+                return candidates, min(pages, self.settings.cataloger_max_pages), trace
+            if pages >= self.settings.cataloger_max_pages:
+                trace.append({"code": "PAGE_LIMIT_REACHED", "pages": pages})
+                break
+        return [], min(pages, self.settings.cataloger_max_pages), trace
+
+    @staticmethod
+    def _agent_elements(page: Any) -> list[dict[str, Any]]:
+        controls = page.locator("a, button, [role='button']")
+        elements: list[dict[str, Any]] = []
+        for index in range(min(controls.count(), 200)):
+            control = controls.nth(index)
+            try:
+                text = " ".join((control.inner_text(timeout=1_000) or control.get_attribute("aria-label") or "").split())[:300]
+                href = control.get_attribute("href") or ""
+                control_type = control.get_attribute("type") or ""
+                elements.append({"ref": f"element_{index}", "index": index, "text": text, "href": href[:1000], "type": control_type})
+            except Exception:
+                continue
+        return elements
+
+    @staticmethod
+    def _agent_control_allowed(element: dict[str, Any] | None) -> bool:
+        if not element:
+            return False
+        label = f"{element.get('text', '')} {element.get('href', '')}".lower()
+        if element.get("type", "").lower() == "submit" or re.search(r"submit|solve|flag|login|register|start|launch|create instance|启动|提交|登录|注册|创建实例|启动靶机", label):
+            return False
+        return bool(re.search(r"next|previous|page|filter|category|challenge|task|problem|more|detail|下一|上一|分页|筛选|分类|题目|详情", label))
+
+    def _observed_json_candidates(self, responses: list[dict[str, Any]], page_url: str) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for response in responses:
+            endpoint_signal = bool(re.search(r"challenge|task|problem", response["url"], re.IGNORECASE))
+            for item in self._json_objects(response["body"]):
+                challenge_id = item.get("id")
+                title = item.get("name") or item.get("title")
+                evidence_signal = any(key in item for key in ("category", "description", "value", "points", "solves", "files", "attachments", "tags"))
+                if challenge_id is None or not isinstance(title, str) or not title.strip() or not (endpoint_signal or evidence_signal):
+                    continue
+                attachments = self._json_attachment_urls(item, page_url)
+                category = str(item.get("category") or item.get("type") or "unknown")
+                candidates.append({
+                    "title": title.strip()[:500],
+                    "description": self._plain_text(str(item.get("description") or ""))[:3000],
+                    "challenge_url": f"{page_url.split('#', 1)[0]}#challenge-{challenge_id}",
+                    "challenge_type": self._challenge_type(category, []),
+                    "confidence": 0.9,
+                    "attachment_urls": attachments,
+                    "source_metadata": {"platform": "generic", "challenge_id": str(challenge_id), "response_url": response["url"], "page_url": page_url, "provenance": "observed_json"},
+                })
+                if len(candidates) >= self.settings.cataloger_max_candidates:
+                    return self._deduplicate_candidates(candidates)
+        return self._deduplicate_candidates(candidates)
+
+    @classmethod
+    def _json_objects(cls, value: Any) -> list[dict[str, Any]]:
+        objects: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            objects.append(value)
+            for child in value.values():
+                objects.extend(cls._json_objects(child))
+        elif isinstance(value, list):
+            for child in value:
+                objects.extend(cls._json_objects(child))
+        return objects
+
+    @classmethod
+    def _json_attachment_urls(cls, item: dict[str, Any], page_url: str) -> list[str]:
+        values = item.get("files", item.get("attachments", []))
+        if not isinstance(values, list):
+            return []
+        urls: list[str] = []
+        for raw in values:
+            value = raw if isinstance(raw, str) else next((raw.get(key) for key in ("url", "downloadUrl", "location", "path") if isinstance(raw, dict) and raw.get(key)), None)
+            if isinstance(value, str):
+                try:
+                    urls.append(cls._safe_url(urljoin(page_url, value)))
+                except ValueError:
+                    continue
+        return list(dict.fromkeys(urls))
+
+    @staticmethod
+    def _plain_text(value: str) -> str:
+        return " ".join(re.sub(r"<[^>]+>", " ", value).split())
+
+    @staticmethod
+    def _challenge_type(category: str, tags: list[str]) -> str:
+        text = " ".join([category, *tags]).lower()
+        for pattern, challenge_type in ((r"\bweb\b", "web"), (r"\bpwn\b|binary exploitation", "pwn"), (r"crypto", "crypto"), (r"reverse|reversing|\bre\b", "reverse"), (r"forensic", "forensics"), (r"misc|osint|steg", "misc")):
+            if re.search(pattern, text):
+                return challenge_type
+        return "unknown"
+
+    @staticmethod
+    def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str]] = set()
+        result: list[dict[str, Any]] = []
+        for candidate in candidates:
+            metadata = candidate.get("source_metadata") if isinstance(candidate.get("source_metadata"), dict) else {}
+            identity = (str(metadata.get("platform") or "url"), str(metadata.get("challenge_id") or candidate.get("challenge_url") or ""))
+            if not identity[1] or identity in seen:
+                continue
+            seen.add(identity)
+            result.append(candidate)
+        return result
 
     def _ctfplus_problem_bank(self, source_url: str, *, cookie: str | None, inventory: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         parsed = urlparse(source_url)
@@ -344,23 +731,44 @@ class HandsFreeService:
         if "difficulty" in query:
             payload["difficulty"] = self._query_int(query, "difficulty", -1)
         endpoint = f"{parsed.scheme}://{parsed.netloc}/api/problem/searchPublicProblem"
-        response = self.post_json(endpoint, payload, cookie)
-        if int(response.get("code", 200)) != 200:
-            message = str(response.get("msg") or "CTF+ problem API request failed")
-            if re.search(r"login|auth|token|登录|未登录|权限", message, re.IGNORECASE):
-                raise NeedsSessionError("CTF+ requires a valid login session. Provide a valid Cookie to continue.", parsed.hostname)
-            raise ValueError(message)
-        data = response.get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("problems"), list):
-            raise ValueError("CTF+ problem API returned an invalid problem list")
-
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        candidates = [self._ctfplus_candidate(problem, origin) for problem in data["problems"] if isinstance(problem, dict)]
-        candidates = [candidate for candidate in candidates if candidate is not None]
+        candidates: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        pages_scanned = 0
+        total = 0
+        current_page = page
+        while pages_scanned < self.settings.cataloger_max_pages and len(candidates) < self.settings.cataloger_max_candidates:
+            request_payload = {**payload, "page": {**payload["page"], "page": current_page}}
+            response = self.post_json(endpoint, request_payload, cookie)
+            if int(response.get("code", 200)) != 200:
+                message = str(response.get("msg") or "CTF+ problem API request failed")
+                if re.search(r"login|auth|token|登录|未登录|权限", message, re.IGNORECASE):
+                    raise NeedsSessionError("CTF+ requires a valid login session. Provide a valid Cookie to continue.", parsed.hostname)
+                raise ValueError(message)
+            data = response.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("problems"), list):
+                raise ValueError("CTF+ problem API returned an invalid problem list")
+            pages_scanned += 1
+            total = int(data.get("total", total or len(data["problems"])))
+            new_count = 0
+            for problem in data["problems"]:
+                if not isinstance(problem, dict):
+                    continue
+                problem_id = str(problem.get("id") or "")
+                if not problem_id or problem_id in seen_ids:
+                    continue
+                candidate = self._ctfplus_candidate(problem, origin)
+                if candidate is not None:
+                    seen_ids.add(problem_id)
+                    candidates.append(candidate)
+                    new_count += 1
+            if new_count == 0 or (total > 0 and len(candidates) >= total):
+                break
+            current_page += 1
         tag_label = "、".join(payload["tags"][:3])
-        inventory = {**inventory, "title": f"CTF+ 题库{f' · {tag_label}' if tag_label else ''}", "text": f"CTF+ API 识别：第 {page} 页，共 {data.get('total', len(candidates))} 道匹配题目。", "links": [], "collected_links": []}
-        summary = f"CTF+ API identified {len(candidates)} problem(s) from page {page} (page size {size}; total {data.get('total', len(candidates))})."
-        return inventory, candidates, {"summary": summary}
+        inventory = {**inventory, "title": f"CTF+ 题库{f' · {tag_label}' if tag_label else ''}", "text": f"CTF+ API 识别：从第 {page} 页开始扫描 {pages_scanned} 页，共 {total or len(candidates)} 道匹配题目。", "links": [], "collected_links": []}
+        summary = f"CTF+ API identified {len(candidates)} problem(s) across {pages_scanned} page(s) starting at page {page} (page size {size}; total {total or len(candidates)})."
+        return inventory, candidates, {"summary": summary, "pages_scanned": pages_scanned}
 
     @classmethod
     def _ctfplus_candidate(cls, problem: dict[str, Any], origin: str) -> dict[str, Any] | None:
@@ -377,7 +785,15 @@ class HandsFreeService:
             details.append(f"公开题号：{public_id}")
         if problem.get("difficulty") is not None:
             details.append(f"难度：{problem['difficulty']}")
-        return {"title": title[:500], "description": "\n".join(part for part in details if part)[:3000], "challenge_url": f"{origin}/learning/problem/problem-detail/{problem_id}/description", "challenge_type": cls._ctfplus_problem_type(tags), "confidence": 0.98, "attachment_urls": cls._ctfplus_attachment_urls(problem.get("attachments"), origin)}
+        return {
+            "title": title[:500],
+            "description": "\n".join(part for part in details if part)[:3000],
+            "challenge_url": f"{origin}/learning/problem/problem-detail/{problem_id}/description",
+            "challenge_type": cls._ctfplus_problem_type(tags),
+            "confidence": 0.98,
+            "attachment_urls": cls._ctfplus_attachment_urls(problem.get("attachments"), origin),
+            "source_metadata": {"platform": "ctfplus", "challenge_id": problem_id, "provenance": "platform_api"},
+        }
 
     @classmethod
     def _ctfplus_attachment_urls(cls, attachments: Any, origin: str) -> list[str]:
@@ -449,7 +865,8 @@ class HandsFreeService:
             return None
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                proxy = network_proxy_registry.get().playwright_proxy()
+                browser = playwright.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
                 try:
                     page = browser.new_page()
                     page.goto(url, wait_until="networkidle", timeout=30_000)
@@ -476,7 +893,7 @@ class HandsFreeService:
         endpoint = self.settings.cataloger_llm_base_url.rstrip("/") + "/chat/completions"
         request = Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {self.settings.cataloger_llm_api_key}", "Content-Type": "application/json"}, method="POST")
         try:
-            with urlopen(request, timeout=self.settings.cataloger_llm_timeout_seconds) as response:
+            with build_opener(network_proxy_registry.get().urllib_proxy_handler()).open(request, timeout=self.settings.cataloger_llm_timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise ValueError(f"cataloger Agent request failed: {exc}") from exc
@@ -494,7 +911,13 @@ class HandsFreeService:
         links_by_url = {link["url"]: link for link in inventory["links"]}
         candidates: list[dict[str, Any]] = []
         for raw in result.get("candidates", []):
-            if not isinstance(raw, dict) or raw.get("challenge_url") not in valid_links:
+            if not isinstance(raw, dict) or raw.get("challenge_url") not in valid_links or not self._is_verified_challenge_link(raw["challenge_url"], inventory, links_by_url.get(raw["challenge_url"])):
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+            except (TypeError, ValueError):
+                continue
+            if confidence < MIN_VERIFIED_CANDIDATE_CONFIDENCE:
                 continue
             attachments = [url for url in raw.get("attachment_urls", []) if isinstance(url, str) and url in valid_links and self._is_attachment_link(links_by_url[url])]
             title = str(raw.get("title") or raw["challenge_url"]).strip()
@@ -503,9 +926,24 @@ class HandsFreeService:
             candidates.append({
                 "title": title[:500], "description": str(raw.get("description") or "")[:3000],
                 "challenge_url": raw["challenge_url"], "challenge_type": str(raw.get("challenge_type") or "unknown")[:80],
-                "confidence": max(0.0, min(1.0, float(raw.get("confidence", 0.5)))), "attachment_urls": attachments,
+                "confidence": confidence, "attachment_urls": attachments,
+                "source_metadata": {"platform": "generic", "provenance": "cataloger", "page_url": inventory["page_url"]},
             })
         return candidates
+
+    @classmethod
+    def _is_verified_challenge_link(cls, url: str, inventory: dict[str, Any], link: dict[str, Any] | None) -> bool:
+        parsed = urlparse(url)
+        page = urlparse(inventory["page_url"])
+        if not parsed.hostname or not page.hostname or not cls._same_domain(inventory["page_url"], url):
+            return False
+        if url.split("#", 1)[0].rstrip("/") == inventory["page_url"].split("#", 1)[0].rstrip("/"):
+            return False
+        path = parsed.path.lower()
+        if Path(path).suffix.lower() in {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".map"}:
+            return False
+        text = f"{(link or {}).get('text', '')} {path}".lower()
+        return bool(re.search(r"challenge|task|problem|题目|赛题|/detail(?:/|$)|/challenges?/[^/]+", text))
 
     def _enrich_candidate_attachments(self, candidates: list[dict[str, Any]], fetch_text: FetchText) -> None:
         for candidate in candidates:
@@ -528,7 +966,8 @@ class HandsFreeService:
             return
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            proxy = network_proxy_registry.get().playwright_proxy()
+            browser = playwright.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
             context = browser.new_context(accept_downloads=True)
             try:
                 if cookie and cookie.strip():
@@ -543,7 +982,7 @@ class HandsFreeService:
     def _collect_candidate_browser_attachments(self, context: Any, candidate: dict[str, Any]) -> None:
         page = context.new_page()
         try:
-            response = page.goto(candidate["challenge_url"], wait_until="networkidle", timeout=30_000)
+            response = page.goto(candidate["challenge_url"], wait_until="domcontentloaded", timeout=30_000)
             if response is not None and response.status in {401, 403}:
                 candidate["_attachment_needs_session"] = True
                 candidate.setdefault("_attachment_issues", []).append({"status": "needs_session", "reason": "attachment requires a logged-in Cookie"})
@@ -601,18 +1040,22 @@ class HandsFreeService:
         return cookies
 
     def _heuristic_candidates(self, inventory: dict[str, Any]) -> list[dict[str, Any]]:
-        candidates = []
-        for link in inventory["links"]:
-            text = (link["text"] + " " + link["url"]).lower()
-            if link["is_attachment"] or not re.search(r"challenge|task|problem|ctf|题目|赛题", text):
-                continue
-            candidates.append({"title": link["text"] or link["url"], "description": "Detected from page navigation.", "challenge_url": link["url"], "challenge_type": "unknown", "confidence": 0.35, "attachment_urls": []})
-        return candidates[:50]
+        # Navigation text alone is not proof that a URL represents a challenge.
+        # Keep the method for compatibility with older callers, but never emit
+        # speculative candidates.
+        return []
 
     def _persist_candidates(self, session: Session, batch: ImportBatch, candidates: list[dict[str, Any]], inventory: dict[str, Any], fetch_bytes: FetchBytes) -> list[ImportCandidate]:
         persisted: list[ImportCandidate] = []
         for item in candidates:
-            staged, external = self._stage_attachments(session, batch, inventory["page_url"], item["attachment_urls"], fetch_bytes)
+            staged, external = self._stage_attachments(
+                session,
+                batch,
+                inventory["page_url"],
+                item["attachment_urls"],
+                fetch_bytes,
+                trusted_external_urls=item.get("_trusted_external_attachment_urls", []),
+            )
             staged_hashes = {str(reference.get("sha256")) for reference in staged if reference.get("sha256")}
             for downloaded in item.get("_downloaded_attachments", []):
                 try:
@@ -628,7 +1071,8 @@ class HandsFreeService:
             candidate = ImportCandidate(
                 batch_id=batch.id, title=item["title"], description=item["description"], challenge_url=item["challenge_url"],
                 challenge_type=item["challenge_type"], confidence=item["confidence"], staged_attachments_json=staged,
-                external_attachments_json=external, evidence_json=[{"source_url": inventory["page_url"], "title": inventory["title"]}],
+                external_attachments_json=external, evidence_json=[{"source_url": inventory["page_url"], "title": inventory["title"], "provenance": (item.get("source_metadata") or {}).get("provenance")}],
+                source_metadata_json=item.get("source_metadata") if isinstance(item.get("source_metadata"), dict) else {},
             )
             session.add(candidate)
             persisted.append(candidate)
@@ -637,15 +1081,29 @@ class HandsFreeService:
             session.refresh(candidate)
         return persisted
 
-    def _stage_attachments(self, session: Session, batch: ImportBatch, page_url: str, urls: list[str], fetch_bytes: FetchBytes | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _stage_attachments(
+        self,
+        session: Session,
+        batch: ImportBatch,
+        page_url: str,
+        urls: list[str],
+        fetch_bytes: FetchBytes | None = None,
+        *,
+        trusted_external_urls: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         staged: list[dict[str, Any]] = []
         external: list[dict[str, Any]] = []
+        trusted_external = set(trusted_external_urls or [])
         for url in dict.fromkeys(urls):
-            if not self._same_domain(page_url, url):
+            same_domain = self._same_domain(page_url, url)
+            if not same_domain and url not in trusted_external:
                 external.append({"url": url, "status": "external_review_required"})
                 continue
             try:
-                data, mime_type = (fetch_bytes or self.fetch_bytes)(url, MAX_ATTACHMENT_BYTES)
+                # Authenticated fetchers carry platform cookies, so external CDN
+                # downloads always use the service's unauthenticated downloader.
+                downloader = (fetch_bytes or self.fetch_bytes) if same_domain else self.fetch_bytes
+                data, mime_type = downloader(url, MAX_ATTACHMENT_BYTES)
                 if len(data) > MAX_ATTACHMENT_BYTES:
                     raise ValueError("attachment exceeds size limit")
                 if self._attachment_response_requires_login(data, mime_type):
@@ -664,7 +1122,9 @@ class HandsFreeService:
             except NeedsSessionError:
                 raise
             except Exception as exc:
-                external.append({"url": url, "status": "download_failed", "reason": str(exc)[:300]})
+                reason = str(exc)[:300]
+                status = "external_review_required" if "exceeds size limit" in reason else "download_failed"
+                external.append({"url": url, "status": status, "reason": reason})
         return staged, external
 
     @staticmethod
@@ -711,7 +1171,7 @@ class HandsFreeService:
             imported = session.get(ImportArtifact, reference.get("import_artifact_id"))
             if imported is None or not Path(imported.path).is_file():
                 continue
-            artifact = Artifact(project_id=project_id, type="imported_attachment", path=imported.path, sha256=imported.sha256, mime_type=imported.mime_type, size=imported.size, summary=f"Imported attachment: {imported.filename}")
+            artifact = Artifact(project_id=project_id, type="imported_attachment", path=imported.path, sha256=imported.sha256, mime_type=imported.mime_type, size=imported.size, summary=f"Imported attachment: {imported.filename}", origin_kind="challenge_input")
             session.add(artifact)
             session.commit()
             session.refresh(artifact)
@@ -805,7 +1265,7 @@ class HandsFreeService:
     @staticmethod
     def _fetch_text(url: str) -> tuple[str, str]:
         request = Request(url, headers={"User-Agent": "Aurora-Cataloger/1.0"})
-        with urlopen(request, timeout=20) as response:
+        with build_opener(network_proxy_registry.get().urllib_proxy_handler()).open(request, timeout=20) as response:
             return response.read(2 * 1024 * 1024).decode(response.headers.get_content_charset() or "utf-8", errors="replace"), response.geturl()
 
     @staticmethod
@@ -815,7 +1275,7 @@ class HandsFreeService:
             headers["Cookie"] = cookie.strip().removeprefix("Cookie:").strip()
         request = Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=20) as response:
+            with build_opener(network_proxy_registry.get().urllib_proxy_handler()).open(request, timeout=20) as response:
                 body = json.loads(response.read(2 * 1024 * 1024).decode(response.headers.get_content_charset() or "utf-8"))
         except HTTPError as exc:
             if exc.code in {401, 403}:
@@ -828,13 +1288,67 @@ class HandsFreeService:
         return body
 
     @staticmethod
+    def _fetch_json(url: str, cookie: str | None) -> dict[str, Any]:
+        headers = {"User-Agent": "Aurora-Cataloger/1.0", "Accept": "application/json"}
+        if cookie and cookie.strip():
+            headers["Cookie"] = cookie.strip().removeprefix("Cookie:").strip()
+        request = Request(url, headers=headers)
+        try:
+            with build_opener(network_proxy_registry.get().urllib_proxy_handler()).open(request, timeout=20) as response:
+                body = json.loads(response.read(2 * 1024 * 1024).decode(response.headers.get_content_charset() or "utf-8"))
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise NeedsSessionError("The platform API requires a valid login session.", urlparse(url).hostname) from exc
+            raise ValueError(f"platform API request failed with HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise ValueError(f"platform API request failed: {exc}") from exc
+        if not isinstance(body, dict):
+            raise ValueError("platform API returned an invalid response")
+        return body
+
+    @staticmethod
     def _fetch_bytes(url: str, max_bytes: int) -> tuple[bytes, str | None]:
-        request = Request(url, headers={"User-Agent": "Aurora-Cataloger/1.0"})
-        with urlopen(request, timeout=30) as response:
+        class _SafeRedirectHandler(HTTPRedirectHandler):
+            def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
+                HandsFreeService._safe_url(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        HandsFreeService._safe_url(url)
+        headers = {"User-Agent": "Aurora-Cataloger/1.0"}
+        opener = build_opener(network_proxy_registry.get().urllib_proxy_handler(), _SafeRedirectHandler())
+        try:
+            head_request = Request(url, headers=headers, method="HEAD")
+            with opener.open(head_request, timeout=15) as head_response:
+                HandsFreeService._safe_url(head_response.geturl())
+                content_length = head_response.headers.get("Content-Length")
+                if content_length is not None and int(content_length) > max_bytes:
+                    raise ValueError("attachment exceeds size limit")
+        except ValueError:
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError):
+            # Some download endpoints do not implement HEAD; the bounded GET
+            # below remains the authoritative size check.
+            pass
+        request = Request(url, headers=headers)
+        with opener.open(request, timeout=30) as response:
+            HandsFreeService._safe_url(response.geturl())
             data = response.read(max_bytes + 1)
             if len(data) > max_bytes:
                 raise ValueError("attachment exceeds size limit")
             return data, response.headers.get_content_type()
+
+    @staticmethod
+    def open_external_attachment(url: str):
+        class _SafeRedirectHandler(HTTPRedirectHandler):
+            def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
+                HandsFreeService._safe_url(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        url = HandsFreeService._safe_url(url)
+        opener = build_opener(network_proxy_registry.get().urllib_proxy_handler(), _SafeRedirectHandler())
+        response = opener.open(Request(url, headers={"User-Agent": "Aurora-Attachment-Review/1.0"}), timeout=30)
+        HandsFreeService._safe_url(response.geturl())
+        return response
 
 
 class _PlaywrightAuthenticatedFetcher:
@@ -852,7 +1366,8 @@ class _PlaywrightAuthenticatedFetcher:
         self._context = None
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=True)
+            proxy = network_proxy_registry.get().playwright_proxy()
+            self._browser = self._playwright.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
             self._context = self._browser.new_context()
             if cookie and cookie.strip():
                 self._context.add_cookies(self._parse_cookie(cookie))
@@ -894,10 +1409,30 @@ class _PlaywrightAuthenticatedFetcher:
             raise ValueError("attachment exceeds size limit")
         return data, response.headers.get("content-type")
 
+    def fetch_json(self, url: str) -> dict[str, Any]:
+        response = self._context.request.get(url, timeout=30_000, max_redirects=5, headers={"Accept": "application/json"})
+        final_url = HandsFreeService._safe_url(response.url)
+        if not HandsFreeService._same_domain(self.source_url, final_url):
+            raise ValueError("platform API redirected outside the source domain")
+        if response.status in {401, 403}:
+            raise NeedsSessionError("The login session does not have access to the platform API.", urlparse(final_url).hostname)
+        if not response.ok:
+            raise ValueError(f"platform API request failed with HTTP {response.status}")
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise ValueError("platform API returned invalid JSON") from exc
+        if not isinstance(body, dict):
+            raise ValueError("platform API returned an invalid response")
+        return body
+
     def collect_attachments(self, candidates: list[dict[str, Any]], collector: Callable[[Any, dict[str, Any]], None]) -> None:
         """Run browser attachment collection in the authenticated import context."""
         for candidate in candidates:
             collector(self._context, candidate)
+
+    def collect_catalog(self, service: HandsFreeService) -> CollectionResult:
+        return service._browser_collection_context(self._context, self.source_url)
 
     def close(self) -> None:
         if self._context is not None:

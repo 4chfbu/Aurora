@@ -50,7 +50,7 @@ AURORA_CODEX_PROXY_BASE_URL=http://aurora-cc-switch:15723/v1
 uv run uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-`runtime-up.sh` 会构建 `aurora-kali-codex` 镜像、准备 CC Switch，并启动私有的 `aurora-runtime` 网络。API 启动后可用 `http://localhost:8000/health` 检查：
+`runtime-up.sh` 会构建共享层的 `aurora-kali-codex:core` 与 `aurora-kali-codex:heavy` 镜像、准备 CC Switch，并启动私有的 `aurora-runtime` 网络。Web 题路由到 core，其余题型路由到 heavy；选中的镜像和实际能力会写入 Solver 的 `tool_environment`。API 启动后可用 `http://localhost:8000/health` 检查：
 
 ```bash
 curl http://localhost:8000/health
@@ -118,9 +118,9 @@ AURORA_DEV_API_URL=http://localhost:8000 npm run dev
 3. 使用“运行规划器”消费线索并创建 Intent，使用“运行观察器”检查策略拒绝、重复调用或缺少证据等异常。
 4. 点击“开始自动解题”运行后台循环；需要立即终止时点击“停止自动解题”。
 5. 在“控制台”中可以更新题目站 Cookie、手动加入 Intent，或直接执行一个受策略检查的工具请求。
-6. 在“证据/结论”面板查看 Artifact 原文，并用选中的 Artifact 推导可追溯事实。
+6. 在“证据/结论”面板逐条填写支撑观察，为每条观察关联原始 Artifact，再形成可追溯结论。
 
-界面中的“刷新”只重新读取数据库；实时动作通过项目事件流自动更新。项目进入 `COMPLETED`、`FAILED` 或 `CANCELLED` 后，新增 Intent、Hint 和证据事实等黑板写入会被锁定。
+界面中的“刷新”只重新读取数据库；实时动作通过项目事件流自动更新。项目进入 `FLAG_READY`、`AWAITING_MANUAL_VALIDATION`、`COMPLETED`、`FAILED` 或 `CANCELLED` 后，新增 Intent、Hint 和证据事实等黑板写入会被锁定。
 
 ## 4. API 基本流程
 
@@ -173,7 +173,11 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/intents \
   }'
 ```
 
-`POST /scheduler/run-next` 每次只领取并运行一个 Intent。模型和工具产生的原始输出会存为 Artifact，系统会把候选 `flag{...}`/`ctf{...}` 交给 Flag Validator；确认有效的候选会形成 Finding 并推动项目完成，随后取消剩余待执行 Intent。
+`POST /scheduler/run-next` 每次只领取并运行一个 Intent。模型和工具产生的原始输出会存为 Artifact，但只有题目附件、可信目标响应或成功的 `flag.verify` 双重重放结果可以证明候选 flag。候选通过本地校验后形成 Finding 并进入 `FLAG_READY`；比赛平台或人工接受后才完成项目并取消剩余 Intent。模型文本、transcript、黑板摘要和普通 `sandbox.exec` 回显不能证明 flag。
+
+每个主 Solver 轮次进入 `SUCCESS`、`PARTIAL`、`FAILED` 或 `TIMEOUT` 后，系统都会在 blackboard 中写入一条轮次反思（API 中沿用 `checkpoints` 字段）。反思会整理本轮总结、证据结论、假设、失败路线和下一步，并审核 Solver 的候选建议后创建最多 3 个后续 Intent。Solver 输出的 `suggested_intents` 本身不会绕过反思直接进入调度队列；反思模型不可用时，系统使用确定性 fallback 规则校验这些建议。项目已经完成时仍保留最终反思，但不会再创建 Intent。Subagent 报告由主轮汇总，不单独触发反思。
+
+Fact 使用 `statement` 保存结论，使用 `evidence_items` 保存支撑结论的可观察证据。每个证据项包含 `description` 和至少一个 `artifact_refs`；例如证据可以是“参数 `id=1'` 返回 SQL 语法错误”，结论则是“目标接口的 `id` 参数存在 SQL 注入”。顶层 `evidence_refs` 是所有证据项引用的并集，用于兼容执行图和旧客户端。仅提交 `evidence_refs` 的旧格式仍然有效，但界面会标记为“仅关联原始材料”。
 
 ## 5. 自动解题
 
@@ -257,11 +261,11 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/browser/session 
 
 ## 7. “解放双手”批量导入
 
-Web 界面的“解放双手”用于从赛事、题库或题目列表 URL 归集候选题目和附件。Cataloger 只负责分类和归集，不执行 Solver 工具。
+Web 界面的“解放双手”用于从赛事、题库或题目列表 URL 归集候选题目和附件。系统按以下顺序处理：已知平台 API 适配器（当前包括 CTF+ 和 CTFd）、浏览器同域 JSON 响应解析、Cataloger 分类，以及最后的受限浏览器 Agent。Agent 只进行只读分页、筛选和题目详情展开，不执行 Solver 工具，也不会登录、提交答案、启动实例或执行任意 URL/脚本。
 
 1. 打开“解放双手”，输入题目列表 URL。
 2. 选择匿名、Cookie 或账号密码方式并点击“识别”。
-3. 通过进度条等待 `READY`；若返回 `NEEDS_SESSION`，补充 Cookie/登录信息后点击“继续抓取”。
+3. 系统从当前筛选视图开始采集并继续处理分页，直到没有新题目或达到配置上限。通过进度条等待 `READY`；若返回 `NEEDS_SESSION`，补充 Cookie/登录信息后点击“继续抓取”。
 4. 检查候选题目、题型、置信度和附件来源，取消不需要的项目并修改项目名称。
 5. 点击“批量创建项目”。系统会创建项目组、执行授权目标校验，并把项目加入题目组。
 6. 在题目组面板点击“开始组解题”或“停止”。
@@ -279,6 +283,8 @@ POST /api/challenge-groups/{group_id}/stop
 ```
 
 登录凭据只用于本次隔离浏览器抓取；仍应使用短期 Cookie，并在任务结束后撤销或更换凭据。
+
+候选必须具备平台 API、已观察 JSON 对象或明确题目详情链接等身份依据；低置信度推测、当前列表页、导航链接、Logo、脚本、样式和外部平台链接都会被过滤。若无法验证任何题目，批次仍以 `READY` 返回并展示诊断信息，但候选列表为空且不能执行“批量创建项目”。
 
 ## 8. 查看证据和调试记录
 
@@ -302,6 +308,8 @@ curl -sS 'http://localhost:8000/api/projects/'$PROJECT_ID'/runtime/logs?tail=200
 ```
 
 Artifact 保存原始工具输出、导入附件和 Codex transcript；上下文快照和调试面板默认只展示摘要及引用。安全相关字段会在上下文快照中脱敏。
+
+左侧“网络代理”可切换直连、系统代理和自定义 HTTP(S) 代理。保存后，新启动的 Solver、题目归集浏览器和附件下载使用同一网络出口；人工审查附件的下载图标通过 Aurora 流式转发，来源图标仍直接打开原始地址。
 
 需要清空当前工作黑板但保留原始证据和审计记录时，可调用：
 
@@ -362,6 +370,10 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=4
 ### 导入停在 `NEEDS_SESSION`
 
 目标题库需要登录。回到导入窗口选择 Cookie 或账号密码，提交后点击“继续抓取”。如果站点使用多因素认证或动态登录，先在浏览器完成登录，再粘贴有效 Cookie。
+
+### 导入完成但候选为零
+
+查看导入窗口中的诊断信息。零候选表示系统没有找到足够证据证明某个对象是题目，而不是自动把导航和资源链接降级为候选。确认 URL 保留了需要的筛选参数；若页面需要登录或登录后才加载题目，请提供有效短期 Cookie 后重新识别。
 
 ## 11. 本地验证
 

@@ -3,15 +3,18 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from sqlmodel import Session, select
 
 from aurora.models import Artifact, DiscoveredTarget, WorkerEvent
+from aurora.config import get_settings
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.browser_sessions import browser_session_registry
+from aurora.services.network_proxy import network_proxy_registry
 
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
@@ -55,16 +58,39 @@ class BrowserInteractionService:
             return BrowserInteractionResult(False, "Playwright Chromium is not installed", [], [])
 
         response_urls: list[str] = []
+        browser = None
+        settings = get_settings()
+        navigation_timeout = max(1, min(int(request.get("navigation_timeout_seconds", settings.browser_navigation_timeout_seconds)), 60)) * 1_000
+        retry_timeout = max(1, min(settings.browser_retry_timeout_seconds, 15)) * 1_000
+        dom_timeout = max(1, min(settings.browser_dom_timeout_seconds, 15)) * 1_000
+        action_timeout = max(1, min(settings.browser_action_timeout_seconds, 20)) * 1_000
+        total_deadline = time.monotonic() + max(5, min(int(request.get("total_timeout_seconds", 35)), 90))
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                proxy = network_proxy_registry.get().playwright_proxy()
+                browser = playwright.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
                 context = browser.new_context()
                 context.add_cookies(self._parse_cookie(browser_session.cookie, source_host))
                 page = context.new_page()
                 page.on("response", lambda response: response_urls.append(response.url))
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                navigation_error = None
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=min(navigation_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
+                except Exception as exc:
+                    navigation_error = exc
+                    try:
+                        page.goto(url, wait_until="commit", timeout=min(retry_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
+                        navigation_error = None
+                    except Exception as retry_exc:
+                        navigation_error = retry_exc
                 before_url = page.url
-                before_body = page.locator("body").inner_text(timeout=10_000)[:80_000]
+                try:
+                    before_body = page.locator("body").inner_text(timeout=dom_timeout)[:80_000]
+                except Exception:
+                    before_body = ""
+                if navigation_error is not None and not before_body and not response_urls:
+                    browser.close()
+                    return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=response_urls, page_text=before_body, reason=f"browser navigation timeout: {navigation_error}")
                 candidates = self._labeled_target_urls(before_body, source_host)
                 clicked = False
                 auto_launch_label = ""
@@ -82,6 +108,7 @@ class BrowserInteractionService:
                             project_id=project_id,
                             source_attempt_id=attempt_id,
                             artifact_type="browser-inspection",
+                            origin_kind="target_observation",
                             summary="Browser inspected challenge page; no labeled target address or launch control found",
                             content=json.dumps({"page_url": url, "page_text": before_body[:12_000], "target_urls": []}, ensure_ascii=False, indent=2),
                         )
@@ -93,12 +120,15 @@ class BrowserInteractionService:
                     if control.count() < 1:
                         browser.close()
                         return BrowserInteractionResult(False, "declared browser control was not found", [], [])
-                    control.click(timeout=10_000)
+                    control.click(timeout=min(action_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
                     clicked = True
-                    page.wait_for_timeout(min(max(int(request.get("wait_seconds", 5)), 1), 20) * 1_000)
-                    page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                    page.wait_for_timeout(min(min(max(int(request.get("wait_seconds", 5)), 1), 20) * 1_000, max(1, int((total_deadline - time.monotonic()) * 1_000))))
+                    page.wait_for_load_state("domcontentloaded", timeout=min(dom_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
                 final_url = page.url
-                body = page.locator("body").inner_text(timeout=10_000)[:80_000]
+                try:
+                    body = page.locator("body").inner_text(timeout=dom_timeout)[:80_000]
+                except Exception:
+                    body = before_body
                 candidates = list(dict.fromkeys([*candidates, *self._labeled_target_urls(body, source_host)]))
                 if clicked:
                     candidates = list(dict.fromkeys([*candidates, *self._target_urls([before_url, final_url, *response_urls, *URL_PATTERN.findall(body)], source_host)]))
@@ -107,12 +137,18 @@ class BrowserInteractionService:
                     project_id=project_id,
                     source_attempt_id=attempt_id,
                     artifact_type="browser-interaction",
+                    origin_kind="target_observation",
                     summary=f"Browser {'clicked ' + (auto_launch_label or text or selector) if clicked else 'inspected labeled fields'}; discovered {len(candidates)} target URL(s)",
                     content=json.dumps({"page_url": url, "before_url": before_url, "final_url": final_url, "locator": {"text": text, "selector": selector}, "clicked": clicked, "response_urls": response_urls[-100:], "target_urls": candidates, "page_text": body[:12_000]}, ensure_ascii=False, indent=2),
                 )
                 browser.close()
         except Exception as exc:
-            return BrowserInteractionResult(False, f"browser interaction failed: {exc}", [], [])
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=response_urls, page_text="", reason=f"browser interaction failed: {exc}")
 
         for target_url in candidates:
             host = (urlparse(target_url).hostname or "").lower().rstrip(".")
@@ -124,6 +160,16 @@ class BrowserInteractionService:
                 BlackboardRepository().upsert_intent(session, project_id=project_id, objective=f"Inspect provisioned target {target_url}", capability_tags=["http.request"], parent_intent_id=intent_id, priority=3.0, risk_level="low", budget={"tool_request": {"url": target_url, "timeout_seconds": 10}})
         session.commit()
         return BrowserInteractionResult(True, f"browser interaction completed; discovered {len(candidates)} target URL(s)", [artifact.id], candidates)
+
+    @staticmethod
+    def _record_execution_error(session: Session, *, project_id: str, attempt_id: str | None, url: str, response_urls: list[str], page_text: str, reason: str) -> BrowserInteractionResult:
+        artifact = ArtifactStore().write_text(
+            session, project_id=project_id, source_attempt_id=attempt_id,
+            artifact_type="browser-inspection", origin_kind="target_observation",
+            summary="Browser execution error; partial observation retained",
+            content=json.dumps({"page_url": url, "page_text": page_text[:12_000], "response_urls": response_urls[-100:], "error": reason}, ensure_ascii=False, indent=2),
+        )
+        return BrowserInteractionResult(False, reason, [artifact.id], [])
 
     @staticmethod
     def _same_domain(source_host: str, host: str) -> bool:

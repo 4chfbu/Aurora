@@ -19,7 +19,7 @@ class TargetVerificationResult:
 class TargetVerificationService:
     """Verify a challenge's launch page using the ephemeral project browser session."""
 
-    def verify(self, session: Session, *, project_id: str, source_url: str | None = None) -> TargetVerificationResult:
+    def verify(self, session: Session, *, project_id: str, source_url: str | None = None, source_metadata: dict | None = None) -> TargetVerificationResult:
         project = session.get(Project, project_id)
         if project is None:
             raise ValueError("project not found")
@@ -27,10 +27,14 @@ class TargetVerificationService:
         if browser_session is None:
             return self._record(session, project, "NEEDS_SESSION", "需要已登录的 Cookie 才能验证靶机启动", None)
 
+        request = {"url": source_url or browser_session.source_url, "wait_seconds": 5}
+        locator = source_metadata.get("locator") if isinstance(source_metadata, dict) else None
+        if isinstance(locator, dict):
+            request["locator"] = locator
         result = BrowserInteractionService().execute(
             session,
             project_id=project_id,
-            request={"url": source_url or browser_session.source_url, "wait_seconds": 5},
+            request=request,
             worker_id=None,
             intent_id=None,
             attempt_id=None,

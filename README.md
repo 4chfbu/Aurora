@@ -116,6 +116,10 @@ The capability gateway prefers Kali native tooling over MCP. It currently maps t
 - `binary.inspect` -> `file`, `sha256sum`, `strings`
 - `forensic.inspect` -> `file`, `exiftool`, `binwalk`
 
+The Worker build produces two shared-layer profiles. `core` contains the common Web, network, crypto, reverse, pwn, and forensic CLI suite. `heavy` adds Ghidra, angr, Volatility3, jadx/apktool, and hashcat with a Mesa CPU OpenCL backend. Web challenges use `core`; all other or unknown challenge types use `heavy`. The selected profile and command manifest are included in each Solver context.
+
+Stateful local analysis is exposed to Codex through two stdio MCP servers: `aurora_reverse` maintains Rizin sessions and optionally uses Ghidra decompilation, while `aurora_debug` maintains GDB/MI sessions. MCP calls are imported into Aurora as `ToolTrace` and Artifact records after the Worker exits.
+
 ## MCP Capabilities and FOFA
 
 Aurora exposes its Worker-visible capabilities through a small MCP-compatible registry. `blackboard.query` is read-only and returns Artifact-backed results. Native Kali capabilities remain the preferred implementation for local execution.
@@ -157,7 +161,7 @@ If Docker/Podman or the image is unavailable, commands fall back to local execut
 
 Raw stdout/stderr is stored in Artifact files. The model-facing context and UI debug panel only receive summaries and artifact references unless an artifact is explicitly opened.
 
-Tool artifacts are scanned for conservative candidate flag patterns such as `flag{...}` and `ctf{...}`. A detected candidate creates a `Finding`, emits `finding.flag_candidate`, and marks the project `COMPLETED`.
+Only trusted challenge/target artifacts and successful `flag.verify` replay artifacts are scanned for flag candidates. A locally verified candidate creates a `Finding`, emits `finding.flag_candidate`, and moves the project to `FLAG_READY`; only platform or manual acceptance marks it `COMPLETED`.
 
 When a project is completed, remaining pending Intents are cancelled and `scheduler/run-next` returns a `project_completed` no-op response instead of claiming more work.
 

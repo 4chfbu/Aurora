@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from sqlmodel import Session, select
 
-from aurora.models import Hint, Intent, WorkerEvent
+from aurora.models import AttemptCheckpoint, Hint, Intent, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
 
 
@@ -81,21 +81,25 @@ class ManagerService:
                 )
 
         if not proposed and not self._has_runnable_intents(session, project_id):
+            checkpoint = session.exec(
+                select(AttemptCheckpoint)
+                .where(AttemptCheckpoint.project_id == project_id)
+                .order_by(AttemptCheckpoint.created_at.desc())
+            ).first()
+            next_step = next(
+                (str(step).strip() for step in (checkpoint.next_steps if checkpoint else []) if str(step).strip()),
+                "Inspect current project evidence and produce the next evidence-backed result.",
+            )
             result = repository.upsert_intent(
                 session,
                 project_id=project_id,
-                objective="Review the current blackboard and decide the next concrete investigation step.",
-                capability_tags=["sandbox.exec"],
-                priority=0.4,
+                objective=f"Continue from the latest checkpoint: {next_step[:500]}",
+                capability_tags=["sandbox.exec", "blackboard.query"],
+                priority=0.8,
                 risk_level="low",
                 budget={
                     "model_role": "planner",
                     "max_tool_calls": 3,
-                    "tool_request": {
-                        "command": "printf 'Manager requested blackboard review.\\n'",
-                        "cwd": ".",
-                        "timeout_seconds": 5,
-                    }
                 },
             )
             proposed.append({"intent_id": result.item.id, "created": result.created, "objective": result.item.objective})

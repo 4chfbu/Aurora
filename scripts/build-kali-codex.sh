@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${AURORA_WORKER_IMAGE:-aurora-kali-codex:latest}"
+CORE_IMAGE="${AURORA_WORKER_IMAGE_CORE:-${AURORA_WORKER_IMAGE:-aurora-kali-codex:core}}"
+HEAVY_IMAGE="${AURORA_WORKER_IMAGE_HEAVY:-aurora-kali-codex:heavy}"
+MANIFEST_SHA="$(sha256sum aurora/tool_profiles.json | awk '{print $1}')"
 build_args=()
 if [[ -n "${AURORA_BUILD_PROXY:-}" ]]; then
   build_args+=(
@@ -10,5 +12,8 @@ if [[ -n "${AURORA_BUILD_PROXY:-}" ]]; then
     --build-arg "NO_PROXY=127.0.0.1,localhost"
   )
 fi
-docker build "${build_args[@]}" -t "${IMAGE_NAME}" -f container/kali-codex/Dockerfile .
-docker run --rm "${IMAGE_NAME}" bash -lc 'cat /etc/os-release | sed -n "1,3p"; command -v codex; codex --version'
+build_args+=(--build-arg "AURORA_TOOL_MANIFEST_SHA=${MANIFEST_SHA}")
+docker build "${build_args[@]}" --target core -t "${CORE_IMAGE}" -t aurora-kali-codex:latest -f container/kali-codex/Dockerfile .
+docker build "${build_args[@]}" --target heavy -t "${HEAVY_IMAGE}" -f container/kali-codex/Dockerfile .
+docker run --rm "${CORE_IMAGE}" bash -lc 'cat /etc/os-release | sed -n "1,3p"; codex --version; rizin -v | head -n 1; gdb --version | head -n 1'
+docker run --rm -e AURORA_SMOKE_GHIDRA=1 -v "$(pwd)/scripts/smoke-local-mcp.py:/tmp/smoke-local-mcp.py:ro" "${HEAVY_IMAGE}" bash -lc 'command -v analyzeHeadless ghidra hashcat vol; python -c "import angr, volatility3"; python /tmp/smoke-local-mcp.py; hashcat -I'

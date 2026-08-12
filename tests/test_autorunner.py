@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from aurora.api import create_app  # noqa: E402
 
 
-def test_autorun_start_completes_candidate_flag() -> None:
+def test_autorun_stops_when_candidate_is_ready_for_final_validation() -> None:
     client = TestClient(create_app())
     with client:
         project = client.post(
@@ -38,8 +38,8 @@ def test_autorun_start_completes_candidate_flag() -> None:
         )
         assert result.status_code == 200
         body = result.json()
-        assert body["autorun"]["status"] == "completed"
-        assert body["summary"]["project"]["status"] == "COMPLETED"
+        assert body["autorun"]["status"] == "candidate_ready"
+        assert body["summary"]["project"]["status"] == "FLAG_READY"
         assert body["summary"]["findings"][0]["title"] == "Candidate flag: flag{autorun_ok}"
 
 
@@ -61,6 +61,26 @@ def test_autorun_stops_on_observer_escalate() -> None:
         body = result.json()
         assert body["autorun"]["status"] == "blocked"
         assert body["autorun"]["stop_reason"] == "observer_escalate"
+
+
+def test_autorun_zero_no_progress_limit_disables_duplicate_blocking() -> None:
+    client = TestClient(create_app())
+    with client:
+        project = client.post(
+            "/api/projects",
+            json={"name": "autorun-unlimited-duplicates", "goal": "允许重复路由继续执行", "allowed_hosts": ["127.0.0.1"]},
+        ).json()
+        project_id = project["id"]
+        payload = {"request": {"command": "printf 'repeat\\n'", "cwd": ".", "timeout_seconds": 5}}
+        assert client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=payload).status_code == 200
+        assert client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=payload).status_code == 200
+
+        result = client.post(
+            f"/api/projects/{project_id}/autorun/start",
+            json={"max_iterations": 1, "max_minutes": 5, "no_progress_limit": 0},
+        )
+        assert result.status_code == 200
+        assert result.json()["autorun"]["stop_reason"] != "duplicate_tool_streak"
 
 
 def test_autorun_background_start_reports_status() -> None:

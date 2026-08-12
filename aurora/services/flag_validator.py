@@ -20,6 +20,9 @@ from aurora.services.artifact_store import ArtifactStore
 FLAG_VALUE_PATTERN = r"[a-z0-9][a-z0-9_-]{1,63}\{[^\s{}*]{1,200}\}"
 FLAG_PATTERNS = [re.compile(rf"(?i)(?<![a-z0-9_-]){FLAG_VALUE_PATTERN}")]
 
+TRUSTED_FLAG_ORIGINS = {"challenge_input", "target_observation", "operator_observation", "verified_derivation"}
+TRUSTED_LEGACY_FLAG_TYPES = {"imported_attachment", "browser-inspection", "browser-interaction", "flag-verification"}
+
 DECOY_PAYLOAD_MARKERS = (
     "fake",
     "false",
@@ -74,7 +77,11 @@ class FlagValidator:
                     if key in seen:
                         continue
                     seen.add(key)
-                    candidates.append({"value": value, "artifact_ref": artifact_id, "validator": "regex"})
+                    candidates.append({
+                        "value": value,
+                        "artifact_ref": artifact_id,
+                        "validator": "replay" if artifact.origin_kind == "verified_derivation" else "observed",
+                    })
         return candidates
 
     def is_verified_candidate(self, session: Session, *, value: str, artifact_ref: str | None, project_id: str | None = None) -> bool:
@@ -144,7 +151,14 @@ class FlagValidator:
 
     @staticmethod
     def is_trusted_evidence_artifact(artifact: Artifact | None) -> bool:
-        return artifact is not None and artifact.sensitivity != "secret" and artifact.type != "codex-transcript"
+        return bool(
+            artifact is not None
+            and artifact.sensitivity != "secret"
+            and (
+                artifact.origin_kind in TRUSTED_FLAG_ORIGINS
+                or (artifact.origin_kind == "unclassified" and artifact.type in TRUSTED_LEGACY_FLAG_TYPES)
+            )
+        )
 
     def _scannable_content(self, artifact: Artifact, content: str) -> str:
         if "[stdout]" in content:

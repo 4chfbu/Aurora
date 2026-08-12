@@ -13,12 +13,16 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from aurora.api import create_app  # noqa: E402
 from aurora.db import engine  # noqa: E402
-from aurora.models import Attempt, ChallengeGroup, ChallengeGroupItem, DiscoveredTarget, Fact, ImportCandidate, Intent, LLMTrace, Project, Worker, WorkerEvent, now_utc  # noqa: E402
+from aurora.models import Attempt, AttemptCheckpoint, ChallengeGroup, ChallengeGroupItem, DiscoveredTarget, Fact, Finding, FlagCandidate, ImportCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc  # noqa: E402
+from aurora.services.challenge_group_runner import GroupRunState  # noqa: E402
 from aurora.services.artifact_store import ArtifactStore  # noqa: E402
 from aurora.services.browser_interaction import BrowserInteractionService  # noqa: E402
+from aurora.services.capability_gateway import CapabilityGateway  # noqa: E402
+from aurora.services.demo import _repeat_failure_count, _route_request  # noqa: E402
 from aurora.services.flag_validator import FlagValidator  # noqa: E402
 from aurora.services.policy import PolicyEngine  # noqa: E402
 from aurora.services.result_processor import ResultProcessor  # noqa: E402
+from aurora.services.round_summary import RoundReflectionService  # noqa: E402
 from aurora.services.scheduler import Scheduler  # noqa: E402
 from aurora.services.worker_runtime import CodexHarnessRuntime  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
@@ -50,10 +54,14 @@ def test_demo_flow_creates_blackboard_and_debug_traces() -> None:
         assert len(body["artifacts"]) >= 1
         assert len(body["checkpoints"]) == 1
         assert body["checkpoints"][0]["source"] == "fallback"
+        assert len(body["checkpoints"][0]["generated_intent_ids"]) == 1
+        reflected_intent = next(intent for intent in body["intents"] if intent["id"] == body["checkpoints"][0]["generated_intent_ids"][0])
+        assert reflected_intent["parent_intent_id"] == body["checkpoints"][0]["intent_id"]
 
         contexts = client.get(f"/api/projects/{project_id}/debug/context-snapshots")
         assert contexts.status_code == 200
         assert contexts.json()[0]["estimated_tokens"] > 0
+        assert contexts.json()[0]["sections_json"]["current_intent"]["budget"]["soft_timeout_seconds"] > 0
 
         traces = client.get(f"/api/projects/{project_id}/debug/llm-traces")
         assert traces.status_code == 200
@@ -67,6 +75,98 @@ def test_demo_flow_creates_blackboard_and_debug_traces() -> None:
         artifact_content = client.get(f"/api/artifacts/{artifact_id}/content")
         assert artifact_content.status_code == 200
         assert "Aurora Kali-first sandbox smoke test" in artifact_content.json()["content"]
+
+
+def test_manual_flag_acceptance_resumes_group_with_pending_items(monkeypatch) -> None:
+    client = TestClient(create_app())
+    with client:
+        with Session(engine) as session:
+            solved = Project(name="manual-solved", goal="solved", status="COMPLETED")
+            pending = Project(name="manual-next", goal="next")
+            group = ChallengeGroup(name="manual-resume", status="AWAITING_MANUAL_VALIDATION")
+            session.add_all([solved, pending, group])
+            session.commit()
+            reviewed = ChallengeGroupItem(
+                group_id=group.id,
+                project_id=solved.id,
+                position=1,
+                status="AWAITING_MANUAL_VALIDATION",
+                fused_status="AWAITING_MANUAL_VALIDATION",
+                submission_status="AWAITING_MANUAL_VALIDATION",
+            )
+            next_item = ChallengeGroupItem(group_id=group.id, project_id=pending.id, position=2)
+            finding = Finding(project_id=solved.id, title="Candidate flag: flag{manual_review}")
+            session.add_all([reviewed, next_item, finding])
+            session.commit()
+            group_id, item_id = group.id, reviewed.id
+
+        resumed: list[str] = []
+
+        def resume(group_id: str) -> GroupRunState:
+            resumed.append(group_id)
+            return GroupRunState(group_id=group_id)
+
+        monkeypatch.setattr("aurora.api.challenge_group_registry.resume_after_manual_validation", resume)
+        response = client.post(
+            f"/api/challenge-groups/{group_id}/items/{item_id}/flag-validation",
+            json={"accepted": True},
+        )
+
+        assert response.status_code == 200
+        assert resumed == [group_id]
+        assert response.json()["background"]["status"] == "running"
+        with Session(engine) as session:
+            assert session.get(ChallengeGroup, group_id).status == "READY"
+            assert session.get(ChallengeGroupItem, item_id).submission_status == "MANUALLY_ACCEPTED"
+
+
+def test_project_flag_acceptance_advances_awaiting_group_item(monkeypatch) -> None:
+    client = TestClient(create_app())
+    with client:
+        with Session(engine) as session:
+            solved = Project(name="top-review", goal="solved", status="AWAITING_MANUAL_VALIDATION")
+            pending = Project(name="top-next", goal="next")
+            group = ChallengeGroup(name="top-resume", status="AWAITING_MANUAL_VALIDATION")
+            session.add_all([solved, pending, group])
+            session.commit()
+            reviewed = ChallengeGroupItem(
+                group_id=group.id,
+                project_id=solved.id,
+                position=1,
+                status="AWAITING_MANUAL_VALIDATION",
+                fused_status="AWAITING_MANUAL_VALIDATION",
+                submission_status="AWAITING_MANUAL_VALIDATION",
+            )
+            next_item = ChallengeGroupItem(group_id=group.id, project_id=pending.id, position=2)
+            finding = Finding(project_id=solved.id, title="Candidate flag: flag{top_review}")
+            candidate = FlagCandidate(
+                project_id=solved.id,
+                value="flag{top_review}",
+                value_hash="top-review-hash",
+                status="AWAITING_MANUAL_VALIDATION",
+                provenance_kind="OBSERVED",
+            )
+            session.add_all([reviewed, next_item, finding, candidate])
+            session.commit()
+            project_id, candidate_id, group_id, item_id = solved.id, candidate.id, group.id, reviewed.id
+
+        resumed: list[str] = []
+        monkeypatch.setattr(
+            "aurora.api.challenge_group_registry.resume_after_manual_validation",
+            lambda current_group_id: resumed.append(current_group_id) or GroupRunState(group_id=current_group_id),
+        )
+        response = client.post(
+            f"/api/projects/{project_id}/flag-candidates/{candidate_id}/validation",
+            json={"accepted": True},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["groups"] == [group_id]
+        assert resumed == [group_id]
+        with Session(engine) as session:
+            assert session.get(ChallengeGroup, group_id).status == "READY"
+            assert session.get(ChallengeGroupItem, item_id).submission_status == "MANUALLY_ACCEPTED"
+            assert session.get(Project, project_id).status == "COMPLETED"
 
 
 def test_deleting_project_removes_group_items_and_resets_import_candidate() -> None:
@@ -335,6 +435,9 @@ def test_scheduler_heartbeat_and_reap_expired_leases() -> None:
             assert timed_out_attempt.status == "TIMEOUT"
             assert timed_out_attempt.finished_at is not None
             assert retried_intent is not None and retried_intent.status == "PENDING"
+            checkpoint = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.attempt_id == timed_out_attempt.id)).one()
+            assert checkpoint.source == "fallback"
+            assert checkpoint.generated_intent_ids == []
 
         events = client.get(f"/api/projects/{project_id}/events")
         assert events.status_code == 200
@@ -342,6 +445,125 @@ def test_scheduler_heartbeat_and_reap_expired_leases() -> None:
         assert "worker.heartbeat" in event_types
         assert "intent.lease_expired" in event_types
         assert {"worker.timed_out", "attempt.timed_out"}.issubset(event_types)
+        assert "reflection.fallback" in event_types
+
+
+def test_reflection_is_the_only_automatic_intent_authority_and_is_idempotent() -> None:
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "reflection-authority", "goal": "Verify reflection intent ownership.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        with Session(engine) as session:
+            source_intent = session.exec(select(Intent).where(Intent.project_id == project_id)).one()
+            worker = Worker(project_id=project_id, intent_id=source_intent.id, status="COMPLETED")
+            session.add(worker)
+            session.commit()
+            attempt = Attempt(project_id=project_id, intent_id=source_intent.id, worker_id=worker.id)
+            session.add(attempt)
+            session.commit()
+            session.refresh(attempt)
+            trace = LLMTrace(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=source_intent.id,
+                context_snapshot_id="ctx_reflection_authority",
+                prompt_hash="reflection-test",
+                model="test",
+            )
+            output = {
+                "status": "partial",
+                "summary": "One route remains.",
+                "suggested_intents": [
+                    {
+                        "objective": "Inspect the blackboard evidence.",
+                        "capability_tags": ["blackboard.query"],
+                        "priority": 2.0,
+                        "budget": {"model_role": "planner", "max_tool_calls": 2, "unsafe_key": "discarded"},
+                    },
+                    {"objective": "Rejected unsafe capability.", "capability_tags": ["unknown.exec"], "priority": 9.0},
+                ],
+                "decision_summary": {"next_tool_plan": ["blackboard.query"]},
+            }
+            ResultProcessor().apply(session, attempt=attempt, output=output, llm_trace=trace)
+            assert session.exec(select(Intent).where(Intent.parent_intent_id == source_intent.id)).all() == []
+
+            first = RoundReflectionService().create(session, attempt=attempt, output=output, budget={})
+            second = RoundReflectionService().create(session, attempt=attempt, output=output, budget={})
+            assert first.id == second.id
+            assert len(first.generated_intent_ids) == 1
+            generated = session.get(Intent, first.generated_intent_ids[0])
+            assert generated is not None and generated.capability_tags == ["blackboard.query"]
+            assert generated.budget == {"model_role": "planner", "max_tool_calls": 2}
+            assert len(session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.attempt_id == attempt.id)).all()) == 1
+
+
+def test_completed_project_reflects_without_generating_intents() -> None:
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "final-reflection", "goal": "Keep a final reflection.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        with Session(engine) as session:
+            intent = session.exec(select(Intent).where(Intent.project_id == project_id)).one()
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="COMPLETED")
+            session.add(worker)
+            session.commit()
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id, status="SUCCESS", result_summary="Solved")
+            session.add(attempt)
+            project = session.get(Project, project_id)
+            assert project is not None
+            project.status = "COMPLETED"
+            session.add(project)
+            session.commit()
+            session.refresh(attempt)
+            checkpoint = RoundReflectionService().create(
+                session,
+                attempt=attempt,
+                output={
+                    "status": "success",
+                    "summary": "Solved",
+                    "suggested_intents": [{"objective": "Do unnecessary work", "capability_tags": ["blackboard.query"]}],
+                    "decision_summary": {"next_tool_plan": []},
+                },
+                budget={},
+            )
+            assert checkpoint.generated_intent_ids == []
+
+
+def test_planner_reflection_caps_generated_intents_at_three(monkeypatch) -> None:
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "planner-reflection", "goal": "Bound reflected branches.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        with Session(engine) as session:
+            intent = session.exec(select(Intent).where(Intent.project_id == project_id)).one()
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="COMPLETED")
+            session.add(worker)
+            session.commit()
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id, status="PARTIAL", result_summary="Reflect")
+            session.add(attempt)
+            session.commit()
+            session.refresh(attempt)
+            planned = {
+                "summary": "Planner reflection",
+                "conclusions": [],
+                "hypotheses": [],
+                "failed_routes": [],
+                "next_steps": ["one", "two", "three"],
+                "intents": [
+                    {"objective": f"Reflected branch {index}", "capabilities": ["blackboard.query"], "priority": index}
+                    for index in range(1, 5)
+                ],
+            }
+            monkeypatch.setattr(RoundReflectionService, "_planner_summary", lambda self, fallback: planned)
+            checkpoint = RoundReflectionService().create(session, attempt=attempt, output={}, budget={})
+            assert checkpoint.source == "planner"
+            assert len(checkpoint.generated_intent_ids) == 3
 
 
 def test_blackboard_suppresses_duplicate_intents_and_merges_facts() -> None:
@@ -414,6 +636,109 @@ def test_observer_escalates_policy_denial() -> None:
         assert "observer.decision" in {event["event_type"] for event in events.json()}
 
 
+def test_browser_execution_error_does_not_escalate_as_policy_denial(monkeypatch) -> None:
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "browser-error", "goal": "browser error classification", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+
+        def failed_browser(*args, **kwargs):
+            from aurora.services.browser_interaction import BrowserInteractionResult
+            return BrowserInteractionResult(False, "browser interaction failed: timeout", [], [])
+
+        monkeypatch.setattr(BrowserInteractionService, "execute", failed_browser)
+        with Session(engine) as session:
+            result = CapabilityGateway().execute(
+                session,
+                project_id=project_id,
+                worker_id=None,
+                intent_id=None,
+                attempt_id=None,
+                tool_name="browser.interact",
+                    request={"url": "http://127.0.0.1/challenges"},
+            )
+        # The trace classification is what Observer consumes; execution
+        # failures must remain distinguishable from policy denials.
+        with Session(engine) as session:
+            trace = session.get(ToolTrace, result.trace_id)
+            assert trace is not None
+            assert trace.policy_decision == "execution_error"
+
+
+def test_repeat_failure_count_matches_non_adjacent_failed_routes() -> None:
+    project_id = "proj_repeat_route"
+    intent_id = "intent_repeat_route"
+    repeated_request = {"url": "http://127.0.0.1/challenges"}
+    with Session(engine) as session:
+        session.add_all([
+            ToolTrace(project_id=project_id, intent_id=intent_id, tool_name="browser.interact", request_json=repeated_request, policy_decision="execution_error"),
+            ToolTrace(project_id=project_id, intent_id=intent_id, tool_name="blackboard.query", request_json={}, policy_decision="allow", exit_code=0),
+            ToolTrace(project_id=project_id, intent_id=intent_id, tool_name="browser.interact", request_json=repeated_request, policy_decision="execution_error"),
+        ])
+        session.commit()
+
+        assert _repeat_failure_count(
+            session,
+            project_id=project_id,
+            tool_name="browser.interact",
+            request=repeated_request,
+        ) == 2
+
+
+def test_browser_route_fingerprint_changes_with_session_cookie() -> None:
+    from aurora.services.browser_sessions import browser_session_registry
+
+    project_id = "proj_browser_fingerprint"
+    request = {"url": "https://example.test/challenge"}
+    browser_session_registry.set_project_session(project_id=project_id, source_url=request["url"], cookie="session=one")
+    first = _route_request(project_id, "browser.interact", request)
+    browser_session_registry.set_project_session(project_id=project_id, source_url=request["url"], cookie="session=two")
+    second = _route_request(project_id, "browser.interact", request)
+    browser_session_registry.clear_project_session(project_id)
+
+    assert first["_aurora_browser_session"] != second["_aurora_browser_session"]
+    assert "session=one" not in str(first)
+
+
+def test_scheduler_suppresses_same_failed_route_across_intents(monkeypatch) -> None:
+    from aurora.services.browser_interaction import BrowserInteractionResult
+
+    def failed_browser(*args, **kwargs):
+        return BrowserInteractionResult(False, "no labeled target address or launch control found", [], [])
+
+    monkeypatch.setattr(BrowserInteractionService, "execute", failed_browser)
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "repeat-browser-route", "goal": "Suppress a repeated browser dead end.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        route = {"url": "http://127.0.0.1/challenge"}
+        results = []
+        for index in range(3):
+            created = client.post(
+                f"/api/projects/{project_id}/intents",
+                json={
+                    "objective": f"Inspect the same browser route attempt {index}",
+                    "capability_tags": ["browser.interact"],
+                    "priority": 10,
+                    "risk_level": "low",
+                    "tool_request": route,
+                },
+            )
+            assert created.status_code == 200
+            results.append(client.post(f"/api/projects/{project_id}/scheduler/run-next").json())
+
+        traces = client.get(f"/api/projects/{project_id}/debug/tool-traces").json()
+        events = client.get(f"/api/projects/{project_id}/events").json()
+
+    assert len([trace for trace in traces if trace["tool_name"] == "browser.interact"]) == 2
+    assert results[2]["tool_calls"][0]["skipped"] is True
+    assert any(event["event_type"] == "tool.skipped.repeat_failure" for event in events)
+
+
 def test_observer_redirects_duplicate_tool_calls() -> None:
     client = TestClient(create_app())
     with client:
@@ -433,6 +758,27 @@ def test_observer_redirects_duplicate_tool_calls() -> None:
         observer = client.post(f"/api/projects/{project_id}/observer/run")
         assert observer.status_code == 200
         assert observer.json()["decision"] == "REDIRECT"
+
+
+def test_observer_does_not_redirect_non_consecutive_duplicate_tool_calls() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "observer-non-consecutive", "goal": "Verify observer streak detection.", "allowed_hosts": ["127.0.0.1"]},
+        )
+        assert created.status_code == 200
+        project_id = created.json()["id"]
+        repeated = {"request": {"command": "printf 'repeat\\n'", "cwd": ".", "timeout_seconds": 5}}
+        different = {"request": {"command": "printf 'different\\n'", "cwd": ".", "timeout_seconds": 5}}
+
+        assert client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=repeated).status_code == 200
+        assert client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=different).status_code == 200
+        assert client.post(f"/api/projects/{project_id}/tools/sandbox.exec/execute", json=repeated).status_code == 200
+
+        observer = client.post(f"/api/projects/{project_id}/observer/run")
+        assert observer.status_code == 200
+        assert observer.json()["decision"] == "CONTINUE"
 
 
 def test_manager_generates_intent_from_url_hint_without_duplicates() -> None:
@@ -504,7 +850,7 @@ def test_post_creation_hint_is_consumed_by_manager() -> None:
         assert "manager.decision" in event_types
 
 
-def test_candidate_flag_creates_finding_and_completes_project() -> None:
+def test_candidate_flag_creates_finding_and_waits_for_final_validation() -> None:
     client = TestClient(create_app())
     with client:
         created = client.post(
@@ -532,7 +878,7 @@ def test_candidate_flag_creates_finding_and_completes_project() -> None:
 
         project = client.get(f"/api/projects/{project_id}")
         assert project.status_code == 200
-        assert project.json()["status"] == "COMPLETED"
+        assert project.json()["status"] == "FLAG_READY"
 
         findings = client.get(f"/api/projects/{project_id}/findings")
         assert findings.status_code == 200
@@ -542,11 +888,11 @@ def test_candidate_flag_creates_finding_and_completes_project() -> None:
         assert events.status_code == 200
         event_types = {event["event_type"] for event in events.json()}
         assert "finding.flag_candidate" in event_types
-        assert "project.completed" in event_types
+        assert "project.flag_ready" in event_types
+        assert "project.completed" not in event_types
 
 
-def test_derived_competition_prefixed_flag_is_archived() -> None:
-    """Computed flags need not occur verbatim in their source artifact."""
+def test_unreplayed_derived_flag_is_rejected() -> None:
     client = TestClient(create_app())
     with client:
         created = client.post(
@@ -580,18 +926,22 @@ def test_derived_competition_prefixed_flag_is_archived() -> None:
                     "status": "success",
                     "artifact_refs": [source.id],
                     "candidate_flags": [value],
-                    "fact_candidates": [{"statement": f"ROT13 decode yields {value}", "evidence_refs": [source.id]}],
+                    "fact_candidates": [{
+                        "statement": f"ROT13 decode yields {value}",
+                        "evidence_refs": [source.id],
+                        "evidence_items": [{"description": "Applying ROT13 to the ciphertext produced the candidate flag.", "artifact_refs": []}],
+                    }],
                 },
             )
+            assert session.exec(select(Fact).where(Fact.statement == f"ROT13 decode yields {value}")).first() is None
 
         project = client.get(f"/api/projects/{project_id}")
-        assert project.json()["status"] == "COMPLETED"
+        assert project.json()["status"] == "ACTIVE"
         findings = client.get(f"/api/projects/{project_id}/findings")
-        assert findings.json()[0]["title"] == f"Candidate flag: {value}"
+        assert findings.json() == []
 
 
-def test_event_specific_prefix_flag_completes_without_trusted_transcript_evidence() -> None:
-    """A meaningful event prefix such as qwxf is a valid flag prefix."""
+def test_event_specific_prefix_without_evidence_is_rejected() -> None:
     client = TestClient(create_app())
     with client:
         project_id = client.post(
@@ -613,8 +963,8 @@ def test_event_specific_prefix_flag_completes_without_trusted_transcript_evidenc
                 output={"status": "success", "candidate_flags": ["qwxf{you_say_chick_beautiful?}"]},
             )
 
-        assert client.get(f"/api/projects/{project_id}").json()["status"] == "COMPLETED"
-        assert client.get(f"/api/projects/{project_id}/findings").json()[0]["title"] == "Candidate flag: qwxf{you_say_chick_beautiful?}"
+        assert client.get(f"/api/projects/{project_id}").json()["status"] == "ACTIVE"
+        assert client.get(f"/api/projects/{project_id}/findings").json() == []
 
 
 def test_decoy_flag_returns_continue_feedback_and_deep_investigation_intent() -> None:
@@ -718,6 +1068,13 @@ def test_completed_project_cancels_pending_intents_and_blocks_run_next() -> None
         assert run_flag.status_code == 200
         assert run_flag.json()["status"] == "completed"
 
+        candidate = client.get(f"/api/projects/{project_id}/flag-candidates").json()[0]
+        accepted = client.post(
+            f"/api/projects/{project_id}/flag-candidates/{candidate['id']}/validation",
+            json={"accepted": True},
+        )
+        assert accepted.status_code == 200
+
         run_again = client.post(f"/api/projects/{project_id}/scheduler/run-next")
         assert run_again.status_code == 200
         assert run_again.json()["status"] == "project_completed"
@@ -757,6 +1114,12 @@ def test_completed_project_rejects_new_intents_and_hints() -> None:
         assert intent.status_code == 200
         assert client.post(f"/api/projects/{project_id}/scheduler/run-next").status_code == 200
 
+        candidate = client.get(f"/api/projects/{project_id}/flag-candidates").json()[0]
+        assert client.post(
+            f"/api/projects/{project_id}/flag-candidates/{candidate['id']}/validation",
+            json={"accepted": True},
+        ).status_code == 200
+
         new_intent = client.post(
             f"/api/projects/{project_id}/intents",
             json={"objective": "Should fail", "capability_tags": ["sandbox.exec"]},
@@ -792,8 +1155,9 @@ def test_project_summary_supports_acceptance_review() -> None:
         summary = client.get(f"/api/projects/{project_id}/summary")
         assert summary.status_code == 200
         body = summary.json()
-        assert body["project"]["status"] == "COMPLETED"
+        assert body["project"]["status"] == "FLAG_READY"
         assert body["counts"]["findings"] == 1
+        assert body["flag_candidates"][0]["status"] == "LOCAL_VERIFIED"
         assert body["counts"]["events_returned"] >= 1
         assert body["findings"][0]["title"] == "Candidate flag: ctf{summary}"
         assert body["latest_context_snapshot"] is not None
@@ -929,10 +1293,62 @@ def test_evidence_conclusion_runtime_warning_and_rethink(monkeypatch) -> None:
 
         derived = client.post(
             f"/api/projects/{project_id}/facts",
-            json={"statement": "The target exposes an X-Test response header.", "evidence_refs": [artifact_id], "confidence": 0.8, "category": "web"},
+            json={
+                "statement": "The target exposes an X-Test response header.",
+                "evidence_items": [{"description": "The response contains the X-Test header.", "artifact_refs": [artifact_id]}],
+                "confidence": 0.8,
+                "category": "web",
+            },
         )
         assert derived.status_code == 200
         assert derived.json()["evidence_refs"] == [artifact_id]
+        assert derived.json()["evidence_items"] == [{"description": "The response contains the X-Test header.", "artifact_refs": [artifact_id]}]
+
+        merged = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={
+                "statement": "The target exposes an X-Test response header.",
+                "evidence_items": [{"description": "A repeated request returns the same header.", "artifact_refs": [artifact_id]}],
+                "confidence": 0.9,
+                "category": "web",
+            },
+        )
+        assert merged.status_code == 200
+        assert len(merged.json()["evidence_items"]) == 2
+        assert merged.json()["confidence"] == 0.9
+
+        legacy = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={"statement": "Legacy evidence remains supported.", "evidence_refs": [artifact_id], "confidence": 0.6, "category": "compatibility"},
+        )
+        assert legacy.status_code == 200
+        assert legacy.json()["evidence_items"] == []
+
+        missing_evidence = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={"statement": "Unsupported conclusion.", "confidence": 0.6, "category": "web"},
+        )
+        assert missing_evidence.status_code == 422
+
+        blank_description = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={"statement": "Blank evidence.", "evidence_items": [{"description": "   ", "artifact_refs": [artifact_id]}]},
+        )
+        assert blank_description.status_code == 422
+
+        other_project_id = client.post(
+            "/api/projects",
+            json={"name": "other-evidence", "goal": "Own another artifact.", "allowed_hosts": ["127.0.0.1"]},
+        ).json()["id"]
+        other_artifact = client.post(
+            f"/api/projects/{other_project_id}/tools/sandbox.exec/execute",
+            json={"request": {"command": "printf 'other project'", "cwd": ".", "timeout_seconds": 5}},
+        ).json()["artifact_refs"][0]
+        cross_project = client.post(
+            f"/api/projects/{project_id}/facts",
+            json={"statement": "Cross-project evidence.", "evidence_items": [{"description": "Wrong source.", "artifact_refs": [other_artifact]}]},
+        )
+        assert cross_project.status_code == 400
 
         with Session(engine) as session:
             warning = WorkerEvent(project_id=project_id, event_type="runtime.error", payload_json={"error": "container exited 1"})

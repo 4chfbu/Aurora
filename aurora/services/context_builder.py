@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 from aurora.config import get_settings
 from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, Intent, Project, ProjectRuntimePolicy, Worker, WorkerEvent
 from aurora.services.mcp_registry import visible_mcp_tools
+from aurora.services.tool_profiles import tool_environment
 
 
 SECRET_PATTERNS = [
@@ -19,14 +20,24 @@ SECRET_PATTERNS = [
 OUTPUT_SCHEMA: dict[str, Any] = {
     "status": "success | partial | failed",
     "summary": "short operator-visible result",
-    "fact_candidates": [{"statement": "...", "confidence": 0.0, "category": "...", "evidence_refs": []}],
+    "fact_candidates": [{
+        "statement": "evidence-backed conclusion",
+        "confidence": 0.0,
+        "category": "...",
+        "evidence_refs": [],
+        "evidence_items": [{"description": "observable supporting evidence", "artifact_refs": ["artifact_id"]}],
+    }],
     "hypotheses": [],
     "artifact_refs": [],
     "failed_attempts": [],
     "suggested_intents": [],
     "fork_recommendations": [],
     "subagent_reports": [],
-    "candidate_flags": [],
+    "candidate_flags": [{
+        "value": "prefix{payload}",
+        "artifact_ref": "trusted artifact containing the exact value",
+        "provenance_kind": "observed | derived_replay",
+    }],
     "decision_summary": {
         "selected_intent": "...",
         "reason_summary": "observable non-chain-of-thought rationale",
@@ -80,6 +91,7 @@ class ContextBuilder:
 
         sections: dict[str, Any] = {
             "project_goal": project.goal,
+            "tool_environment": tool_environment(settings, project.challenge_type),
             "competition_context": {
                 "phase": group_item.phase,
                 "attachments": list((group_item.competition_meta or {}).get("attachments", [])),
@@ -94,7 +106,10 @@ class ContextBuilder:
                 "capability_tags": intent.capability_tags,
                 "risk_level": intent.risk_level,
                 "tool_request": intent.budget.get("tool_request") if intent.budget else None,
-                "budget": intent.budget or {},
+                # Worker budgets contain the effective defaults applied by the
+                # scheduler. Expose them so the solver can honor the soft
+                # finalization deadline even when the Intent omitted limits.
+                "budget": {**(intent.budget or {}), **(worker.budgets if worker else {})},
             },
             "authorization_scope": scope.model_dump(mode="json") if scope else None,
             "facts": [
@@ -104,6 +119,7 @@ class ContextBuilder:
                     "category": fact.category,
                     "confidence": fact.confidence,
                     "evidence_refs": fact.evidence_refs,
+                    "evidence_items": fact.evidence_items,
                 }
                 for fact in facts
             ],
@@ -122,6 +138,7 @@ class ContextBuilder:
                     "next_steps": checkpoint.next_steps,
                     "fact_refs": checkpoint.fact_refs,
                     "artifact_refs": checkpoint.artifact_refs,
+                    "generated_intent_ids": checkpoint.generated_intent_ids,
                 }
                 for checkpoint in checkpoints
             ],

@@ -1,0 +1,17 @@
+[mcp_servers.aurora_reverse]
+command = "/opt/aurora-venv/bin/python"
+args = ["/opt/aurora-mcp/reverse_server.py"]
+startup_timeout_sec = 20
+tool_timeout_sec = 300
+
+[mcp_servers.aurora_reverse.env]
+AURORA_MCP_EVENT_LOG = "/workspace/runtime/mcp-events.jsonl"
+
+[mcp_servers.aurora_debug]
+command = "/opt/aurora-venv/bin/python"
+args = ["/opt/aurora-mcp/debug_server.py"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.aurora_debug.env]
+AURORA_MCP_EVENT_LOG = "/workspace/runtime/mcp-events.jsonl"

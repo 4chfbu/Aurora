@@ -1,0 +1,6 @@
+mcp==1.13.1
+pillow==11.3.0
+pygdbmi==0.11.0.0
+ROPGadget==7.6
+unix-ar==0.2.1
+unicorn==2.1.2

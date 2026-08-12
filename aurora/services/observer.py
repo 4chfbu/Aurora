@@ -59,11 +59,12 @@ class ObserverService:
     def _find_duplicate_tool_call(self, tool_traces: list[ToolTrace]) -> ObserverDecision | None:
         if len(tool_traces) < 2:
             return None
-        latest, previous = tool_traces[0], tool_traces[1]
-        if latest.tool_name == previous.tool_name and stable_json(latest.request_json) == stable_json(previous.request_json):
+        latest = tool_traces[0]
+        previous = tool_traces[1]
+        if previous.tool_name == latest.tool_name and stable_json(previous.request_json) == stable_json(latest.request_json):
             return ObserverDecision(
                 "REDIRECT",
-                "The two most recent tool calls are identical; redirect before repeating more work.",
+                "The two latest tool routes are identical; redirect before repeating more work.",
                 severity="medium",
                 references={"tool_trace_ids": [latest.id, previous.id], "tool_name": latest.tool_name},
             )

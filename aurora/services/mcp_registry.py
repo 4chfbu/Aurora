@@ -23,6 +23,21 @@ BASE_TOOLS = (
     MCPToolDefinition("web.enumerate", "semantic", "kali-native", "Enumerate an authorized web target.", {"type": "object"}),
     MCPToolDefinition("binary.inspect", "semantic", "kali-native", "Inspect an authorized local binary.", {"type": "object"}),
     MCPToolDefinition("forensic.inspect", "semantic", "kali-native", "Inspect an authorized local artifact.", {"type": "object"}),
+    MCPToolDefinition(
+        "flag.verify",
+        "verification",
+        "aurora",
+        "Replay a Python derivation twice against declared evidence before accepting its flag output.",
+        {
+            "type": "object",
+            "required": ["source_artifact_refs", "verification_script"],
+            "properties": {
+                "source_artifact_refs": {"type": "array", "items": {"type": "string"}},
+                "verification_script": {"type": "string"},
+                "timeout_seconds": {"type": "integer"},
+            },
+        },
+    ),
     MCPToolDefinition("blackboard.query", "read", "aurora", "Read scoped blackboard state.", {"type": "object"}),
     MCPToolDefinition("capability.request", "request", "gateway", "Request an additional authorized capability.", {"type": "object"}),
 )

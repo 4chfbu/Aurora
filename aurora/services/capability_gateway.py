@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+import hashlib
 import json
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -12,12 +15,13 @@ from urllib.parse import urlparse
 
 from sqlmodel import Session
 
-from aurora.models import ToolTrace
+from aurora.models import Artifact, Intent, ToolTrace
 from aurora.services.command_runner import AutoCommandRunner, CommandRunner
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.policy import PolicyEngine
 from aurora.services.browser_interaction import BrowserInteractionService
 from aurora.config import get_settings
+from aurora.services.flag_validator import FlagValidator
 
 
 DENIED_TOKENS = ["rm -rf", "mkfs", ":(){", "dd if=", "shutdown", "reboot", "docker.sock"]
@@ -38,10 +42,17 @@ class CapabilityGateway:
         self,
         artifact_store: ArtifactStore | None = None,
         command_runner: CommandRunner | None = None,
+        verification_runner: CommandRunner | None = None,
         policy_engine: PolicyEngine | None = None,
     ) -> None:
         self.artifact_store = artifact_store or ArtifactStore()
         self.command_runner = command_runner or AutoCommandRunner()
+        self.verification_runner = verification_runner or command_runner or AutoCommandRunner(
+            prefer_kali=True,
+            allow_local_fallback=False,
+            network="none",
+            workspace_read_only=True,
+        )
         self.policy_engine = policy_engine or PolicyEngine()
 
     def execute(
@@ -74,6 +85,8 @@ class CapabilityGateway:
 
         if tool_name == "sandbox.exec":
             return self._sandbox_exec(session, project_id, request, worker_id, intent_id, attempt_id)
+        if tool_name == "flag.verify":
+            return self._flag_verify(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "fofa.search":
             return self._fofa_search(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "blackboard.query":
@@ -92,6 +105,159 @@ class CapabilityGateway:
             }
             return self._sandbox_exec(session, project_id, semantic_request, worker_id, intent_id, attempt_id, tool_name=tool_name)
         return self._semantic_stub(session, project_id, tool_name, request, worker_id, intent_id, attempt_id)
+
+    def _flag_verify(
+        self,
+        session: Session,
+        project_id: str,
+        request: dict[str, Any],
+        worker_id: str | None,
+        intent_id: str | None,
+        attempt_id: str | None,
+    ) -> ToolResult:
+        """Replay a model-authored Python derivation without supplying an expected flag."""
+        refs = request.get("source_artifact_refs")
+        script_name = str(request.get("verification_script") or "").strip()
+        timeout = max(1, min(int(request.get("timeout_seconds", 30)), 60))
+        if not worker_id:
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                "flag.verify is missing the server-side worker context",
+            )
+        if not isinstance(refs, list) or not refs:
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                "flag.verify requires a non-empty source_artifact_refs array",
+            )
+        if not script_name:
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                "flag.verify requires verification_script",
+            )
+
+        # Worker containers see their mounted workspace at /workspace, while
+        # the gateway resolves files from the host-side worker directory.
+        # Accept that container spelling, then apply the normal workspace
+        # containment check below. Other absolute paths remain rejected.
+        if script_name == "/workspace":
+            script_name = ""
+        elif script_name.startswith("/workspace/"):
+            script_name = script_name[len("/workspace/"):]
+        workspace = (get_settings().codex_workspace_dir / project_id / worker_id).resolve()
+        script_path = (workspace / script_name).resolve()
+        try:
+            script_path.relative_to(workspace)
+        except ValueError:
+            return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification script escapes the worker workspace")
+        if script_path.suffix != ".py" or not script_path.is_file():
+            return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification_script must name an existing Python file in the worker workspace")
+
+        artifacts: list[Artifact] = []
+        for ref in dict.fromkeys(ref for ref in refs if isinstance(ref, str)):
+            artifact = session.get(Artifact, ref)
+            if artifact is None or artifact.project_id != project_id or artifact.type in {"codex-transcript", "subagent-transcript", "blackboard-query", "tool-request"}:
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, f"untrusted or foreign source artifact: {ref}")
+            artifacts.append(artifact)
+        if not artifacts:
+            return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "no valid source artifacts were declared")
+
+        script_bytes = script_path.read_bytes()
+        runs: list[dict[str, Any]] = []
+        verify_root = Path(tempfile.mkdtemp(prefix=".aurora-flag-verify-", dir=Path.cwd()))
+        try:
+            for index in range(2):
+                run_dir = verify_root / f"run-{index + 1}"
+                input_dir = run_dir / "inputs"
+                input_dir.mkdir(parents=True)
+                replay_script = run_dir / "verify.py"
+                replay_script.write_bytes(script_bytes)
+                manifest: list[dict[str, str]] = []
+                for artifact in artifacts:
+                    source = Path(artifact.path)
+                    # Keep the original basename and extension. Verification
+                    # scripts commonly need to identify archive/file formats,
+                    # and stripping ``.zip`` made correctly declared evidence
+                    # indistinguishable inside the isolated replay workspace.
+                    target = input_dir / f"{artifact.id}_{source.name}"
+                    shutil.copyfile(source, target)
+                    target.chmod(0o444)
+                    manifest.append({"artifact_id": artifact.id, "path": f"inputs/{target.name}", "sha256": artifact.sha256})
+                (input_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+                completed = self.verification_runner.run(command="PYTHONDONTWRITEBYTECODE=1 python3 verify.py inputs/manifest.json", cwd=run_dir, timeout=timeout)
+                output = completed.stdout.strip()
+                runs.append({"exit_code": completed.exit_code, "stdout": output, "stderr": completed.stderr[-1000:]})
+                if completed.exit_code != 0 or not FlagValidator.is_valid_flag_value(output):
+                    return self._verification_failure(
+                        session, project_id, request, worker_id, intent_id, attempt_id,
+                        "verification replay must exit successfully and print exactly one flag",
+                        runs=runs,
+                    )
+            value = runs[0]["stdout"]
+            if runs[1]["stdout"] != value:
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification replay produced inconsistent results", runs=runs)
+            request_text = json.dumps(request, ensure_ascii=False, sort_keys=True)
+            script_text = script_bytes.decode("utf-8", errors="replace")
+            if value in request_text or value in script_text:
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "candidate flag is hard-coded in the verification request or script", runs=runs)
+
+            payload = {
+                "status": "verified",
+                "value": value,
+                "source_artifacts": [{"id": artifact.id, "sha256": artifact.sha256} for artifact in artifacts],
+                "script_sha256": hashlib.sha256(script_bytes).hexdigest(),
+                "runs": runs,
+            }
+            artifact = self.artifact_store.write_text(
+                session,
+                project_id=project_id,
+                source_attempt_id=attempt_id,
+                content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                summary="Flag derivation replayed twice with identical output",
+                artifact_type="flag-verification",
+                origin_kind="verified_derivation",
+            )
+            trace = ToolTrace(
+                project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id,
+                tool_name="flag.verify", request_json=request, policy_decision="allow", exit_code=0,
+                summary="Flag derivation verified by deterministic replay", artifact_refs=[artifact.id, *[source.id for source in artifacts]],
+            )
+            session.add(trace)
+            session.commit()
+            session.refresh(trace)
+            return ToolResult(True, trace.summary or "Flag verified", [artifact.id, *[source.id for source in artifacts]], {"runs": 2, "backend": "isolated-replay"}, [], trace.id)
+        finally:
+            shutil.rmtree(verify_root, ignore_errors=True)
+
+    def _verification_failure(
+        self,
+        session: Session,
+        project_id: str,
+        request: dict[str, Any],
+        worker_id: str | None,
+        intent_id: str | None,
+        attempt_id: str | None,
+        reason: str,
+        *,
+        runs: list[dict[str, Any]] | None = None,
+    ) -> ToolResult:
+        artifact = self.artifact_store.write_text(
+            session,
+            project_id=project_id,
+            source_attempt_id=attempt_id,
+            content=json.dumps({"status": "rejected", "reason": reason, "runs": runs or []}, ensure_ascii=False, sort_keys=True),
+            summary=f"Flag verification rejected: {reason}",
+            artifact_type="flag-verification-failed",
+            origin_kind="verification_failure",
+        )
+        trace = ToolTrace(
+            project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id,
+            tool_name="flag.verify", request_json=request, policy_decision="allow", exit_code=1,
+            summary=reason, artifact_refs=[artifact.id],
+        )
+        session.add(trace)
+        session.commit()
+        session.refresh(trace)
+        return ToolResult(False, reason, [artifact.id], {"runs": len(runs or []), "backend": "isolated-replay"}, [reason], trace.id)
 
     def _fofa_search(
         self, session: Session, project_id: str, request: dict[str, Any], worker_id: str | None, intent_id: str | None, attempt_id: str | None
@@ -126,6 +292,7 @@ class CapabilityGateway:
             content=json.dumps({"query": query, "results": rows}, ensure_ascii=False, indent=2),
             summary=f"FOFA search returned {len(rows)} result(s) for authorized target",
             artifact_type="fofa-search",
+            origin_kind="target_observation",
         )
         trace = ToolTrace(
             project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id,
@@ -145,8 +312,8 @@ class CapabilityGateway:
 
         limit = max(1, min(int(request.get("limit", 10)), 25))
         facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").limit(limit)).all()
-        payload = [{"id": fact.id, "statement": fact.statement, "confidence": fact.confidence, "evidence_refs": fact.evidence_refs} for fact in facts]
-        artifact = self.artifact_store.write_text(session, project_id=project_id, source_attempt_id=attempt_id, content=json.dumps(payload, ensure_ascii=False, indent=2), summary=f"Blackboard query returned {len(payload)} fact(s)", artifact_type="blackboard-query")
+        payload = [{"id": fact.id, "statement": fact.statement, "confidence": fact.confidence, "evidence_refs": fact.evidence_refs, "evidence_items": fact.evidence_items} for fact in facts]
+        artifact = self.artifact_store.write_text(session, project_id=project_id, source_attempt_id=attempt_id, content=json.dumps(payload, ensure_ascii=False, indent=2), summary=f"Blackboard query returned {len(payload)} fact(s)", artifact_type="blackboard-query", origin_kind="derived_context")
         trace = ToolTrace(project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id, tool_name="blackboard.query", request_json={"limit": limit}, policy_decision="allow", summary=f"Blackboard returned {len(payload)} fact(s)", artifact_refs=[artifact.id])
         session.add(trace)
         session.commit()
@@ -164,7 +331,12 @@ class CapabilityGateway:
             attempt_id=attempt_id,
             tool_name="browser.interact",
             request_json=request,
-            policy_decision="allow" if result.success else "deny",
+            # BrowserInteractionService returns False for both policy failures
+            # and ordinary execution outcomes such as a navigation timeout or
+            # a page with no launch control.  The policy gate has already run
+            # before this point, so recording every unsuccessful interaction
+            # as a denial makes Observer stop otherwise viable CTF rounds.
+            policy_decision="allow" if result.success else "execution_error",
             summary=result.summary,
             artifact_refs=result.artifact_refs,
         )
@@ -229,6 +401,11 @@ class CapabilityGateway:
             f"[stdout]\n{completed.stdout}\n\n"
             f"[stderr]\n{completed.stderr}"
         )
+        origin_kind = "target_observation"
+        if tool_name == "sandbox.exec":
+            intent = session.get(Intent, intent_id) if intent_id else None
+            declared = (intent.budget or {}).get("tool_request") if intent is not None else None
+            origin_kind = "operator_observation" if isinstance(declared, dict) and declared == request else "model_generated"
         artifact = self.artifact_store.write_text(
             session,
             project_id=project_id,
@@ -236,6 +413,7 @@ class CapabilityGateway:
             content=raw,
             summary=f"{tool_name} {completed.backend} exit={completed.exit_code}: {command[:120]}",
             artifact_type="terminal",
+            origin_kind=origin_kind,
         )
         summary_source = stdout or stderr or "no output"
         summary = summary_source.replace("\n", " ")[:300]
@@ -339,6 +517,7 @@ class CapabilityGateway:
             content=f"tool={tool_name}\nrequest={request}\nsummary={summary}\n",
             summary=summary,
             artifact_type="tool-request",
+            origin_kind="model_generated",
         )
         trace = ToolTrace(
             project_id=project_id,

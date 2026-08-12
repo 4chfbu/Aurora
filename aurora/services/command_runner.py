@@ -3,10 +3,13 @@ from __future__ import annotations
 import shutil
 import subprocess
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from aurora.config import get_settings
+from aurora.services.tool_profiles import manifest_sha256
+from aurora.services.network_proxy import network_proxy_registry
 
 
 @dataclass
@@ -29,6 +32,8 @@ class CommandRunner:
 class LocalCommandRunner(CommandRunner):
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
         try:
+            environment = os.environ.copy()
+            environment.update(network_proxy_registry.get().environment())
             completed = subprocess.run(
                 command,
                 shell=True,
@@ -37,6 +42,7 @@ class LocalCommandRunner(CommandRunner):
                 capture_output=True,
                 timeout=timeout,
                 check=False,
+                env=environment,
             )
         except subprocess.TimeoutExpired as exc:
             return CommandResult(
@@ -61,12 +67,24 @@ class LocalCommandRunner(CommandRunner):
 
 
 class KaliContainerRunner(CommandRunner):
-    def __init__(self, image: str | None = None) -> None:
+    def __init__(
+        self,
+        image: str | None = None,
+        expected_profile: str | None = None,
+        *,
+        network: str | None = None,
+        workspace_read_only: bool = False,
+        environment_overrides: dict[str, str] | None = None,
+    ) -> None:
         settings = get_settings()
         self.settings = settings
         self.image = image or settings.default_worker_image
-        self.network = settings.default_container_network
+        self.network = network or settings.default_container_network
+        self.workspace_read_only = workspace_read_only
+        self.environment_overrides = dict(environment_overrides or {})
         self.engine = shutil.which("podman") or shutil.which("docker")
+        self.expected_profile = expected_profile
+        self.availability_error: str | None = None
 
     def _env_args(self) -> list[str]:
         settings = get_settings()
@@ -79,17 +97,13 @@ class KaliContainerRunner(CommandRunner):
             "AURORA_SUBAGENTS_ENABLED": "true" if settings.subagents_enabled else "false",
             "AURORA_SUBAGENTS_MAX_PER_WORKER": str(settings.subagents_max_per_worker),
             "AURORA_SUBAGENTS_MAX_CONCURRENT": str(settings.subagents_max_concurrent),
+            **network_proxy_registry.get().environment(),
         }
+        values.update(self.environment_overrides)
         inherited_keys = [
             "AURORA_SUBAGENTS_MAX_PER_WORKER",
             "AURORA_SUBAGENTS_MAX_CONCURRENT",
             "AURORA_SUBAGENT_CODEX_COMMAND",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "NO_PROXY",
-            "https_proxy",
-            "http_proxy",
-            "no_proxy",
         ]
         args: list[str] = []
         for key, value in values.items():
@@ -103,6 +117,7 @@ class KaliContainerRunner(CommandRunner):
 
     def available(self) -> bool:
         if self.engine is None:
+            self.availability_error = "docker/podman not available"
             return False
         inspected = subprocess.run(
             [self.engine, "image", "inspect", self.image],
@@ -111,7 +126,31 @@ class KaliContainerRunner(CommandRunner):
             timeout=5,
             check=False,
         )
-        return inspected.returncode == 0
+        if inspected.returncode != 0:
+            self.availability_error = f"worker image is not available locally: {self.image}"
+            return False
+        if self.expected_profile:
+            labels = subprocess.run(
+                [self.engine, "image", "inspect", "--format", "{{json .Config.Labels}}", self.image],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            try:
+                parsed = json.loads(labels.stdout or "{}") if labels.returncode == 0 else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            actual_profile = parsed.get("io.aurora.worker.profile")
+            actual_manifest = parsed.get("io.aurora.tool-manifest-sha256")
+            if actual_profile != self.expected_profile or actual_manifest != manifest_sha256():
+                self.availability_error = (
+                    f"worker image metadata mismatch: image={self.image} expected_profile={self.expected_profile} "
+                    f"actual_profile={actual_profile or 'missing'}"
+                )
+                return False
+        self.availability_error = None
+        return True
 
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
         if self.engine is None:
@@ -135,7 +174,7 @@ class KaliContainerRunner(CommandRunner):
             *label_args,
             *self._env_args(),
             "-v",
-            f"{workspace}:/workspace:rw",
+            f"{workspace}:/workspace:{'ro' if self.workspace_read_only else 'rw'}",
             "-w",
             str(container_cwd),
             self.image,
@@ -206,10 +245,26 @@ class KaliContainerRunner(CommandRunner):
 
 
 class AutoCommandRunner(CommandRunner):
-    def __init__(self, prefer_kali: bool = True, allow_local_fallback: bool = True) -> None:
+    def __init__(
+        self,
+        prefer_kali: bool = True,
+        allow_local_fallback: bool = True,
+        image: str | None = None,
+        expected_profile: str | None = None,
+        *,
+        network: str | None = None,
+        workspace_read_only: bool = False,
+        environment_overrides: dict[str, str] | None = None,
+    ) -> None:
         self.prefer_kali = prefer_kali
         self.allow_local_fallback = allow_local_fallback
-        self.kali = KaliContainerRunner()
+        self.kali = KaliContainerRunner(
+            image=image,
+            expected_profile=expected_profile,
+            network=network,
+            workspace_read_only=workspace_read_only,
+            environment_overrides=environment_overrides,
+        )
         self.local = LocalCommandRunner()
 
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
@@ -224,7 +279,6 @@ class AutoCommandRunner(CommandRunner):
                 local.backend = "local-fallback"
                 return local
         if self.prefer_kali and not self.allow_local_fallback:
-            raise RuntimeError(
-                f"kali worker image is not available locally: {self.kali.image}. Pull/build it before running this runtime."
-            )
+            reason = self.kali.availability_error or f"worker image is unavailable: {self.kali.image}"
+            raise RuntimeError(f"{reason}. Build the configured core/heavy worker images before running this runtime.")
         return self.local.run(command=command, cwd=cwd, timeout=timeout)

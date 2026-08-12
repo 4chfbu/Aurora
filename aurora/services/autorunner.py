@@ -7,10 +7,11 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, Fact, Finding, Intent, Project, WorkerEvent, now_utc
+from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
 from aurora.services.demo import run_one_demo_step
 from aurora.services.manager import ManagerService
 from aurora.services.observer import ObserverService
+from aurora.services.blackboard_repository import stable_json
 
 
 @dataclass
@@ -43,7 +44,7 @@ class AutoRunnerService:
         project = session.get(Project, project_id)
         if project is None:
             raise ValueError("project not found")
-        if project.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+        if project.status in {"COMPLETED", "FAILED", "CANCELLED", "FLAG_READY"}:
             return AutoRunResult(project.status.lower(), "project_terminal", 0, project_id)
 
         started_at = now_utc()
@@ -60,9 +61,10 @@ class AutoRunnerService:
             project = session.get(Project, project_id)
             if project is None:
                 return AutoRunResult("failed", "project_missing", iteration - 1, project_id, events)
-            if project.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+            if project.status in {"COMPLETED", "FAILED", "CANCELLED", "FLAG_READY"}:
                 self._event(session, project_id, "autorun.completed", {"iteration": iteration - 1, "project_status": project.status})
-                return AutoRunResult(project.status.lower(), "project_terminal", iteration - 1, project_id, events)
+                reason = "candidate_ready" if project.status == "FLAG_READY" else "project_terminal"
+                return AutoRunResult(project.status.lower(), reason, iteration - 1, project_id, events)
             if limits.max_minutes > 0 and now_utc() - started_at > timedelta(minutes=limits.max_minutes):
                 self._event(session, project_id, "autorun.stopped", {"reason": "max_minutes", "iteration": iteration - 1})
                 return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
@@ -80,6 +82,19 @@ class AutoRunnerService:
                 self._event(session, project_id, "autorun.blocked", payload)
                 events.append(payload)
                 return AutoRunResult("blocked", "observer_escalate", iteration, project_id, events)
+            if (
+                limits.no_progress_limit > 0
+                and observer_decision.decision == "REDIRECT"
+                and self._duplicate_streak(session, project_id) >= max(2, limits.no_progress_limit)
+            ):
+                payload = {
+                    "reason": "duplicate_tool_streak",
+                    "iteration": iteration,
+                    "observer_decision": observer_decision.__dict__,
+                }
+                self._event(session, project_id, "autorun.blocked", payload)
+                events.append(payload)
+                return AutoRunResult("blocked", "duplicate_tool_streak", iteration, project_id, events)
 
             manager_decision = ManagerService().run_project(session, project_id=project_id)
             run_result = run_one_demo_step(session, project_id=project_id)
@@ -102,8 +117,10 @@ class AutoRunnerService:
             events.append(payload)
 
             project = session.get(Project, project_id)
-            if project is not None and project.status == "COMPLETED":
+            if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
                 self._event(session, project_id, "autorun.completed", {"iteration": iteration, "project_status": project.status})
+                if project.status == "FLAG_READY":
+                    return AutoRunResult("candidate_ready", "candidate_ready", iteration, project_id, events)
                 return AutoRunResult("completed", "project_completed", iteration, project_id, events)
             if run_result.get("status") == "idle" and manager_decision.status == "NOOP":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
@@ -154,6 +171,21 @@ class AutoRunnerService:
             "new_findings": after["findings"] - before["findings"],
             "new_attempts": after["attempts"] - before["attempts"],
         }
+
+    def _duplicate_streak(self, session: Session, project_id: str) -> int:
+        traces = session.exec(
+            select(ToolTrace).where(ToolTrace.project_id == project_id).order_by(ToolTrace.created_at.desc()).limit(10)
+        ).all()
+        if len(traces) < 2:
+            return 0
+        latest = traces[0]
+        latest_request = stable_json(latest.request_json)
+        streak = 0
+        for trace in traces:
+            if trace.tool_name != latest.tool_name or stable_json(trace.request_json) != latest_request:
+                break
+            streak += 1
+        return streak
 
     def _event(self, session: Session, project_id: str, event_type: str, payload: dict[str, Any]) -> None:
         session.add(WorkerEvent(project_id=project_id, event_type=event_type, payload_json=payload))

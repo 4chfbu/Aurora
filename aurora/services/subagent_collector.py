@@ -48,7 +48,7 @@ class SubagentCollector:
         session.add(snapshot)
         session.commit()
         session.refresh(snapshot)
-        artifact = self.artifact_store.write_text(session, project_id=parent_worker.project_id, content=str(record.get("transcript", "")), summary=f"Same-container subagent {run_id} exit={record.get('exit_code')}", artifact_type="subagent-transcript")
+        artifact = self.artifact_store.write_text(session, project_id=parent_worker.project_id, content=str(record.get("transcript", "")), summary=f"Same-container subagent {run_id} exit={record.get('exit_code')}", artifact_type="subagent-transcript", origin_kind="model_output")
         attempt = Attempt(project_id=parent_worker.project_id, intent_id=parent_worker.intent_id, worker_id=worker.id, parent_attempt_id=parent_attempt.id, status=status, result_summary=str(output.get("summary", "Subagent did not return a summary.")), failure_reason=str(record.get("error")) if record.get("error") else None, artifact_refs=[artifact.id], finished_at=now_utc())
         session.add(attempt)
         session.commit()

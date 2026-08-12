@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
+import hashlib
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +13,7 @@ from sqlmodel import Session, select
 
 from aurora.db import engine
 from aurora.config import get_settings
-from aurora.models import Attempt, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, Intent, Project, Worker, WorkerEvent, now_utc
+from aurora.models import Attempt, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
 from aurora.services.autorunner import AutoRunLimits
 from aurora.services.competition_adapter import CompetitionAdapter, LocalCompetitionAdapter
 from aurora.services.container_control import stop_project_containers
@@ -120,6 +122,7 @@ class ChallengeGroupRunner:
             item.status = "RUNNING"
             item.fused_status = "RUNNING"
             item.started_at = now_utc()
+            item.stop_reason = None
             item.updated_at = now_utc()
             phase_key = str(item.phase)
             item.phase_attempts = {**item.phase_attempts, phase_key: int(item.phase_attempts.get(phase_key, 0)) + 1}
@@ -134,7 +137,12 @@ class ChallengeGroupRunner:
 
             if project is None:
                 outcome, reason = "CRASHED", "project_missing"
-            elif project.status == "COMPLETED":
+            elif self._is_explicit_no_flag_challenge(project):
+                # Some CTF platforms include attendance/VM onboarding tasks
+                # whose statement explicitly says that no flag is required.
+                # They are terminal analysis tasks, not failed flag recovery.
+                outcome, reason = "NO_FLAG_COMPLETED", "statement_explicitly_requires_no_flag"
+            elif project.status in {"COMPLETED", "FLAG_READY"}:
                 outcome, reason = "COMPLETED", "project_terminal"
             else:
                 # Phase budgets belong to the scheduler, not the solver.
@@ -144,6 +152,7 @@ class ChallengeGroupRunner:
                     no_progress_limit=0,
                     stop_on_observer_escalate=True,
                 )
+                self._apply_phase_attempt_budget(session, project_id=project.id, phase=item.phase)
                 health = self.competition.ensure_environment(session, project_id=project.id)
                 task = self._task_payload(session, item=item, project=project)
                 if not health.available:
@@ -155,8 +164,8 @@ class ChallengeGroupRunner:
                     session.commit()
                     result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
                     project = session.get(Project, project.id)
-                    if project is not None and project.status == "COMPLETED":
-                        outcome, reason = "COMPLETED", result.reason
+                    if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
+                        outcome, reason = ("COMPLETED" if project.status == "COMPLETED" else "CANDIDATE_READY"), result.reason
                     else:
                         outcome, reason = self._failure_outcome(result.status), result.reason
             self._resolve_phase(session, group=group, item=item, project=project, outcome=outcome, reason=reason)
@@ -186,6 +195,37 @@ class ChallengeGroupRunner:
     @staticmethod
     def _failure_outcome(status: str) -> str:
         return status if status in {"TIMEOUT", "CRASHED", "STUCK"} else "FAILED"
+
+    @staticmethod
+    def _is_explicit_no_flag_challenge(project: Project) -> bool:
+        statement = project.goal or ""
+        return bool(re.search(
+            r"(?:you\s+don['’]t\s+need\s+to\s+(?:input|submit|enter)\s+(?:a\s+)?flag|no\s+flag\s+(?:is\s+)?required|无需(?:输入|提交|填写).{0,12}flag)",
+            statement,
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _apply_phase_attempt_budget(session: Session, *, project_id: str, phase: int) -> None:
+        # A P1 phase has a 30 minute wall-clock budget.  Without a per-worker
+        # cap, one Codex Harness request may consume the whole phase and leave
+        # no opportunity to recover from a provider/context failure.
+        cap_seconds = 600 if phase == 1 else 1_800
+        intents = session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+        ).all()
+        for intent in intents:
+            budget = dict(intent.budget or {})
+            configured = budget.get("hard_timeout_seconds")
+            try:
+                configured_seconds = int(configured) if configured is not None else cap_seconds
+            except (TypeError, ValueError):
+                configured_seconds = cap_seconds
+            budget["hard_timeout_seconds"] = min(configured_seconds, cap_seconds)
+            intent.budget = budget
+            intent.updated_at = now_utc()
+            session.add(intent)
+        session.commit()
 
     @staticmethod
     def _write_done_marker(group_id: str) -> None:
@@ -221,23 +261,44 @@ class ChallengeGroupRunner:
 
     def _resolve_phase(self, session: Session, *, group: ChallengeGroup, item: ChallengeGroupItem, project: Project | None, outcome: str, reason: str) -> None:
         executed_phase = item.phase
-        terminal = outcome == "COMPLETED"
+        terminal = outcome in {"COMPLETED", "CANDIDATE_READY", "NO_FLAG_COMPLETED"}
         if terminal:
-            submission = self._submit_pending_flag(session, item=item)
-            if submission is False:
+            if outcome == "NO_FLAG_COMPLETED":
+                item.fused_status = "COMPLETED"
+                item.status = "COMPLETED"
+                if project is not None:
+                    project.status = "COMPLETED"
+                    project.updated_at = now_utc()
+                    session.add(project)
+                submission = True
+            else:
+            # A COMPLETED project has already passed platform/manual validation.
+            # FLAG_READY/CANDIDATE_READY is the only state that may submit.
+                submission = True if outcome == "COMPLETED" and project is not None and project.status == "COMPLETED" else self._submit_pending_flag(session, item=item)
+            if outcome != "NO_FLAG_COMPLETED" and submission is False:
                 terminal = False
                 outcome = "FLAG_REJECTED"
                 reason = "competition platform rejected the candidate flag"
                 item.fused_status = "PENDING"
                 item.status = "PENDING"
-            elif submission is None and item.submission_status == "AWAITING_MANUAL_VALIDATION":
+            elif outcome != "NO_FLAG_COMPLETED" and submission is None and item.submission_status == "AWAITING_MANUAL_VALIDATION":
                 terminal = False
                 outcome = "AWAITING_MANUAL_VALIDATION"
                 reason = "flag submission API unavailable; manual validation required"
                 item.fused_status = "AWAITING_MANUAL_VALIDATION"
                 item.status = "AWAITING_MANUAL_VALIDATION"
                 group.status = "AWAITING_MANUAL_VALIDATION"
-            else:
+                if project is not None:
+                    project.status = "AWAITING_MANUAL_VALIDATION"
+                    project.updated_at = now_utc()
+                    session.add(project)
+            elif outcome != "NO_FLAG_COMPLETED" and submission is None:
+                terminal = False
+                outcome = "NO_VERIFIED_CANDIDATE"
+                reason = "no locally verified flag candidate is available"
+                item.fused_status = "PENDING"
+                item.status = "PENDING"
+            elif outcome != "NO_FLAG_COMPLETED":
                 item.fused_status = "COMPLETED"
                 item.status = "COMPLETED"
         elif item.phase >= 3:
@@ -267,19 +328,34 @@ class ChallengeGroupRunner:
         session.add(item)
         session.add(group)
         if item.fused_status in {"COMPLETED", "FAILED"}:
-            self.competition.close_environment(project_id=item.project_id)
+            close_environment = getattr(self.competition, "close_environment", None)
+            if callable(close_environment):
+                close_environment(project_id=item.project_id)
         self._event(session, group.id, item.id, "group.item.phase_finished", {"project_id": item.project_id, "outcome": outcome, "reason": reason, "phase": executed_phase, "next_phase": None if item.fused_status in {"COMPLETED", "FAILED"} else item.phase, "fused_status": item.fused_status})
         session.commit()
 
     def _submit_pending_flag(self, session: Session, *, item: ChallengeGroupItem) -> bool | None:
-        findings = session.exec(
-            select(Finding).where(Finding.project_id == item.project_id, Finding.title.startswith("Candidate flag: "))
+        candidates = session.exec(
+            select(FlagCandidate).where(
+                FlagCandidate.project_id == item.project_id,
+                FlagCandidate.status.in_(["LOCAL_VERIFIED", "SUBMITTED"]),
+            ).order_by(FlagCandidate.created_at.desc())
         ).all()
-        if not findings:
+        if not candidates:
             item.submission_status = "NO_CANDIDATE"
             return None
-        finding = findings[-1]
-        value = finding.title.removeprefix("Candidate flag: ")
+        candidate = candidates[0]
+        if candidate.submission_count >= 1:
+            item.submission_status = "AWAITING_MANUAL_VALIDATION"
+            candidate.status = "AWAITING_MANUAL_VALIDATION"
+            candidate.updated_at = now_utc()
+            session.add(candidate)
+            return None
+        value = candidate.value
+        candidate.submission_count += 1
+        candidate.status = "SUBMITTED"
+        candidate.updated_at = now_utc()
+        session.add(candidate)
         try:
             accepted = self.competition.submit_flag(session, project_id=item.project_id, value=value)
         except Exception as exc:
@@ -287,6 +363,9 @@ class ChallengeGroupRunner:
             # broken/expired endpoint must not turn an unverified model answer
             # into either a success or a rejection.
             item.submission_status = "AWAITING_MANUAL_VALIDATION"
+            candidate.status = "AWAITING_MANUAL_VALIDATION"
+            candidate.updated_at = now_utc()
+            session.add(candidate)
             self._event(
                 session,
                 item.group_id,
@@ -297,6 +376,9 @@ class ChallengeGroupRunner:
             return None
         if accepted is None:
             item.submission_status = "AWAITING_MANUAL_VALIDATION"
+            candidate.status = "AWAITING_MANUAL_VALIDATION"
+            candidate.updated_at = now_utc()
+            session.add(candidate)
             self._event(
                 session,
                 item.group_id,
@@ -307,8 +389,39 @@ class ChallengeGroupRunner:
             return None
         if accepted:
             item.submission_status = "SUBMITTED"
+            candidate.status = "ACCEPTED"
+            candidate.updated_at = now_utc()
+            project = session.get(Project, item.project_id)
+            if project is not None:
+                project.status = "COMPLETED"
+                project.updated_at = now_utc()
+                session.add(project)
+            pending_intents = session.exec(select(Intent).where(Intent.project_id == item.project_id, Intent.status == "PENDING")).all()
+            for intent in pending_intents:
+                intent.status = "CANCELLED"
+                intent.updated_at = now_utc()
+                session.add(intent)
+            session.add(
+                WorkerEvent(
+                    project_id=item.project_id,
+                    event_type="project.completed",
+                    payload_json={
+                        "reason": "competition platform accepted flag",
+                        "candidate_id": candidate.id,
+                        "value": value,
+                        "cancelled_intent_ids": [intent.id for intent in pending_intents],
+                    },
+                )
+            )
             return True
         item.submission_status = "REJECTED"
+        candidate.status = "REJECTED"
+        candidate.rejection_reason = "competition platform rejected the candidate flag"
+        candidate.updated_at = now_utc()
+        session.add(candidate)
+        finding = session.exec(select(Finding).where(Finding.project_id == item.project_id, Finding.title == f"Candidate flag: {value}")).first()
+        if finding is None:
+            raise RuntimeError("candidate finding not found")
         reopen_project_after_invalid_flag(
             session,
             project_id=item.project_id,
@@ -317,7 +430,15 @@ class ChallengeGroupRunner:
         )
         return False
 
-    def validate_flag_manually(self, session: Session, *, group_id: str, item_id: str, accepted: bool) -> ChallengeGroupItem:
+    def validate_flag_manually(
+        self,
+        session: Session,
+        *,
+        group_id: str,
+        item_id: str,
+        accepted: bool,
+        candidate_id: str | None = None,
+    ) -> ChallengeGroupItem:
         """Apply a human flag decision after the platform API was unavailable."""
         group = session.get(ChallengeGroup, group_id)
         item = session.get(ChallengeGroupItem, item_id)
@@ -326,16 +447,61 @@ class ChallengeGroupRunner:
         if item.submission_status != "AWAITING_MANUAL_VALIDATION":
             raise RuntimeError("flag is not awaiting manual validation")
 
-        finding = session.exec(
-            select(Finding).where(Finding.project_id == item.project_id, Finding.title.startswith("Candidate flag: "))
-        ).all()
-        candidate = finding[-1] if finding else None
+        candidate = session.get(FlagCandidate, candidate_id) if candidate_id else None
+        if candidate is not None and candidate.project_id != item.project_id:
+            raise RuntimeError("candidate flag does not belong to the challenge group item")
+        if candidate is None and candidate_id is None:
+            candidates = session.exec(
+                select(FlagCandidate)
+                .where(
+                    FlagCandidate.project_id == item.project_id,
+                    FlagCandidate.status.in_(["SUBMITTED", "LOCAL_VERIFIED", "AWAITING_MANUAL_VALIDATION"]),
+                )
+                .order_by(FlagCandidate.created_at)
+            ).all()
+            candidate = candidates[-1] if candidates else None
+        if candidate is None:
+            # Existing installations may have paused legacy Finding rows from
+            # before provenance-aware candidates were introduced.  They remain
+            # ineligible for automatic submission but can be decided manually.
+            finding = session.exec(
+                select(Finding).where(Finding.project_id == item.project_id, Finding.title.startswith("Candidate flag: "))
+            ).all()
+            legacy = finding[-1] if finding else None
+            if legacy is not None:
+                value = legacy.title.removeprefix("Candidate flag: ").strip()
+                value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                candidate = session.exec(
+                    select(FlagCandidate).where(
+                        FlagCandidate.project_id == item.project_id,
+                        FlagCandidate.value_hash == value_hash,
+                    )
+                ).first()
+                if candidate is None:
+                    candidate = FlagCandidate(
+                        project_id=item.project_id,
+                        value=value,
+                        value_hash=value_hash,
+                        status="AWAITING_MANUAL_VALIDATION",
+                        provenance_kind="LEGACY_UNVERIFIED",
+                        artifact_refs=legacy.evidence_refs,
+                    )
+                    session.add(candidate)
+                    session.flush()
+                elif candidate.status not in {"ACCEPTED", "REJECTED"}:
+                    candidate.status = "AWAITING_MANUAL_VALIDATION"
+                    session.add(candidate)
         if candidate is None:
             raise RuntimeError("candidate flag not found")
-        value = candidate.title.removeprefix("Candidate flag: ")
+        already_decided = candidate.status == ("ACCEPTED" if accepted else "REJECTED")
+        if candidate.status not in {"SUBMITTED", "LOCAL_VERIFIED", "AWAITING_MANUAL_VALIDATION"} and not already_decided:
+            raise RuntimeError("candidate flag is not awaiting manual validation")
+        value = candidate.value
 
         if accepted:
             item.submission_status = "MANUALLY_ACCEPTED"
+            candidate.status = "ACCEPTED"
+            candidate.updated_at = now_utc()
             item.fused_status = "COMPLETED"
             item.status = "COMPLETED"
             item.stop_reason = "candidate flag accepted by manual validation"
@@ -347,16 +513,23 @@ class ChallengeGroupRunner:
                 session.add(project)
         else:
             item.submission_status = "MANUALLY_REJECTED"
+            candidate.status = "REJECTED"
+            candidate.rejection_reason = "manual validation rejected the candidate flag"
+            candidate.updated_at = now_utc()
             item.fused_status = "PENDING"
             item.status = "PENDING"
             item.stop_reason = "candidate flag rejected by manual validation"
             item.finished_at = None
-            reopen_project_after_invalid_flag(
-                session,
-                project_id=item.project_id,
-                finding_id=candidate.id,
-                reason="manual validation rejected the candidate flag",
-            )
+            if not already_decided:
+                finding = session.exec(select(Finding).where(Finding.project_id == item.project_id, Finding.title == f"Candidate flag: {value}")).first()
+                if finding is None:
+                    raise RuntimeError("candidate finding not found")
+                reopen_project_after_invalid_flag(
+                    session,
+                    project_id=item.project_id,
+                    finding_id=finding.id,
+                    reason="manual validation rejected the candidate flag",
+                )
 
         remaining = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id)).all()
         if accepted and all(current.id == item.id or current.fused_status in {"COMPLETED", "FAILED"} for current in remaining):
@@ -382,9 +555,31 @@ class ChallengeGroupRunner:
         if accepted:
             close_environment = getattr(self.competition, "close_environment", None)
             if callable(close_environment):
-                close_environment(project_id=item.project_id)
+                try:
+                    close_environment(project_id=item.project_id)
+                except Exception as exc:
+                    # The validation decision is already durable. Environment
+                    # cleanup is best-effort and must not turn it into an HTTP 500.
+                    self._event(
+                        session,
+                        group_id,
+                        item.id,
+                        "group.item.environment_cleanup_failed",
+                        {"project_id": item.project_id, "error": str(exc)[:1000]},
+                    )
+                    session.commit()
             if group.status == "COMPLETED":
-                self._write_done_marker(group_id)
+                try:
+                    self._write_done_marker(group_id)
+                except Exception as exc:
+                    self._event(
+                        session,
+                        group_id,
+                        item.id,
+                        "group.done_marker_write_failed",
+                        {"project_id": item.project_id, "error": str(exc)[:1000]},
+                    )
+                    session.commit()
         return item
 
     @staticmethod
@@ -412,6 +607,10 @@ def recover_interrupted_groups(session: Session) -> list[str]:
             item.stop_reason = "recovered_terminal_project"
             item.finished_at = now_utc()
         else:
+            # Daemon threads may leave a Docker worker alive after the API
+            # process exits. Stop it before re-queueing the persisted intent;
+            # otherwise the old and recovered workers can solve concurrently.
+            stop_project_containers(project.id)
             workers = session.exec(select(Worker).where(Worker.project_id == project.id, Worker.status == "RUNNING")).all()
             intents = session.exec(select(Intent).where(Intent.project_id == project.id, Intent.status == "RUNNING")).all()
             attempts = session.exec(select(Attempt).where(Attempt.project_id == project.id, Attempt.status == "RUNNING")).all()
@@ -461,6 +660,84 @@ def recover_interrupted_groups(session: Session) -> list[str]:
     return sorted(recovered_groups)
 
 
+def fail_group_run(session: Session, *, group_id: str, error: str) -> None:
+    """Persist a runner failure without leaving its active item or lease live."""
+    group = session.get(ChallengeGroup, group_id)
+    if group is None:
+        return
+
+    item = session.get(ChallengeGroupItem, group.current_item_id) if group.current_item_id else None
+    if item is None:
+        item = session.exec(
+            select(ChallengeGroupItem).where(
+                ChallengeGroupItem.group_id == group_id,
+                ChallengeGroupItem.status == "RUNNING",
+            )
+        ).first()
+
+    if item is not None and item.status == "RUNNING":
+        project = session.get(Project, item.project_id)
+        if project is not None:
+            stop_project_containers(project.id)
+            workers = session.exec(
+                select(Worker).where(Worker.project_id == project.id, Worker.status == "RUNNING")
+            ).all()
+            attempts = session.exec(
+                select(Attempt).where(Attempt.project_id == project.id, Attempt.status == "RUNNING")
+            ).all()
+            intents = session.exec(
+                select(Intent).where(Intent.project_id == project.id, Intent.status == "RUNNING")
+            ).all()
+            for worker in workers:
+                worker.status = "INTERRUPTED"
+                worker.lease = {}
+                worker.heartbeat = now_utc()
+                worker.updated_at = now_utc()
+                session.add(worker)
+            for attempt in attempts:
+                attempt.status = "INTERRUPTED"
+                attempt.failure_reason = "Challenge group runner failed; recovered for retry."
+                attempt.finished_at = now_utc()
+                session.add(attempt)
+            for intent in intents:
+                intent.status = "PENDING"
+                intent.lease_owner = None
+                intent.lease_expires_at = None
+                intent.updated_at = now_utc()
+                session.add(intent)
+            session.add(
+                WorkerEvent(
+                    project_id=project.id,
+                    event_type="project.recovered_after_runner_failure",
+                    payload_json={
+                        "workers": [worker.id for worker in workers],
+                        "attempts": [attempt.id for attempt in attempts],
+                    },
+                )
+            )
+        item.status = "PENDING"
+        item.fused_status = "PENDING"
+        item.started_at = None
+        item.finished_at = None
+        item.stop_reason = "recovered_after_runner_failure"
+        item.updated_at = now_utc()
+        session.add(item)
+        ChallengeGroupRunner._event(
+            session,
+            group.id,
+            item.id,
+            "group.item.recovered_after_runner_failure",
+            {"project_id": item.project_id, "new_status": item.status},
+        )
+
+    group.status = "FAILED"
+    group.current_item_id = None
+    group.updated_at = now_utc()
+    session.add(group)
+    ChallengeGroupRunner._event(session, group.id, None, "group.failed", {"error": error[:1000]})
+    session.commit()
+
+
 class ChallengeGroupRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -471,6 +748,20 @@ class ChallengeGroupRegistry:
             existing = self._runs.get(group_id)
             if existing is not None and existing.status == "running":
                 return existing
+            state = GroupRunState(group_id=group_id)
+            self._runs[group_id] = state
+        threading.Thread(target=self._run, args=(state,), daemon=True).start()
+        return state
+
+    def resume_after_manual_validation(self, group_id: str) -> GroupRunState | None:
+        """Resume a group whose runner returned while waiting for a flag decision."""
+        with self._lock:
+            existing = self._runs.get(group_id)
+            if existing is not None and existing.stop_requested:
+                return None
+            # Manual validation is only possible after the runner committed its
+            # paused item. The old thread may still be unwinding, so replace its
+            # state instead of letting start() mistake it for active work.
             state = GroupRunState(group_id=group_id)
             self._runs[group_id] = state
         threading.Thread(target=self._run, args=(state,), daemon=True).start()
@@ -530,20 +821,7 @@ class ChallengeGroupRegistry:
             # A daemon-thread exception must be visible after a restart too;
             # keeping it only in this in-memory state would strand the group.
             with Session(engine) as session:
-                group = session.get(ChallengeGroup, state.group_id)
-                if group is not None:
-                    group.status = "FAILED"
-                    group.current_item_id = None
-                    group.updated_at = now_utc()
-                    session.add(group)
-                    ChallengeGroupRunner._event(
-                        session,
-                        group.id,
-                        None,
-                        "group.failed",
-                        {"error": str(exc)[:1000]},
-                    )
-                    session.commit()
+                fail_group_run(session, group_id=state.group_id, error=str(exc))
 
 
 challenge_group_registry = ChallengeGroupRegistry()

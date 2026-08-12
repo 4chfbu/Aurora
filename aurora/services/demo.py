@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 
 from sqlmodel import Session, select
 
 from aurora.db import engine
-from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectRuntimePolicy, WorkerEvent, now_utc
+from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
 from aurora.config import get_settings
-from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.services.blackboard_repository import BlackboardRepository, stable_json
+from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.context_builder import ContextBuilder
 from aurora.services.flag_validator import FlagValidator
 from aurora.services.result_processor import ResultProcessor
-from aurora.services.round_summary import RoundSummaryService
+from aurora.services.round_summary import RoundReflectionService
 from aurora.services.scheduler import Scheduler
 from aurora.services.subagent_collector import SubagentCollector
 from aurora.services.worker_runtime import get_worker_runtime
@@ -206,6 +208,19 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
             )
         )
         session.commit()
+        checkpoint = RoundReflectionService().create(
+            session,
+            attempt=attempt,
+            output={
+                "status": "failed",
+                "summary": f"Solver runtime failed: {exc}",
+                "failed_attempts": [{"reason": str(exc)}],
+                "hypotheses": [],
+                "suggested_intents": [],
+                "decision_summary": {"next_tool_plan": []},
+            },
+            budget=worker.budgets,
+        )
         scheduler.complete(session, intent=intent, worker=worker, status="FAILED")
         return {
             "status": "runtime_error",
@@ -215,6 +230,7 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
             "worker_id": worker.id,
             "attempt_id": attempt.id,
             "context_snapshot_id": snapshot.id,
+            "checkpoint_id": checkpoint.id,
         }
     lease_heartbeat.stop()
     session.add(
@@ -271,14 +287,53 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         session.commit()
     max_tool_calls = worker.budgets["max_tool_calls"]
     max_repeat_failures = worker.budgets["max_repeat_failures"]
-    failed_by_tool: dict[str, int] = {}
     skipped_tools = 0
     raw_tool_requests = structured.get("tool_requests", [])
     valid_tool_requests = [item for item in raw_tool_requests if isinstance(item, dict)] if isinstance(raw_tool_requests, list) else []
+    # Verification is a post-solver gate, not another exploratory action.
+    # Run it first so a valid derivation cannot be dropped merely because the
+    # model also returned enough ordinary requests to fill the tool budget.
+    valid_tool_requests.sort(key=lambda item: item.get("tool_name") != "flag.verify")
     for tool_request in valid_tool_requests[:max_tool_calls]:
         tool_name = str(tool_request.get("tool_name") or "")
-        if failed_by_tool.get(tool_name, 0) >= max_repeat_failures:
+        request = _route_request(project_id, tool_name, tool_request.get("request", {}))
+        repeat_failures = _repeat_failure_count(
+            session,
+            project_id=project_id,
+            tool_name=tool_name,
+            request=request,
+        )
+        if repeat_failures >= max_repeat_failures:
             skipped_tools += 1
+            summary = f"skipped repeated failed route after {repeat_failures} failure(s)"
+            tool_calls.append({
+                "tool_name": tool_name,
+                "activity_label": _activity_label(tool_request),
+                "success": False,
+                "skipped": True,
+                "summary": summary,
+                "artifact_refs": [],
+                "trace_id": None,
+            })
+            structured.setdefault("failed_attempts", []).append({
+                "reason": "repeat_failure_suppressed",
+                "tool_name": tool_name,
+                "summary": summary,
+            })
+            session.add(WorkerEvent(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                event_type="tool.skipped.repeat_failure",
+                payload_json={
+                    "tool_name": tool_name,
+                    "request": request,
+                    "failure_count": repeat_failures,
+                    "max_repeat_failures": max_repeat_failures,
+                },
+            ))
+            session.commit()
             continue
         activity_label = _activity_label(tool_request)
         session.add(
@@ -299,7 +354,7 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
             intent_id=intent.id,
             attempt_id=attempt.id,
             tool_name=tool_request["tool_name"],
-            request=tool_request.get("request", {}),
+            request=request,
         )
         tool_calls.append(
             {
@@ -310,8 +365,6 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
                 "trace_id": result.trace_id,
             }
         )
-        if not result.success:
-            failed_by_tool[tool_name] = failed_by_tool.get(tool_name, 0) + 1
         session.add(
             WorkerEvent(
                 project_id=project_id,
@@ -362,7 +415,7 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     if candidate_flags:
         structured.setdefault("candidate_flags", []).extend(candidate_flags)
     ResultProcessor().apply(session, attempt=attempt, output=structured, llm_trace=runtime_output.llm_trace)
-    checkpoint = RoundSummaryService().create(session, attempt=attempt, output=structured, budget=worker.budgets)
+    checkpoint = RoundReflectionService().create(session, attempt=attempt, output=structured, budget=worker.budgets)
     estimated_tokens = runtime_output.llm_trace.estimated_input_tokens + runtime_output.llm_trace.estimated_output_tokens
     token_budget = worker.budgets.get("token_budget")
     if token_budget and estimated_tokens > int(token_budget):
@@ -393,3 +446,36 @@ def _activity_label(tool_request: dict) -> str:
         "python.analyze": "正在尝试 Python 分析", "php.unserialize": "正在尝试反序列化", "blackboard.query": "正在查询解题上下文",
     }
     return labels.get(tool_name, f"正在执行 {tool_name or '工具操作'}")
+
+
+def _route_request(project_id: str, tool_name: str, request: object) -> dict:
+    normalized = dict(request) if isinstance(request, dict) else {}
+    if tool_name != "browser.interact":
+        return normalized
+    browser_session = browser_session_registry.get_project_session(project_id)
+    if browser_session is not None:
+        session_material = f"{browser_session.source_url}\0{browser_session.cookie}".encode("utf-8")
+        normalized["_aurora_browser_session"] = hashlib.sha256(session_material).hexdigest()[:16]
+    return normalized
+
+
+def _repeat_failure_count(
+    session: Session,
+    *,
+    project_id: str,
+    tool_name: str,
+    request: dict,
+) -> int:
+    traces = session.exec(
+        select(ToolTrace).where(
+            ToolTrace.project_id == project_id,
+            ToolTrace.tool_name == tool_name,
+        )
+    ).all()
+    fingerprint = stable_json(request)
+    return sum(
+        1
+        for trace in traces
+        if stable_json(trace.request_json) == fingerprint
+        and (trace.policy_decision != "allow" or (trace.exit_code is not None and trace.exit_code != 0))
+    )

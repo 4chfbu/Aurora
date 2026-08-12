@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "routing": {
+    "web": "core",
+    "pwn": "heavy",
+    "reverse": "heavy",
+    "crypto": "heavy",
+    "forensics": "heavy",
+    "misc": "heavy",
+    "unknown": "heavy"
+  },
+  "profiles": {
+    "core": {
+      "description": "Common Kali CTF command-line tools plus Rizin and GDB MCP sessions.",
+      "commands": [
+        "7zz", "binwalk", "checksec", "curl", "dirb", "dmg2img",
+        "exiftool", "ffuf", "file", "foremost", "gdb", "gdbserver", "git",
+        "gobuster", "hashid", "identify", "john", "jq", "ltrace", "nc", "nikto", "nmap",
+        "objdump", "openssl", "patchelf", "pdfinfo", "pngcheck", "qpdf", "rabin2",
+        "radare2", "readelf", "rg", "rizin", "ropper", "ROPgadget", "socat",
+        "sqlmap", "steghide", "strace", "strings", "tcpdump", "tesseract", "testdisk", "tshark",
+        "unrar", "wafw00f", "whatweb", "xxd", "yara"
+      ],
+      "python_modules": ["capstone", "Crypto", "mcp", "PIL", "pwn", "rzpipe", "sympy", "unicorn", "z3"],
+      "mcp_servers": {
+        "aurora_reverse": {
+          "backend": "rizin",
+          "tools": ["open_binary", "list_functions", "list_strings", "disassemble", "find_xrefs", "decompile_function", "close_session"]
+        },
+        "aurora_debug": {
+          "backend": "gdb-mi",
+          "tools": ["start_session", "set_breakpoint", "run", "continue_execution", "step_instruction", "next_instruction", "read_registers", "read_memory", "evaluate", "backtrace", "disassemble", "stop_session"]
+        }
+      },
+      "heavy_only": ["angr", "ghidra", "hashcat", "jadx", "volatility3"]
+    },
+    "heavy": {
+      "extends": "core",
+      "description": "Full CTF profile with heavyweight reverse engineering, symbolic execution, memory forensics, and CPU OpenCL cracking.",
+      "commands": ["analyzeHeadless", "apktool", "ghidra", "hashcat", "jadx", "vol"],
+      "python_modules": ["angr", "volatility3"],
+      "mcp_overrides": {
+        "aurora_reverse": {
+          "backend": "rizin+ghidra"
+        }
+      }
+    }
+  }
+}

@@ -35,6 +35,10 @@ class TestWorkerRuntime:
                 "confidence": 0.7,
                 "category": "execution",
                 "evidence_refs": [],
+                "evidence_items": [{
+                    "description": f"The selected {selected_tool} tool completed for the current intent.",
+                    "artifact_refs": [],
+                }],
             }],
             "hypotheses": [],
             "artifact_refs": [],

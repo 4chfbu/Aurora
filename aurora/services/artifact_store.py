@@ -23,6 +23,7 @@ class ArtifactStore:
         source_attempt_id: str | None = None,
         artifact_type: str = "text",
         sensitivity: str = "normal",
+        origin_kind: str = "unclassified",
     ) -> Artifact:
         artifact_id = new_id("artifact")
         project_dir = self.base_dir / project_id
@@ -41,6 +42,7 @@ class ArtifactStore:
             size=len(data),
             summary=summary,
             sensitivity=sensitivity,
+            origin_kind=origin_kind,
         )
         session.add(artifact)
         session.commit()

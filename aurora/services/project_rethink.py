@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, Attempt, AttemptCheckpoint, ContextSnapshot, DiscoveredTarget, Fact, Finding, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.models import Artifact, Attempt, AttemptCheckpoint, ContextSnapshot, DiscoveredTarget, Fact, Finding, FlagCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_active_runtime_warnings
@@ -30,7 +30,7 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         artifact.source_attempt_id = None
         session.add(artifact)
 
-    for model in (DiscoveredTarget, Fact, Finding, ToolTrace, LLMTrace, ContextSnapshot, AttemptCheckpoint, Attempt, Worker, Intent):
+    for model in (DiscoveredTarget, Fact, Finding, FlagCandidate, ToolTrace, LLMTrace, ContextSnapshot, AttemptCheckpoint, Attempt, Worker, Intent):
         for item in session.exec(select(model).where(model.project_id == project_id)).all():
             session.delete(item)
 
@@ -46,7 +46,7 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         WorkerEvent(
             project_id=project_id,
             event_type="project.rethought",
-            payload_json={"cleared": ["facts", "intents", "workers", "attempts", "attempt_checkpoints", "findings", "context_snapshots", "llm_traces", "tool_traces"], "preserved": ["artifacts", "hints", "events"], "acknowledged_warning_ids": warning_ids},
+            payload_json={"cleared": ["facts", "intents", "workers", "attempts", "attempt_checkpoints", "findings", "flag_candidates", "context_snapshots", "llm_traces", "tool_traces"], "preserved": ["artifacts", "hints", "events"], "acknowledged_warning_ids": warning_ids},
         )
     )
     session.commit()

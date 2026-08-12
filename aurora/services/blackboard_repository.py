@@ -18,6 +18,26 @@ def stable_json(value: Any) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def normalize_evidence_items(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in (items or [])[:10]:
+        if not isinstance(item, dict) or not isinstance(item.get("description"), str):
+            continue
+        description = item["description"].strip()[:2000]
+        refs = item.get("artifact_refs")
+        if not description or not isinstance(refs, list):
+            continue
+        artifact_refs = list(dict.fromkeys(str(ref) for ref in refs if isinstance(ref, str) and ref.strip()))
+        if not artifact_refs:
+            continue
+        key = normalize_text(description)
+        if key in merged:
+            merged[key]["artifact_refs"] = sorted(set(merged[key]["artifact_refs"] + artifact_refs))
+        else:
+            merged[key] = {"description": description, "artifact_refs": artifact_refs}
+    return list(merged.values())
+
+
 @dataclass
 class UpsertResult:
     item: Fact | Intent
@@ -34,15 +54,20 @@ class BlackboardRepository:
         category: str = "general",
         confidence: float = 0.5,
         evidence_refs: list[str] | None = None,
+        evidence_items: list[dict[str, Any]] | None = None,
         source_intent_id: str | None = None,
         source_attempt_id: str | None = None,
     ) -> UpsertResult:
         normalized = normalize_text(statement)
+        normalized_items = normalize_evidence_items(evidence_items)
+        item_refs = [ref for item in normalized_items for ref in item["artifact_refs"]]
+        all_refs = sorted(set((evidence_refs or []) + item_refs))
         existing_facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE")).all()
         for fact in existing_facts:
             if normalize_text(fact.statement) == normalized:
-                merged_refs = sorted(set(fact.evidence_refs + (evidence_refs or [])))
+                merged_refs = sorted(set(fact.evidence_refs + all_refs))
                 fact.evidence_refs = merged_refs
+                fact.evidence_items = normalize_evidence_items((fact.evidence_items or []) + normalized_items)
                 fact.confidence = max(fact.confidence, confidence)
                 session.add(fact)
                 session.add(
@@ -52,7 +77,7 @@ class BlackboardRepository:
                         intent_id=source_intent_id,
                         attempt_id=source_attempt_id,
                         event_type="fact.merged",
-                        payload_json={"fact_id": fact.id, "statement": fact.statement, "evidence_refs": merged_refs},
+                        payload_json={"fact_id": fact.id, "statement": fact.statement, "evidence_refs": merged_refs, "evidence_items": fact.evidence_items},
                     )
                 )
                 session.commit()
@@ -64,7 +89,8 @@ class BlackboardRepository:
             statement=statement,
             category=category,
             confidence=confidence,
-            evidence_refs=evidence_refs or [],
+            evidence_refs=all_refs,
+            evidence_items=normalized_items,
             source_intent_id=source_intent_id,
             source_attempt_id=source_attempt_id,
         )
@@ -76,7 +102,7 @@ class BlackboardRepository:
                 intent_id=source_intent_id,
                 attempt_id=source_attempt_id,
                 event_type="fact.created",
-                payload_json={"statement": statement, "category": category, "confidence": confidence},
+                payload_json={"statement": statement, "category": category, "confidence": confidence, "evidence_items": normalized_items},
             )
         )
         session.commit()

@@ -15,10 +15,11 @@ from typing import Any, Protocol
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, ContextSnapshot, LLMTrace, Worker
+from aurora.models import Artifact, ContextSnapshot, LLMTrace, ToolTrace, Worker
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
 from aurora.services.prompt_renderer import PromptRenderer
+from aurora.services.tool_profiles import image_for_profile
 
 
 @dataclass
@@ -42,6 +43,7 @@ EXECUTABLE_TOOLS = [
     "web.enumerate",
     "binary.inspect",
     "forensic.inspect",
+    "flag.verify",
     "sandbox.exec",
 ]
 
@@ -144,13 +146,27 @@ class OpenAICompatibleRuntime:
             tool_requests = []
         visible_tool_names = {tool.get("name") for tool in snapshot.visible_tools_json}
         filtered_tool_requests = []
-        for request in tool_requests[:3]:
-            if not isinstance(request, dict):
-                continue
+        ordered_tool_requests = [request for request in tool_requests if isinstance(request, dict)]
+        ordered_tool_requests.sort(key=lambda request: request.get("tool_name") != "flag.verify")
+        for request in ordered_tool_requests[:3]:
             tool_name = request.get("tool_name")
             if tool_name in visible_tool_names:
                 activity_label = self._safe_activity_label(request.get("activity_label"))
-                filtered_tool_requests.append({"tool_name": tool_name, "request": request.get("request") or {}, **({"activity_label": activity_label} if activity_label else {})})
+                # Codex commonly calls the tool payload ``parameters`` (the
+                # name used by the visible capability schema), while the
+                # scheduler historically consumed ``request``.  Normalize
+                # both forms at the runtime boundary so a valid call cannot
+                # silently become an empty request.
+                payload = request.get("request")
+                if not isinstance(payload, dict):
+                    payload = request.get("parameters")
+                if not isinstance(payload, dict):
+                    payload = request.get("arguments")
+                if not isinstance(payload, dict):
+                    payload = request.get("params")
+                if not isinstance(payload, dict):
+                    payload = {}
+                filtered_tool_requests.append({"tool_name": tool_name, "request": payload, **({"activity_label": activity_label} if activity_label else {})})
         if not filtered_tool_requests:
             fallback_tool = self._select_tool(intent, visible_tool_names)
             filtered_tool_requests = [{"tool_name": fallback_tool, "request": self._tool_request(intent, fallback_tool)}]
@@ -197,22 +213,42 @@ class CodexHarnessRuntime:
     def __init__(self, artifact_store: ArtifactStore | None = None, command_runner: CommandRunner | None = None) -> None:
         self.settings = get_settings()
         self.artifact_store = artifact_store or ArtifactStore()
-        self.command_runner = command_runner or AutoCommandRunner(prefer_kali=True, allow_local_fallback=False)
+        self.command_runner = command_runner
 
     def execute(self, session: Session, *, worker: Worker, snapshot: ContextSnapshot) -> RuntimeOutput:
         prompt_file = self._write_prompt(session, worker, snapshot)
         model = self.settings.model_for_role(str(worker.budgets.get("model_role", "solver")))
         command = self._render_command(prompt_file, model=model)
         started = time.monotonic()
-        completed = self._run_command(command, prompt_file.parent, timeout_seconds=worker.budgets.get("hard_timeout_seconds"))
+        tool_environment = snapshot.sections_json.get("tool_environment") or {}
+        profile = str(tool_environment.get("profile") or "heavy")
+        runner = self.command_runner or AutoCommandRunner(
+            prefer_kali=True,
+            allow_local_fallback=False,
+            image=image_for_profile(self.settings, profile),
+            expected_profile=profile,
+            environment_overrides={
+                "OPENAI_MODEL": model,
+                "AURORA_CODEX_MODEL_CONTEXT_WINDOW": str(self.settings.codex_model_context_window),
+                "AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT": str(self.settings.codex_auto_compact_token_limit),
+            },
+        )
+        completed = self._run_command(command, prompt_file.parent, timeout_seconds=worker.budgets.get("hard_timeout_seconds"), runner=runner)
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        transcript = self._transcript(command, completed)
+        transcript = self._bounded_transcript(self._transcript(command, completed))
         artifact = self.artifact_store.write_text(
             session,
             project_id=snapshot.project_id,
             content=transcript,
             summary=f"Codex harness transcript {completed.backend} exit={completed.exit_code}",
             artifact_type="codex-transcript",
+            origin_kind="model_output",
+        )
+        mcp_import = self._import_mcp_events(
+            session,
+            worker=worker,
+            snapshot=snapshot,
+            workspace=prompt_file.parent,
         )
 
         output_file = prompt_file.parent / "aurora-last-message.json"
@@ -237,7 +273,7 @@ class CodexHarnessRuntime:
             intent_id=worker.intent_id,
             context_snapshot_id=snapshot.id,
             prompt_hash=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
-            model=self.model,
+            model=model,
             input_chars=len(prompt_text),
             estimated_input_tokens=max(1, len(prompt_text) // 4),
             output_chars=len(output_json),
@@ -251,8 +287,12 @@ class CodexHarnessRuntime:
                 "stderr_bytes": len(completed.stderr.encode("utf-8", errors="replace")),
                 "duration_ms": elapsed_ms,
                 "model_role": worker.budgets.get("model_role", "solver"),
+                "requested_model": model,
+                "model_context_window": self.settings.codex_model_context_window,
+                "auto_compact_token_limit": self.settings.codex_auto_compact_token_limit,
                 "hard_timeout_seconds": worker.budgets.get("hard_timeout_seconds"),
                 "output": output_diagnostic,
+                "mcp": mcp_import,
             },
             decision_summary=decision_summary,
             structured_output=structured,
@@ -290,6 +330,9 @@ class CodexHarnessRuntime:
         self._materialize_project_inputs(session, snapshot, workspace)
         runtime_dir = workspace / "runtime"
         runtime_dir.mkdir(exist_ok=True)
+        event_log = runtime_dir / "mcp-events.jsonl"
+        if event_log.exists():
+            event_log.unlink()
         for name in ("codex-via-cc-switch.sh", "aurora-subagent.py"):
             source = Path.cwd() / "scripts" / name
             if source.exists():
@@ -297,6 +340,58 @@ class CodexHarnessRuntime:
                 shutil.copy2(source, target)
                 target.chmod(target.stat().st_mode | 0o100)
         return prompt_file
+
+    def _import_mcp_events(
+        self,
+        session: Session,
+        *,
+        worker: Worker,
+        snapshot: ContextSnapshot,
+        workspace: Path,
+    ) -> dict[str, Any]:
+        event_log = workspace / "runtime" / "mcp-events.jsonl"
+        if not event_log.is_file():
+            return {"calls": 0, "invalid_lines": 0}
+        raw = event_log.read_text(encoding="utf-8", errors="replace")
+        artifact = self.artifact_store.write_text(
+            session,
+            project_id=snapshot.project_id,
+            content=raw,
+            summary="Local stdio MCP call log",
+            artifact_type="mcp-tool-log",
+            origin_kind="tool_log",
+        )
+        calls = 0
+        invalid_lines = 0
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                invalid_lines += 1
+                continue
+            if not isinstance(event, dict) or not event.get("server") or not event.get("tool"):
+                invalid_lines += 1
+                continue
+            success = bool(event.get("success"))
+            request = event.get("request") if isinstance(event.get("request"), dict) else {}
+            request = {**request, "duration_ms": event.get("duration_ms")}
+            trace = ToolTrace(
+                project_id=snapshot.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                tool_name=f"mcp.{event['server']}.{event['tool']}",
+                request_json=request,
+                policy_decision="allow_local_stdio",
+                exit_code=0 if success else 1,
+                summary=str(event.get("summary") or ("MCP call completed" if success else "MCP call failed"))[:500],
+                artifact_refs=[artifact.id],
+            )
+            session.add(trace)
+            calls += 1
+        session.commit()
+        return {"calls": calls, "invalid_lines": invalid_lines, "artifact_id": artifact.id}
 
     @staticmethod
     def _materialize_project_inputs(session: Session, snapshot: ContextSnapshot, workspace: Path) -> None:
@@ -332,7 +427,19 @@ class CodexHarnessRuntime:
                 "suggested_intents": array,
                 "fork_recommendations": array,
                 "subagent_reports": array,
-                "candidate_flags": {"type": "array"},
+                "candidate_flags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["value", "artifact_ref"],
+                        "properties": {
+                            "value": {"type": "string"},
+                            "artifact_ref": {"type": "string"},
+                            "provenance_kind": {"type": "string", "enum": ["observed", "derived_replay"]},
+                        },
+                        "additionalProperties": True,
+                    },
+                },
                 "decision_summary": {
                     "type": "object",
                     "required": ["selected_intent", "reason_summary", "next_tool_plan"],
@@ -374,11 +481,14 @@ class CodexHarnessRuntime:
             base_url = f"{base_url}/v1"
         return base_url
 
-    def _run_command(self, command: str, cwd: Path, *, timeout_seconds: object = None) -> CommandResult:
+    def _run_command(self, command: str, cwd: Path, *, timeout_seconds: object = None, runner: CommandRunner | None = None) -> CommandResult:
         configured = self.settings.codex_timeout_seconds if self.settings.codex_timeout_seconds > 0 else None
         budget_timeout = int(timeout_seconds) if timeout_seconds else None
         timeout = min(value for value in (configured, budget_timeout) if value is not None) if configured or budget_timeout else None
-        return self.command_runner.run(command=command, cwd=cwd, timeout=timeout)
+        selected_runner = runner or self.command_runner
+        if selected_runner is None:
+            selected_runner = AutoCommandRunner(prefer_kali=True, allow_local_fallback=False)
+        return selected_runner.run(command=command, cwd=cwd, timeout=timeout)
 
     def _transcript(self, command: str, completed: CommandResult) -> str:
         return (
@@ -392,6 +502,18 @@ class CodexHarnessRuntime:
             f"[stdout]\n{completed.stdout}\n\n"
             f"[stderr]\n{completed.stderr}\n"
         )
+
+    def _bounded_transcript(self, transcript: str) -> str:
+        limit = max(1024, self.settings.codex_transcript_max_bytes)
+        encoded = transcript.encode("utf-8", errors="replace")
+        if len(encoded) <= limit:
+            return transcript
+        marker = f"\n\n[aurora transcript truncated: original_bytes={len(encoded)} kept_bytes={limit}]\n\n".encode()
+        payload_limit = max(0, limit - len(marker))
+        head_size = payload_limit // 2
+        tail_size = payload_limit - head_size
+        bounded = encoded[:head_size] + marker + (encoded[-tail_size:] if tail_size else b"")
+        return bounded.decode("utf-8", errors="replace")
 
     def _parse_or_synthesize(
         self,
@@ -427,8 +549,29 @@ class CodexHarnessRuntime:
             return self._normalize(parsed, snapshot, artifact_id), diagnostic
         except (json.JSONDecodeError, ValueError) as exc:
             diagnostic.setdefault("error", str(exc)[:300])
+        # Some Codex/provider combinations emit the final assistant message to
+        # stderr. The process can hit the outer timeout after emitting a result
+        # but before writing --output-last-message. Recover only a schema-valid
+        # full worker result; progress JSON must not become a completion result.
+        try:
+            parsed = self._parse_json(stderr)
+            self._validate_output(parsed)
+            diagnostic.update({"source": "stderr_fallback", "stderr_bytes": len(stderr.encode("utf-8", errors="replace"))})
+            return self._normalize(parsed, snapshot, artifact_id), diagnostic
+        except (json.JSONDecodeError, ValueError) as exc:
+            diagnostic.setdefault("stderr_error", str(exc)[:300])
+        failure_kind = failure_kind or self._provider_failure_kind(stderr)
         failure_kind = failure_kind or ("command_timed_out" if exit_code == 124 else "resource_terminated" if exit_code == 137 else "output_missing" if not output_file.exists() else "output_invalid_json")
         return self._failure_output(failure_kind, stderr, artifact_id, snapshot), diagnostic
+
+    @staticmethod
+    def _provider_failure_kind(stderr: str) -> str | None:
+        lowered = stderr.lower()
+        if "maximum context length" in lowered or "context_length_exceeded" in lowered:
+            return "context_length_exceeded"
+        if '"type":"invalid_request_error"' in lowered or "invalid_request_error" in lowered:
+            return "provider_invalid_request"
+        return None
 
     def _validate_output(self, parsed: Any) -> None:
         if not isinstance(parsed, dict):
@@ -443,20 +586,41 @@ class CodexHarnessRuntime:
 
     def _failure_output(self, failure_kind: str, stderr: str, artifact_id: str, snapshot: ContextSnapshot) -> dict[str, Any]:
         intent = snapshot.sections_json.get("current_intent", {})
+        timed_out = failure_kind == "command_timed_out"
+        suggested_intents = []
+        next_tool_plan = []
+        if timed_out:
+            objective = (
+                "Resume the timed-out investigation from current project evidence. "
+                "Prioritize the last concrete lead, verify it, and return a partial or successful JSON result "
+                "before the soft deadline instead of restarting broad analysis."
+            )
+            suggested_intents = [{
+                "objective": objective,
+                "capabilities": ["sandbox.exec", "blackboard.query"],
+                "priority": 1.5,
+                "risk_level": "low",
+            }]
+            next_tool_plan = [objective]
         return {
             "status": "failed",
-            "summary": f"Codex harness failed: {failure_kind}; transcript saved as Artifact.",
+            "summary": (
+                f"Codex harness failed: {failure_kind}; the whole solver process exceeded its wall-clock budget, "
+                "not an individual sandbox command. Transcript saved as Artifact."
+                if timed_out
+                else f"Codex harness failed: {failure_kind}; transcript saved as Artifact."
+            ),
             "fact_candidates": [],
             "hypotheses": [],
             "artifact_refs": [artifact_id],
             "failed_attempts": [{"reason": failure_kind, "stderr": stderr[-1000:] if stderr else ""}],
-            "suggested_intents": [],
+            "suggested_intents": suggested_intents,
             "fork_recommendations": [],
             "candidate_flags": [],
             "decision_summary": {
                 "selected_intent": intent.get("objective", "unknown objective"),
                 "reason_summary": f"Codex harness did not return a valid final result ({failure_kind}).",
-                "next_tool_plan": [],
+                "next_tool_plan": next_tool_plan,
             },
             "tool_requests": [],
         }
@@ -517,6 +681,32 @@ class CodexHarnessRuntime:
         ]:
             if not isinstance(structured.get(key), list):
                 structured[key] = []
+        visible_tool_names = {
+            tool.get("name")
+            for tool in getattr(snapshot, "visible_tools_json", [])
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        }
+        normalized_requests = []
+        ordered_tool_requests = [tool_request for tool_request in structured["tool_requests"] if isinstance(tool_request, dict)]
+        ordered_tool_requests.sort(key=lambda request: request.get("tool_name") != "flag.verify")
+        for tool_request in ordered_tool_requests[:3]:
+            tool_name = tool_request.get("tool_name")
+            if not isinstance(tool_name, str) or tool_name not in visible_tool_names:
+                continue
+            payload = tool_request.get("request")
+            if not isinstance(payload, dict):
+                payload = tool_request.get("parameters")
+            if not isinstance(payload, dict):
+                payload = tool_request.get("arguments")
+            if not isinstance(payload, dict):
+                payload = tool_request.get("params")
+            if not isinstance(payload, dict):
+                payload = {}
+            normalized = {"tool_name": tool_name, "request": payload}
+            if "activity_label" in tool_request:
+                normalized["activity_label"] = tool_request["activity_label"]
+            normalized_requests.append(normalized)
+        structured["tool_requests"] = normalized_requests
         structured.setdefault(
             "decision_summary",
             {

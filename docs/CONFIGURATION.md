@@ -61,8 +61,13 @@ Codex Harness 在 Kali Worker 容器内执行。容器引擎和包含 Codex CLI 
 ```dotenv
 AURORA_WORKER_RUNTIME=codex
 AURORA_WORKER_IMAGE=aurora-kali-codex:latest
+AURORA_WORKER_IMAGE_CORE=aurora-kali-codex:core
+AURORA_WORKER_IMAGE_HEAVY=aurora-kali-codex:heavy
 AURORA_CONTAINER_NETWORK=aurora-runtime
 AURORA_CODEX_COMMAND_TEMPLATE=/workspace/runtime/codex-via-cc-switch.sh {prompt_filename} {output_schema_filename} {last_message_filename}
+AURORA_CODEX_MODEL_CONTEXT_WINDOW=1000000
+AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT=800000
+AURORA_CODEX_TRANSCRIPT_MAX_BYTES=2097152
 AURORA_CODEX_PROXY_BASE_URL=http://aurora-cc-switch:15723/v1
 AURORA_CODEX_TIMEOUT_SECONDS=1800
 AURORA_LLM_BASE_URL=https://api.openai.com/v1
@@ -90,6 +95,8 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_ARTIFACT_DIR` | `./artifacts` | 原始工具输出、导入附件和 Codex transcript 的存储目录。API 启动时会自动创建。 |
 | `AURORA_WORKER_RUNTIME` | `codex` | `codex`/`codex_harness`/`harness` 使用 Codex Harness；`openai_direct`/`openai`/`llm`/`real` 使用直接兼容接口。其他值直接报错。 |
 | `AURORA_WORKER_IMAGE` | `aurora-kali-codex:latest` | 包含 Codex CLI 的 Kali Worker 镜像名。只有本地已存在的镜像才会被容器执行器使用。 |
+| `AURORA_WORKER_IMAGE_CORE` | `AURORA_WORKER_IMAGE` 或 `aurora-kali-codex:core` | Web 题和手工语义工具使用的常用 CTF 工具镜像。 |
+| `AURORA_WORKER_IMAGE_HEAVY` | `aurora-kali-codex:heavy` | Pwn、Reverse、Crypto、Forensics、Misc 和未知题型使用的完整分析镜像。 |
 | `AURORA_CONTAINER_NETWORK` | `aurora-runtime` | Worker 与 CC Switch 共用的私有 Docker bridge 网络。 |
 | `AURORA_WORKER_CONTAINER_CPUS` | `2` | Worker 容器的 CPU 限额，传给 `docker/podman run --cpus`。 |
 | `AURORA_WORKER_CONTAINER_MEMORY` | `4g` | Worker 容器的内存限额，传给 `docker/podman run --memory`。 |
@@ -97,6 +104,17 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_CODEX_WORKSPACE_DIR` | `./codex-workspaces` | 每个项目和 Worker 的提示词、输入附件、输出 schema 和 transcript 工作目录。 |
 | `AURORA_CODEX_PROXY_BASE_URL` | `http://aurora-cc-switch:15723/v1` | Worker 内 Codex 使用的 CC Switch Responses 地址。 |
 | `AURORA_WORKER_REAP_INTERVAL_SECONDS` | `5` | API 后台线程清理过期 Worker lease 的间隔秒数。 |
+
+运行时网络出口通过 Web 界面的“网络代理”设置，或通过 `GET/PUT /api/settings/network-proxy` 管理。`direct` 强制直连，`system` 继承 API 进程的代理环境，`custom` 将指定 HTTP(S) 代理用于新 Worker、Cataloger、Playwright 和附件下载。设置持久化在数据库中；已运行的 Worker 不会被重启。`127.0.0.1`、`localhost` 和 `aurora-cc-switch` 始终加入 `NO_PROXY`。
+
+### Browser interaction
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AURORA_BROWSER_NAVIGATION_TIMEOUT_SECONDS` | `15` | 首次页面导航等待时间；超时后保留部分响应并执行一次轻量重试。 |
+| `AURORA_BROWSER_RETRY_TIMEOUT_SECONDS` | `5` | 导航超时后的 `commit` 重试等待时间。 |
+| `AURORA_BROWSER_DOM_TIMEOUT_SECONDS` | `5` | DOM 文本读取和点击后页面状态等待时间。 |
+| `AURORA_BROWSER_ACTION_TIMEOUT_SECONDS` | `8` | 启动/创建控件点击等待时间。 |
 
 ### Codex 命令模板
 
@@ -114,6 +132,12 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `{llm_base_url}` / `{llm_base_url_shell}` | 规范化后的 OpenAI 兼容地址，原始值或 shell 转义值 |
 
 `AURORA_CODEX_PROXY_BASE_URL` 默认为 `http://aurora-cc-switch:15723/v1`。上游可以只支持 Chat Completions，CC Switch 会转换 Codex 的 Responses 请求。可用 `./scripts/check-codex-provider.sh` 做真实预检。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AURORA_CODEX_MODEL_CONTEXT_WINDOW` | `1000000` | 传给 Codex 的自定义模型上下文上限，避免未知模型使用错误的 fallback 元数据。 |
+| `AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT` | `800000` | 达到此 token 数后触发 Codex 自动压缩，为最终结构化输出保留空间。 |
+| `AURORA_CODEX_TRANSCRIPT_MAX_BYTES` | `2097152` | 单份 Harness transcript 的存储上限；超限时保留头尾并写入截断标记。 |
 
 ### LLM 与角色路由
 
@@ -139,16 +163,21 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 
 ### Hands-free Cataloger
 
-Hands-free URL 导入需要单独的 Cataloger Agent。它只负责页面分类，不执行 Solver 工具：
+Hands-free URL 导入优先使用平台适配器和浏览器已观察到的 JSON 响应；这些确定性路径不要求配置 LLM。Cataloger LLM 用于通用静态页面分类，受限浏览器 Agent 只会在平台适配器和响应解析都没有得到可验证题目时运行，不执行 Solver 工具：
 
-| 变量 | 默认值 | 回退顺序 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AURORA_CATALOGER_LLM_API_KEY` | 未设置 | `AURORA_LLM_API_KEY` -> `OPENAI_API_KEY` |
-| `AURORA_CATALOGER_LLM_BASE_URL` | `https://api.openai.com/v1` | `AURORA_LLM_BASE_URL` -> `OPENAI_BASE_URL` |
-| `AURORA_CATALOGER_LLM_MODEL` | `gpt-4.1-mini` | `AURORA_LLM_MODEL` -> `OPENAI_MODEL` |
-| `AURORA_CATALOGER_LLM_TIMEOUT_SECONDS` | `120` | `AURORA_LLM_TIMEOUT_SECONDS` |
+| `AURORA_CATALOGER_LLM_API_KEY` | 未设置 | 回退到 `AURORA_LLM_API_KEY`、`OPENAI_API_KEY`。为空时仍可使用确定性导入。 |
+| `AURORA_CATALOGER_LLM_BASE_URL` | `https://api.openai.com/v1` | 回退到 `AURORA_LLM_BASE_URL`、`OPENAI_BASE_URL`。 |
+| `AURORA_CATALOGER_LLM_MODEL` | `gpt-4.1-mini` | 回退到 `AURORA_LLM_MODEL`、`OPENAI_MODEL`。 |
+| `AURORA_CATALOGER_LLM_TIMEOUT_SECONDS` | `120` | 回退到 `AURORA_LLM_TIMEOUT_SECONDS`。 |
+| `AURORA_CATALOGER_AGENT_ENABLED` | `true` | 是否允许 Cataloger 执行受限的只读分页、筛选和题目详情展开。 |
+| `AURORA_CATALOGER_MAX_AGENT_STEPS` | `12` | 单次导入允许的最大浏览器 Agent 动作数。 |
+| `AURORA_CATALOGER_MAX_PAGES` | `20` | 从当前筛选页开始允许扫描的最大页数。 |
+| `AURORA_CATALOGER_MAX_CANDIDATES` | `500` | 单次导入最多保留的已验证候选数。 |
+| `AURORA_CATALOGER_MAX_RESPONSE_BYTES` | `2097152` | 单个同域 JSON 响应允许采集的最大字节数。 |
 
-只有 API Key、Base URL 和模型都存在时，Cataloger 才算已配置。
+只有 API Key、Base URL 和模型都存在时，LLM/Agent 路径才算已配置。Agent 只能操作当前 DOM 中已观察到的控件，并拒绝登录、注册、提交答案/flag、启动题目环境和创建实例等动作。
 
 ### FOFA 能力
 

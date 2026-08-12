@@ -1,21 +1,28 @@
 from pathlib import Path
+import hashlib
+import time
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import Settings
-from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, Intent, Project, Worker, WorkerEvent
+from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent
 from aurora.services.hands_free import HandsFreeService
-from aurora.services.challenge_group_runner import ChallengeGroupRunner
-from aurora.services.challenge_group_runner import recover_interrupted_groups
+from aurora.services.challenge_group_runner import ChallengeGroupRegistry, ChallengeGroupRunner, GroupRunState
+from aurora.services.challenge_group_runner import fail_group_run, recover_interrupted_groups
 from aurora.services.harvester_runner import HarvesterResult
 
 
-def test_cataloger_configuration_is_required(tmp_path: Path) -> None:
-    service = HandsFreeService(settings=Settings(artifact_dir=tmp_path, cataloger_llm_api_key=None))
+def test_cataloger_configuration_is_optional_for_deterministic_collection(tmp_path: Path) -> None:
+    service = HandsFreeService(
+        settings=Settings(artifact_dir=tmp_path, cataloger_llm_api_key=None, cataloger_agent_enabled=False),
+        fetch_text=lambda url: ("<html><title>Empty catalog</title></html>", url),
+    )
     with Session(service_session_engine()) as session:
-        with pytest.raises(ValueError, match="cataloger Agent is not configured"):
-            service.scan(session, "https://catalog.example/tasks")
+        result = service.scan(session, "https://catalog.example/tasks")
+        assert result.batch.status == "READY"
+        assert result.batch.diagnostics_json[-1]["code"] == "BROWSER_UNAVAILABLE"
+        assert result.candidates == []
 
 
 def test_ctfplus_problem_bank_uses_api_and_respects_url_pagination(tmp_path: Path) -> None:
@@ -38,17 +45,127 @@ def test_ctfplus_problem_bank_uses_api_and_respects_url_pagination(tmp_path: Pat
     with Session(service_session_engine()) as session:
         result = service.scan(session, source_url)
         assert result.batch.status == "READY"
-        assert "CTF+ API identified 2 problem(s) from page 1" in (result.batch.summary or "")
+        assert "CTF+ API identified 2 problem(s) across 2 page(s)" in (result.batch.summary or "")
         assert [candidate.title for candidate in result.candidates] == ["ezunser", "re_signin"]
         assert result.candidates[0].challenge_type == "web"
         assert result.candidates[1].challenge_type == "reverse"
         assert result.candidates[0].challenge_url.endswith("/learning/problem/problem-detail/2068896697408294912/description")
         assert "浙江警察学院第九届信息网络安全竞赛决赛" in (result.candidates[0].description or "")
-    assert requests == [("https://www.ctfplus.cn/api/problem/searchPublicProblem", {
+    expected = {
         "order": 3, "name": "", "tags": ["浙江警察学院第九届信息网络安全竞赛决赛"], "publicType": -1,
         "problemType": -1, "problemTypeGroup": -1, "isSolved": -1, "favoriteId": "2074085927801589760",
         "payment": {}, "page": {"page": 1, "size": 20},
-    }, None)]
+    }
+    assert requests == [
+        ("https://www.ctfplus.cn/api/problem/searchPublicProblem", expected, None),
+        ("https://www.ctfplus.cn/api/problem/searchPublicProblem", {**expected, "page": {"page": 2, "size": 20}}, None),
+    ]
+
+
+def test_ctfd_uses_platform_api_and_rejects_navigation_assets(tmp_path: Path) -> None:
+    source_url = "https://play.example/challenges"
+    html = """
+    <html><title>scriptCTF</title><body x-data="ChallengeBoard">
+      <a href="/challenges">Challenges</a>
+      <a href="https://ctfd.io">Powered by CTFd</a>
+      <script src="/themes/MagicTheme/static/assets/challenges.js"></script>
+      <img src="/files/logo.png" alt="scriptCTF">
+    </body></html>
+    """
+    requests: list[str] = []
+
+    def fetch_json(url: str, _cookie: str | None) -> dict:
+        requests.append(url)
+        if url.endswith("/api/v1/challenges"):
+            return {"success": True, "data": [{"id": 15, "name": "Rules", "category": "Misc", "value": 348}]}
+        assert url.endswith("/api/v1/challenges/15")
+        return {"success": True, "data": {"id": 15, "name": "Rules", "category": "Misc", "description": "Read the rules", "value": 348, "files": ["/files/rules.zip"]}}
+
+    service = HandsFreeService(
+        settings=Settings(artifact_dir=tmp_path, cataloger_llm_api_key=None),
+        fetch_text=lambda url: (html, url),
+        fetch_json=fetch_json,
+        fetch_bytes=lambda _url, _limit: (b"PK\x03\x04rules", "application/zip"),
+        ctfplus_attachment_collector=lambda _candidates, _cookie: None,
+    )
+    with Session(service_session_engine()) as session:
+        result = service.scan(session, source_url)
+        assert result.batch.platform == "ctfd"
+        assert result.batch.extraction_strategy == "platform_api"
+        assert [candidate.title for candidate in result.candidates] == ["Rules"]
+        candidate = result.candidates[0]
+        assert candidate.challenge_url == f"{source_url}#challenge-15"
+        assert candidate.source_metadata_json["challenge_id"] == "15"
+        assert candidate.staged_attachments_json[0]["filename"] == "rules.zip"
+    assert requests == [f"https://play.example/api/v1/challenges", f"https://play.example/api/v1/challenges/15"]
+
+
+def test_ctfd_stages_trusted_external_description_attachments(tmp_path: Path) -> None:
+    source_url = "https://play.example/challenges"
+    html = "<html><title>scriptCTF</title><body x-data='ChallengeBoard'></body></html>"
+    downloaded: list[str] = []
+
+    def fetch_json(url: str, _cookie: str | None) -> dict:
+        if url.endswith("/api/v1/challenges"):
+            return {"success": True, "data": [{"id": 26, "name": "Bruteforced"}]}
+        return {"success": True, "data": {
+            "id": 26,
+            "name": "Bruteforced",
+            "category": "Forensics",
+            "description": (
+                "Read the [event site](https://unrelated.example/info).\n"
+                "## Attachments\n"
+                "* [log.pcap](https://cdn.example/log.pcap)\n"
+                "* [chall](https://bucket.s3.amazonaws.com/chall)\n"
+                "* [large.zip](https://cdn.example/large.zip)\n"
+                "* [VM mirror](https://drive.google.com/file/d/example/view)\n"
+                "## Notes\n"
+                "See [writeup](https://unrelated.example/writeup.zip)."
+            ),
+        }}
+
+    def fetch_bytes(url: str, _limit: int) -> tuple[bytes, str | None]:
+        downloaded.append(url)
+        if url.endswith("large.zip"):
+            raise ValueError("attachment exceeds size limit")
+        if url.endswith("chall"):
+            return b"\x7fELFpayload", "application/octet-stream"
+        return b"\xd4\xc3\xb2\xa1pcap", "application/octet-stream"
+
+    service = HandsFreeService(
+        settings=Settings(artifact_dir=tmp_path, cataloger_llm_api_key=None),
+        fetch_text=lambda url: (html, url),
+        fetch_json=fetch_json,
+        fetch_bytes=fetch_bytes,
+        ctfplus_attachment_collector=lambda _candidates, _cookie: None,
+    )
+    with Session(service_session_engine()) as session:
+        result = service.scan(session, source_url)
+        candidate = result.candidates[0]
+        assert [item["filename"] for item in candidate.staged_attachments_json] == ["log.pcap", "chall.elf"]
+        assert downloaded == ["https://cdn.example/log.pcap", "https://bucket.s3.amazonaws.com/chall", "https://cdn.example/large.zip"]
+        assert candidate.external_attachments_json == [{
+            "url": "https://cdn.example/large.zip",
+            "status": "external_review_required",
+            "reason": "attachment exceeds size limit",
+        }, {
+            "url": "https://drive.google.com/file/d/example/view",
+            "status": "external_review_required",
+        }]
+
+
+def test_ctfd_extracts_html_attachment_section_only() -> None:
+    description = """
+    <p><a href="https://unrelated.example/rules.pdf">Rules</a></p>
+    <h2>Attachments</h2>
+    <p><a href="/files/challenge.zip">challenge.zip</a></p>
+    <h2>References</h2>
+    <p><a href="https://unrelated.example/reference.zip">Reference</a></p>
+    """
+
+    assert HandsFreeService._ctfd_description_attachment_urls(description, "https://play.example/challenges") == [
+        "https://play.example/files/challenge.zip"
+    ]
 
 
 def test_ctfplus_detail_attachments_are_staged_when_search_api_omits_them(tmp_path: Path) -> None:
@@ -99,6 +216,19 @@ def test_generic_detail_browser_download_is_staged(tmp_path: Path) -> None:
     with Session(service_session_engine()) as session:
         result = service.scan(session, "https://catalog.example/tasks")
         assert result.candidates[0].staged_attachments_json[0]["filename"] == "client.bin"
+
+
+def test_generic_cataloger_rejects_low_confidence_candidates(tmp_path: Path) -> None:
+    service = HandsFreeService(
+        settings=Settings(artifact_dir=tmp_path, cataloger_llm_api_key="test-key", cataloger_agent_enabled=False),
+        fetch_text=lambda url: ("<a href='/tasks/one'>Challenge One</a>", url),
+        cataloger=lambda _: {"summary": "uncertain", "candidates": [{"title": "One", "challenge_url": "https://catalog.example/tasks/one", "attachment_urls": [], "confidence": 0.79}]},
+        ctfplus_attachment_collector=lambda _candidates, _cookie: None,
+    )
+    with Session(service_session_engine()) as session:
+        result = service.scan(session, "https://catalog.example/tasks")
+        assert result.batch.status == "READY"
+        assert result.candidates == []
 
 
 def test_hands_free_stages_same_domain_attachments_and_confirms_projects(tmp_path: Path) -> None:
@@ -193,6 +323,32 @@ def test_challenge_group_advances_through_terminal_projects() -> None:
         assert [item.status for item in items] == ["COMPLETED", "FAILED"]
 
 
+def test_explicit_no_flag_challenge_is_terminal() -> None:
+    with Session(service_session_engine()) as session:
+        project = Project(name="attendance", goal="Click Submit. You don't need to input a flag.")
+        group = ChallengeGroup(name="batch")
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1)
+        session.add(item)
+        session.commit()
+
+        runner = ChallengeGroupRunner()
+        assert runner._is_explicit_no_flag_challenge(project)
+        runner._resolve_phase(
+            session,
+            group=group,
+            item=item,
+            project=project,
+            outcome="NO_FLAG_COMPLETED",
+            reason="statement_explicitly_requires_no_flag",
+        )
+        session.refresh(project)
+        session.refresh(item)
+        assert project.status == "COMPLETED"
+        assert item.fused_status == "COMPLETED"
+
+
 def test_challenge_group_runs_phase_waves_before_marking_final_failure() -> None:
     class FailedHarvester:
         def run(self, session, *, project_id, task, limits, should_stop):
@@ -247,8 +403,9 @@ def test_competition_flag_rejection_reopens_project_with_worker_feedback() -> No
         session.commit()
         cancelled = Intent(project_id=project.id, objective="continue analysis", status="CANCELLED")
         finding = Finding(project_id=project.id, title="Candidate flag: flag{wrong}", evidence_refs=["artifact_original"])
+        candidate = FlagCandidate(project_id=project.id, value="flag{wrong}", value_hash=hashlib.sha256(b"flag{wrong}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED", artifact_refs=["artifact_original"])
         item = ChallengeGroupItem(group_id="group_rejected", project_id=project.id, position=1)
-        session.add_all([cancelled, finding, item])
+        session.add_all([cancelled, finding, candidate, item])
         session.commit()
         session.add(
             WorkerEvent(
@@ -283,17 +440,18 @@ def test_unavailable_submission_requires_manual_flag_validation(adapter_result: 
             return adapter_result
 
     with Session(service_session_engine()) as session:
-        project = Project(name="manual-review", goal="verify the flag", status="COMPLETED")
+        project = Project(name="manual-review", goal="verify the flag", status="FLAG_READY")
         group = ChallengeGroup(name="manual-review-group", status="RUNNING")
         session.add_all([project, group])
         session.commit()
         finding = Finding(project_id=project.id, title="Candidate flag: flag{needs_review}")
+        candidate = FlagCandidate(project_id=project.id, value="flag{needs_review}", value_hash=hashlib.sha256(b"flag{needs_review}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED")
         item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="RUNNING", fused_status="RUNNING")
-        session.add_all([finding, item])
+        session.add_all([finding, candidate, item])
         session.commit()
 
         runner = ChallengeGroupRunner(competition=UnavailableAdapter())
-        runner._resolve_phase(session, group=group, item=item, project=project, outcome="COMPLETED", reason="candidate detected")
+        runner._resolve_phase(session, group=group, item=item, project=project, outcome="CANDIDATE_READY", reason="candidate detected")
 
         session.refresh(group)
         session.refresh(item)
@@ -342,6 +500,51 @@ def test_manual_flag_rejection_reopens_solver_instead_of_accepting_hallucination
         assert "flag{hallucinated}" in feedback.statement
 
 
+def test_manual_validation_resume_replaces_runner_that_is_still_unwinding(monkeypatch) -> None:
+    registry = ChallengeGroupRegistry()
+    paused = GroupRunState(group_id="group_review")
+    registry._runs[paused.group_id] = paused
+    resumed: list[GroupRunState] = []
+    monkeypatch.setattr(registry, "_run", resumed.append)
+
+    state = registry.resume_after_manual_validation(paused.group_id)
+
+    deadline = time.monotonic() + 1
+    while not resumed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert state is not paused
+    assert registry.status(paused.group_id)["started_at"] == state.started_at
+    assert resumed == [state]
+
+
+def test_manual_flag_acceptance_survives_environment_cleanup_failure() -> None:
+    class CleanupFailureAdapter:
+        def close_environment(self, *, project_id):
+            raise RuntimeError("container engine unavailable")
+
+    with Session(service_session_engine()) as session:
+        project = Project(name="cleanup-failure", goal="verify", status="AWAITING_MANUAL_VALIDATION")
+        group = ChallengeGroup(name="cleanup-failure-group", status="AWAITING_MANUAL_VALIDATION")
+        session.add_all([project, group])
+        session.commit()
+        finding = Finding(project_id=project.id, title="Candidate flag: flag{cleanup_ok}")
+        candidate = FlagCandidate(project_id=project.id, value="flag{cleanup_ok}", value_hash="cleanup-ok-hash", status="AWAITING_MANUAL_VALIDATION", provenance_kind="OBSERVED")
+        item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="AWAITING_MANUAL_VALIDATION", fused_status="AWAITING_MANUAL_VALIDATION", submission_status="AWAITING_MANUAL_VALIDATION")
+        session.add_all([finding, candidate, item])
+        session.commit()
+
+        result = ChallengeGroupRunner(competition=CleanupFailureAdapter()).validate_flag_manually(
+            session, group_id=group.id, item_id=item.id, accepted=True
+        )
+
+        assert result.submission_status == "MANUALLY_ACCEPTED"
+        assert session.get(Project, project.id).status == "COMPLETED"
+        cleanup_event = session.exec(
+            select(ChallengeGroupEvent).where(ChallengeGroupEvent.group_id == group.id, ChallengeGroupEvent.event_type == "group.item.environment_cleanup_failed")
+        ).one()
+        assert cleanup_event.payload_json["error"] == "container engine unavailable"
+
+
 def test_recover_interrupted_group_requeues_its_running_item() -> None:
     with Session(service_session_engine()) as session:
         project = Project(name="interrupted", goal="resume after restart")
@@ -368,6 +571,39 @@ def test_recover_interrupted_group_requeues_its_running_item() -> None:
         assert worker.status == "INTERRUPTED"
         assert attempt.status == "INTERRUPTED"
         assert group.current_item_id is None
+
+
+def test_group_runner_failure_requeues_active_item_and_releases_worker(monkeypatch) -> None:
+    monkeypatch.setattr("aurora.services.challenge_group_runner.stop_project_containers", lambda _project_id: [])
+    with Session(service_session_engine()) as session:
+        project = Project(name="runner-failure", goal="retry after infrastructure failure")
+        group = ChallengeGroup(name="batch", status="RUNNING")
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="RUNNING", fused_status="RUNNING")
+        intent = Intent(project_id=project.id, objective="solve", status="RUNNING", lease_owner="worker_test")
+        worker = Worker(id="worker_test", project_id=project.id, intent_id=intent.id, status="RUNNING")
+        attempt = Attempt(project_id=project.id, intent_id=intent.id, worker_id=worker.id, status="RUNNING")
+        group.current_item_id = item.id
+        session.add_all([item, intent, worker, attempt, group])
+        session.commit()
+
+        fail_group_run(session, group_id=group.id, error="database write failed")
+
+        session.refresh(item)
+        session.refresh(intent)
+        session.refresh(worker)
+        session.refresh(attempt)
+        session.refresh(group)
+        assert group.status == "FAILED"
+        assert group.current_item_id is None
+        assert item.status == "PENDING"
+        assert item.fused_status == "PENDING"
+        assert item.stop_reason == "recovered_after_runner_failure"
+        assert intent.status == "PENDING"
+        assert intent.lease_owner is None
+        assert worker.status == "INTERRUPTED"
+        assert attempt.status == "INTERRUPTED"
 
 
 def test_paused_batch_can_continue_with_ephemeral_authenticated_fetcher(tmp_path: Path) -> None:

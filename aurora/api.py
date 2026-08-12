@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlmodel import Session, select
 
 from pathlib import Path
@@ -28,8 +28,10 @@ from aurora.models import (
     DiscoveredTarget,
     Fact,
     Finding,
+    FlagCandidate,
     Hint,
     ImportBatch,
+    ImportCandidate,
     Intent,
     LLMTrace,
     Project,
@@ -37,6 +39,7 @@ from aurora.models import (
     Worker,
     WorkerEvent,
     ProjectRuntimePolicy,
+    now_utc,
 )
 from aurora.services.demo import create_project_with_bootstrap, run_one_demo_step
 from aurora.services.artifact_store import ArtifactStore
@@ -47,6 +50,7 @@ from aurora.services.observer import ObserverService
 from aurora.services.manager import ManagerService
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
 from aurora.services.autorun_registry import autorun_registry
+from aurora.services.api_instance_lock import acquire_api_instance_lock
 from aurora.services.container_control import get_project_container_logs, stop_project_containers
 from aurora.services.hands_free import HandsFreeService
 from aurora.services.project_rethink import rethink_project
@@ -55,7 +59,9 @@ from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_a
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry
 from aurora.services.project_deletion import ProjectDeletionService
+from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.target_verification import TargetVerificationService
+from aurora.services.network_proxy import load_network_proxy, network_proxy_registry, save_network_proxy
 
 
 class CreateProjectRequest(BaseModel):
@@ -100,11 +106,29 @@ class CreateHintRequest(BaseModel):
     source: str = "user"
 
 
+class EvidenceItemRequest(BaseModel):
+    description: str = Field(min_length=1, max_length=2_000)
+    artifact_refs: list[str] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def description_is_not_blank(self) -> "EvidenceItemRequest":
+        if not self.description.strip():
+            raise ValueError("evidence description must not be blank")
+        return self
+
+
 class CreateEvidenceFactRequest(BaseModel):
     statement: str = Field(min_length=1, max_length=4_000)
-    evidence_refs: list[str] = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+    evidence_items: list[EvidenceItemRequest] = Field(default_factory=list, max_length=10)
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     category: str = Field(default="analysis", min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def requires_evidence(self) -> "CreateEvidenceFactRequest":
+        if not self.evidence_refs and not self.evidence_items:
+            raise ValueError("at least one evidence artifact or structured evidence item is required")
+        return self
 
 
 class BrowserSessionRequest(BaseModel):
@@ -144,6 +168,12 @@ class ManualFlagValidationRequest(BaseModel):
     accepted: bool
 
 
+class NetworkProxyRequest(BaseModel):
+    mode: str
+    proxy_url: str | None = Field(default=None, max_length=1_000)
+    no_proxy: str | None = Field(default=None, max_length=2_000)
+
+
 class ImportProgressRegistry:
     def __init__(self) -> None:
         self._events: dict[str, list[dict[str, Any]]] = {}
@@ -177,30 +207,34 @@ def _run_import_batch(batch_id: str, *, cookie: str | None, username: str | None
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        init_db()
-        get_settings().artifact_dir.mkdir(parents=True, exist_ok=True)
-        challenge_group_registry.resume_interrupted_groups()
-        stop_reaper = Event()
+        settings = get_settings()
+        with acquire_api_instance_lock(settings.database_url):
+            init_db()
+            with Session(engine) as session:
+                load_network_proxy(session)
+            settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+            challenge_group_registry.resume_interrupted_groups()
+            stop_reaper = Event()
 
-        def reap_worker_leases() -> None:
-            interval = max(1, get_settings().worker_reap_interval_seconds)
-            while not stop_reaper.is_set():
-                try:
-                    with Session(engine) as session:
-                        Scheduler().reap_all_expired(session)
-                except Exception:
-                    # The next pass retries; worker execution must never be
-                    # brought down by maintenance failure.
-                    pass
-                stop_reaper.wait(interval)
+            def reap_worker_leases() -> None:
+                interval = max(1, settings.worker_reap_interval_seconds)
+                while not stop_reaper.is_set():
+                    try:
+                        with Session(engine) as session:
+                            Scheduler().reap_all_expired(session)
+                    except Exception:
+                        # The next pass retries; worker execution must never be
+                        # brought down by maintenance failure.
+                        pass
+                    stop_reaper.wait(interval)
 
-        reaper_thread = Thread(target=reap_worker_leases, name="aurora-worker-reaper", daemon=True)
-        reaper_thread.start()
-        try:
-            yield
-        finally:
-            stop_reaper.set()
-            reaper_thread.join(timeout=max(1, get_settings().worker_reap_interval_seconds) + 1)
+            reaper_thread = Thread(target=reap_worker_leases, name="aurora-worker-reaper", daemon=True)
+            reaper_thread.start()
+            try:
+                yield
+            finally:
+                stop_reaper.set()
+                reaper_thread.join(timeout=max(1, settings.worker_reap_interval_seconds) + 1)
 
     app = FastAPI(title="Aurora API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -218,6 +252,17 @@ def create_app() -> FastAPI:
     @app.api_route("/favicon.ico", methods=["GET", "HEAD"])
     def favicon() -> Response:
         return Response(status_code=204)
+
+    @app.get("/api/settings/network-proxy")
+    def get_network_proxy() -> dict[str, str | None]:
+        return network_proxy_registry.get().public_dict()
+
+    @app.put("/api/settings/network-proxy")
+    def update_network_proxy(payload: NetworkProxyRequest, session: Session = Depends(get_session)) -> dict[str, str | None]:
+        try:
+            return save_network_proxy(session, mode=payload.mode, proxy_url=payload.proxy_url, no_proxy=payload.no_proxy).public_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects")
     def create_project(payload: CreateProjectRequest, session: Session = Depends(get_session)) -> Project:
@@ -283,6 +328,36 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/hands-free/imports/{batch_id}/candidates/{candidate_id}/external-attachments/{attachment_index}/download")
+    def download_external_attachment(batch_id: str, candidate_id: str, attachment_index: int, session: Session = Depends(get_session)) -> StreamingResponse:
+        candidate = session.get(ImportCandidate, candidate_id)
+        if candidate is None or candidate.batch_id != batch_id:
+            raise HTTPException(status_code=404, detail="import candidate not found")
+        if attachment_index < 0 or attachment_index >= len(candidate.external_attachments_json):
+            raise HTTPException(status_code=404, detail="external attachment not found")
+        item = candidate.external_attachments_json[attachment_index]
+        url = item.get("url") if isinstance(item, dict) else None
+        if not isinstance(url, str) or not url.strip():
+            raise HTTPException(status_code=400, detail="external attachment has no download URL")
+        try:
+            upstream = HandsFreeService.open_external_attachment(url)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"external attachment download failed: {str(exc)[:300]}") from exc
+        filename = HandsFreeService._safe_filename(str(item.get("filename") or HandsFreeService._filename(url)))
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        content_length = upstream.headers.get("Content-Length")
+        if content_length and content_length.isdigit():
+            headers["Content-Length"] = content_length
+
+        def stream():
+            try:
+                while chunk := upstream.read(1024 * 1024):
+                    yield chunk
+            finally:
+                upstream.close()
+
+        return StreamingResponse(stream(), media_type=upstream.headers.get_content_type(), headers=headers)
+
     @app.post("/api/hands-free/imports/{batch_id}/confirm")
     def confirm_hands_free_import(batch_id: str, payload: HandsFreeConfirmRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
@@ -291,7 +366,7 @@ def create_app() -> FastAPI:
             verifier = TargetVerificationService()
             for project in projects:
                 if project["status"] == "created":
-                    verification = verifier.verify(session, project_id=project["project_id"], source_url=project.get("challenge_url"))
+                    verification = verifier.verify(session, project_id=project["project_id"], source_url=project.get("challenge_url"), source_metadata=project.get("source_metadata"))
                     project["target_verification_status"] = verification.status
                     project["target_verification_reason"] = verification.reason
                     project["target_url"] = verification.target_url
@@ -336,17 +411,15 @@ def create_app() -> FastAPI:
         items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id).order_by(ChallengeGroupItem.position)).all()
         events = session.exec(select(ChallengeGroupEvent).where(ChallengeGroupEvent.group_id == group_id).order_by(ChallengeGroupEvent.created_at.desc()).limit(100)).all()
         projects = {project.id: project for project in session.exec(select(Project).where(Project.id.in_([item.project_id for item in items]))).all()}
-        candidate_findings = session.exec(
-            select(Finding).where(
-                Finding.project_id.in_([item.project_id for item in items]),
-                Finding.title.startswith("Candidate flag: "),
-            )
+        group_candidates = session.exec(
+            select(FlagCandidate).where(FlagCandidate.project_id.in_([item.project_id for item in items]))
         ).all() if items else []
         candidate_flags = {
-            finding.project_id: finding.title.removeprefix("Candidate flag: ")
-            for finding in candidate_findings
+            candidate.project_id: candidate.value
+            for candidate in group_candidates
+            if candidate.status in {"LOCAL_VERIFIED", "SUBMITTED", "ACCEPTED", "AWAITING_MANUAL_VALIDATION"}
         }
-        return {"group": group, "items": items, "projects": projects, "candidate_flags": candidate_flags, "events": events, "background": challenge_group_registry.status(group_id)}
+        return {"group": group, "items": items, "projects": projects, "candidate_flags": candidate_flags, "flag_candidates": group_candidates, "events": events, "background": challenge_group_registry.status(group_id)}
 
     @app.post("/api/challenge-groups/{group_id}/items/{item_id}/flag-validation")
     def validate_group_flag_manually(
@@ -366,7 +439,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"status": "accepted" if payload.accepted else "rejected", "item": item}
+        group = session.get(ChallengeGroup, group_id)
+        background = (
+            challenge_group_registry.resume_after_manual_validation(group_id)
+            if group is not None and group.status == "READY"
+            else None
+        )
+        return {
+            "status": "accepted" if payload.accepted else "rejected",
+            "item": item,
+            "background": background.__dict__ if background else None,
+        }
 
     @app.delete("/api/challenge-groups/{group_id}")
     def delete_challenge_group(group_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
@@ -475,7 +558,15 @@ def create_app() -> FastAPI:
     @app.post("/api/projects/{project_id}/facts")
     def derive_fact_from_evidence(project_id: str, payload: CreateEvidenceFactRequest, session: Session = Depends(get_session)) -> Fact:
         _require_mutable_project(session, project_id)
-        artifacts = [session.get(Artifact, artifact_id) for artifact_id in payload.evidence_refs]
+        evidence_items = [
+            {"description": item.description.strip(), "artifact_refs": list(dict.fromkeys(item.artifact_refs))}
+            for item in payload.evidence_items
+        ]
+        evidence_refs = list(dict.fromkeys([
+            *payload.evidence_refs,
+            *(artifact_id for item in evidence_items for artifact_id in item["artifact_refs"]),
+        ]))
+        artifacts = [session.get(Artifact, artifact_id) for artifact_id in evidence_refs]
         if any(artifact is None or artifact.project_id != project_id for artifact in artifacts):
             raise HTTPException(status_code=400, detail="every evidence artifact must belong to this project")
         result = BlackboardRepository().upsert_fact(
@@ -484,13 +575,14 @@ def create_app() -> FastAPI:
             statement=payload.statement.strip(),
             category=payload.category.strip(),
             confidence=payload.confidence,
-            evidence_refs=list(dict.fromkeys(payload.evidence_refs)),
+            evidence_refs=evidence_refs,
+            evidence_items=evidence_items,
         )
         session.add(
             WorkerEvent(
                 project_id=project_id,
                 event_type="fact.derived_from_evidence",
-                payload_json={"fact_id": result.item.id, "evidence_refs": list(dict.fromkeys(payload.evidence_refs)), "created": result.created},
+                payload_json={"fact_id": result.item.id, "evidence_refs": evidence_refs, "evidence_items": evidence_items, "created": result.created},
             )
         )
         session.commit()
@@ -642,6 +734,7 @@ def create_app() -> FastAPI:
             "attempts": session.exec(select(Attempt).where(Attempt.project_id == project_id).order_by(Attempt.started_at)).all(),
             "artifacts": session.exec(select(Artifact).where(Artifact.project_id == project_id).order_by(Artifact.created_at)).all(),
             "findings": session.exec(select(Finding).where(Finding.project_id == project_id).order_by(Finding.created_at)).all(),
+            "flag_candidates": session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id).order_by(FlagCandidate.created_at)).all(),
             "workers": session.exec(select(Worker).where(Worker.project_id == project_id).order_by(Worker.created_at)).all(),
             "checkpoints": session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at)).all(),
         }
@@ -661,6 +754,7 @@ def create_app() -> FastAPI:
         ).all()
         checkpoints = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at.desc())).all()
         events = session.exec(select(WorkerEvent).where(WorkerEvent.project_id == project_id).order_by(WorkerEvent.created_at.desc()).limit(200)).all()
+        flag_candidates = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id).order_by(FlagCandidate.created_at.desc())).all()
         return {
             "project": project,
             "counts": {
@@ -674,8 +768,10 @@ def create_app() -> FastAPI:
                 "context_snapshots": len(context_snapshots),
                 "checkpoints": len(checkpoints),
                 "events_returned": len(events),
+                "flag_candidates": len(flag_candidates),
             },
             "findings": findings,
+            "flag_candidates": flag_candidates,
             "recent_facts": facts[:20],
             "intents_by_status": _count_by_status([intent.status for intent in intents]),
             "attempts_by_status": _count_by_status([attempt.status for attempt in attempts]),
@@ -691,6 +787,89 @@ def create_app() -> FastAPI:
     def list_findings(project_id: str, session: Session = Depends(get_session)) -> list[Finding]:
         _require_project(session, project_id)
         return session.exec(select(Finding).where(Finding.project_id == project_id).order_by(Finding.created_at.desc())).all()
+
+    @app.get("/api/projects/{project_id}/flag-candidates")
+    def list_flag_candidates(project_id: str, session: Session = Depends(get_session)) -> list[FlagCandidate]:
+        _require_project(session, project_id)
+        return session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id).order_by(FlagCandidate.created_at.desc())).all()
+
+    @app.post("/api/projects/{project_id}/flag-candidates/{candidate_id}/validation")
+    def validate_project_flag_manually(
+        project_id: str,
+        candidate_id: str,
+        payload: ManualFlagValidationRequest,
+        session: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        project = _require_project(session, project_id)
+        candidate = session.get(FlagCandidate, candidate_id)
+        if candidate is None or candidate.project_id != project_id:
+            raise HTTPException(status_code=404, detail="flag candidate not found")
+        if candidate.status not in {"LOCAL_VERIFIED", "SUBMITTED", "AWAITING_MANUAL_VALIDATION"}:
+            raise HTTPException(status_code=409, detail="flag candidate is not awaiting a final decision")
+
+        awaiting_items = session.exec(
+            select(ChallengeGroupItem).where(
+                ChallengeGroupItem.project_id == project_id,
+                ChallengeGroupItem.submission_status == "AWAITING_MANUAL_VALIDATION",
+            )
+        ).all()
+        if awaiting_items:
+            runner = ChallengeGroupRunner()
+            affected_group_ids: list[str] = []
+            try:
+                for item in awaiting_items:
+                    runner.validate_flag_manually(
+                        session,
+                        group_id=item.group_id,
+                        item_id=item.id,
+                        accepted=payload.accepted,
+                        candidate_id=candidate_id,
+                    )
+                    if item.group_id not in affected_group_ids:
+                        affected_group_ids.append(item.group_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            backgrounds: dict[str, Any] = {}
+            for group_id in affected_group_ids:
+                group = session.get(ChallengeGroup, group_id)
+                if group is not None and group.status == "READY":
+                    state = challenge_group_registry.resume_after_manual_validation(group_id)
+                    backgrounds[group_id] = state.__dict__ if state else None
+            session.refresh(candidate)
+            return {
+                "status": "accepted" if payload.accepted else "rejected",
+                "candidate": candidate,
+                "groups": affected_group_ids,
+                "backgrounds": backgrounds,
+            }
+
+        candidate.updated_at = now_utc()
+        if payload.accepted:
+            candidate.status = "ACCEPTED"
+            project.status = "COMPLETED"
+            project.updated_at = now_utc()
+            pending_intents = session.exec(select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")).all()
+            for intent in pending_intents:
+                intent.status = "CANCELLED"
+                intent.updated_at = now_utc()
+                session.add(intent)
+            session.add(WorkerEvent(project_id=project_id, event_type="project.completed", payload_json={"reason": "flag manually accepted", "candidate_id": candidate.id, "value": candidate.value, "cancelled_intent_ids": [intent.id for intent in pending_intents]}))
+            session.add(project)
+            session.add(candidate)
+            session.commit()
+        else:
+            candidate.status = "REJECTED"
+            candidate.rejection_reason = "manual validation rejected the candidate flag"
+            session.add(candidate)
+            finding = session.exec(select(Finding).where(Finding.project_id == project_id, Finding.title == f"Candidate flag: {candidate.value}")).first()
+            if finding is None:
+                raise HTTPException(status_code=409, detail="candidate finding not found")
+            reopen_project_after_invalid_flag(session, project_id=project_id, finding_id=finding.id, reason=candidate.rejection_reason)
+        session.refresh(candidate)
+        return {"status": "accepted" if payload.accepted else "rejected", "candidate": candidate}
 
     @app.get("/api/projects/{project_id}/checkpoints")
     def list_checkpoints(project_id: str, session: Session = Depends(get_session)) -> list[AttemptCheckpoint]:
@@ -853,7 +1032,7 @@ def _require_project(session: Session, project_id: str) -> Project:
 
 def _require_mutable_project(session: Session, project_id: str) -> Project:
     project = _require_project(session, project_id)
-    if project.status in {"COMPLETED", "CANCELLED", "FAILED"}:
+    if project.status in {"COMPLETED", "CANCELLED", "FAILED", "FLAG_READY", "AWAITING_MANUAL_VALIDATION"}:
         raise HTTPException(status_code=409, detail=f"project is {project.status.lower()}")
     return project
 

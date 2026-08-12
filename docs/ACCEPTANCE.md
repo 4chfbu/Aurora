@@ -66,10 +66,10 @@ Create a runnable `sandbox.exec` Intent:
 Then run Scheduler. Expected result:
 
 - A Finding is created.
-- Project status becomes `COMPLETED`.
-- Remaining pending Intents are cancelled.
-- Additional Hint/Intent creation returns `409 Conflict`.
-- `scheduler/run-next` returns `project_completed`.
+- Project status becomes `FLAG_READY` after local evidence validation.
+- Accept the candidate through `POST /api/projects/<project_id>/flag-candidates/<candidate_id>/validation` with `{"accepted": true}` when no competition adapter is available.
+- Project status then becomes `COMPLETED`, remaining pending Intents are cancelled, and additional Hint/Intent creation returns `409 Conflict`.
+- `scheduler/run-next` returns `project_completed` after final acceptance.
 
 ## Review API
 

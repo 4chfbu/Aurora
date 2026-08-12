@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Column
+from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
@@ -13,6 +13,14 @@ def now_utc() -> datetime:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:16]}"
+
+
+class NetworkProxySetting(SQLModel, table=True):
+    id: str = Field(default="global", primary_key=True)
+    mode: str = "system"
+    proxy_url: str | None = None
+    no_proxy: str = "127.0.0.1,localhost,aurora-cc-switch"
+    updated_at: datetime = Field(default_factory=now_utc)
 
 
 class Project(SQLModel, table=True):
@@ -75,6 +83,7 @@ class Fact(SQLModel, table=True):
     category: str = "general"
     confidence: float = 0.5
     evidence_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    evidence_items: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     source_intent_id: str | None = Field(default=None, index=True)
     source_attempt_id: str | None = Field(default=None, index=True)
     status: str = "ACTIVE"
@@ -120,7 +129,7 @@ class Attempt(SQLModel, table=True):
 
 
 class AttemptCheckpoint(SQLModel, table=True):
-    """A compact, evidence-linked handoff from one solver round to the next."""
+    """An evidence-linked reflection and handoff from one solver round to the next."""
     id: str = Field(default_factory=lambda: new_id("checkpoint"), primary_key=True)
     project_id: str = Field(index=True)
     intent_id: str = Field(index=True)
@@ -135,6 +144,7 @@ class AttemptCheckpoint(SQLModel, table=True):
     next_steps: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     fact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     artifact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    generated_intent_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     budget_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     source: str = "planner"
     created_at: datetime = Field(default_factory=now_utc)
@@ -168,6 +178,7 @@ class Artifact(SQLModel, table=True):
     size: int = 0
     summary: str | None = None
     sensitivity: str = "normal"
+    origin_kind: str = "unclassified"
     created_at: datetime = Field(default_factory=now_utc)
 
 
@@ -181,6 +192,10 @@ class ImportBatch(SQLModel, table=True):
     auth_method: str | None = None
     login_domain: str | None = None
     auth_message: str | None = None
+    platform: str | None = None
+    extraction_strategy: str | None = None
+    pages_scanned: int = 0
+    diagnostics_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 
@@ -196,6 +211,7 @@ class ImportCandidate(SQLModel, table=True):
     staged_attachments_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     external_attachments_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     evidence_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    source_metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     confirmed: bool = False
     project_id: str | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=now_utc)
@@ -266,6 +282,26 @@ class Finding(SQLModel, table=True):
     reproduction: str | None = None
     evidence_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class FlagCandidate(SQLModel, table=True):
+    """A flag proposal with explicit provenance and submission lifecycle."""
+    __table_args__ = (UniqueConstraint("project_id", "value_hash", name="uq_flagcandidate_project_value"),)
+
+    id: str = Field(default_factory=lambda: new_id("flag"), primary_key=True)
+    project_id: str = Field(index=True)
+    value: str
+    value_hash: str = Field(index=True)
+    status: str = Field(default="PROPOSED", index=True)
+    provenance_kind: str = "UNVERIFIED"
+    artifact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    verification_artifact_ref: str | None = None
+    source_attempt_id: str | None = Field(default=None, index=True)
+    source_worker_id: str | None = Field(default=None, index=True)
+    submission_count: int = 0
+    rejection_reason: str | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
 
 
 class Hint(SQLModel, table=True):
