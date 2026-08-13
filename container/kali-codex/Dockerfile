@@ -11,7 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN rm -f /etc/apt/sources.list.d/* \
-    && printf 'deb http://ftp.halifax.rwth-aachen.de/kali kali-rolling main contrib non-free non-free-firmware\n' > /etc/apt/sources.list \
+    && printf 'deb http://mirrors.ustc.edu.cn/kali/ kali-rolling main contrib non-free non-free-firmware\n' > /etc/apt/sources.list \
     && apt-get -o Acquire::Retries=20 -o Acquire::http::Pipeline-Depth=0 update \
     && apt-get -o Acquire::Retries=20 -o Acquire::http::Pipeline-Depth=0 install -y --no-install-recommends \
       7zip \

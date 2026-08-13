@@ -33,6 +33,16 @@ class BrowserSessionRegistry:
             for project_id in project_ids:
                 self._project_sessions[project_id] = session
 
+    def bind_batch_project_sources(self, *, batch_id: str, project_sources: dict[str, str]) -> None:
+        """Reuse the in-memory Cookie while binding each project to its detail page."""
+        with self._lock:
+            session = self._batch_sessions.get(batch_id)
+            if session is None:
+                return
+            for project_id, source_url in project_sources.items():
+                if urlparse(source_url).hostname:
+                    self._project_sessions[project_id] = BrowserSession(source_url=source_url, cookie=session.cookie)
+
     def get_batch_session(self, batch_id: str) -> BrowserSession | None:
         with self._lock:
             return self._batch_sessions.get(batch_id)

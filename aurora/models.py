@@ -71,8 +71,12 @@ class DiscoveredTarget(SQLModel, table=True):
     url: str
     host: str = Field(index=True)
     source_artifact_id: str | None = Field(default=None, index=True)
+    source: str = Field(default="automatic", index=True)
+    confidence: float = 0.0
+    probe_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="ACTIVE", index=True)
     created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
     invalidated_at: datetime | None = None
 
 
@@ -118,6 +122,10 @@ class Attempt(SQLModel, table=True):
     parent_attempt_id: str | None = Field(default=None, index=True)
     codex_thread_id: str | None = None
     codex_turn_id: str | None = None
+    codex_control_token_hash: str | None = None
+    last_event_at: datetime | None = None
+    resume_count: int = 0
+    blackboard_version: int = 0
     status: str = "RUNNING"
     result_summary: str | None = None
     failure_reason: str | None = None

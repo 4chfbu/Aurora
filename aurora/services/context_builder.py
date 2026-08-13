@@ -88,6 +88,11 @@ class ContextBuilder:
             .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "harvester.task_dispatched")
             .order_by(WorkerEvent.created_at.desc())
         ).first()
+        live_checkpoint = session.exec(
+            select(WorkerEvent)
+            .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "checkpoint.saved")
+            .order_by(WorkerEvent.created_at.desc())
+        ).first()
 
         sections: dict[str, Any] = {
             "project_goal": project.goal,
@@ -142,6 +147,7 @@ class ContextBuilder:
                 }
                 for checkpoint in checkpoints
             ],
+            "live_checkpoint": live_checkpoint.payload_json if live_checkpoint else None,
             "operating_mode": {
                 "tooling": "Kali native tools first; MCP only when Kali lacks the capability.",
                 "context_policy": "intent-first; raw tool output stays in Artifact Store unless explicitly read by id.",

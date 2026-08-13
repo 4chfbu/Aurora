@@ -6,9 +6,9 @@ import threading
 from sqlmodel import Session, select
 
 from aurora.db import engine
-from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
+from aurora.models import Attempt, AuthorizationScope, DiscoveredTarget, Hint, ImportCandidate, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
 from aurora.config import get_settings
-from aurora.services.blackboard_repository import BlackboardRepository, stable_json
+from aurora.services.blackboard_repository import BlackboardRepository, route_fingerprint
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.context_builder import ContextBuilder
@@ -18,6 +18,7 @@ from aurora.services.round_summary import RoundReflectionService
 from aurora.services.scheduler import Scheduler
 from aurora.services.subagent_collector import SubagentCollector
 from aurora.services.worker_runtime import get_worker_runtime
+from aurora.services.tool_profiles import worker_preflight
 
 
 def _execution_budget(intent: object) -> dict:
@@ -131,6 +132,32 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     project = session.get(Project, project_id)
     if project is not None and project.status == "COMPLETED":
         return {"status": "project_completed", "message": "project is already completed"}
+    if project is None:
+        return {"status": "project_missing", "message": "project not found"}
+
+    has_target_workflow = bool(
+        session.exec(select(ImportCandidate).where(ImportCandidate.project_id == project_id)).first()
+        or session.exec(select(DiscoveredTarget).where(DiscoveredTarget.project_id == project_id)).first()
+    )
+    if has_target_workflow and project.target_verification_status != "VERIFIED":
+        payload = {
+            "status": project.target_verification_status,
+            "reason": project.target_verification_reason,
+            "target_url": project.target_url,
+        }
+        session.add(WorkerEvent(project_id=project_id, event_type="worker.preflight_blocked", payload_json={"kind": "target", **payload}))
+        session.commit()
+        return {"status": "target_not_verified", "message": project.target_verification_reason or "target is not verified", "target": payload}
+
+    preflight = worker_preflight(get_settings(), project.challenge_type)
+    session.add(WorkerEvent(project_id=project_id, event_type="worker.preflight", payload_json=preflight))
+    session.commit()
+    if not preflight["ready"]:
+        return {
+            "status": "runtime_preflight_failed",
+            "message": f"Worker image preflight failed for {preflight['image']} ({preflight['profile']}): {preflight['error']}. Build with {preflight['build_command']}",
+            "preflight": preflight,
+        }
 
     scheduler = Scheduler()
     next_intent = session.exec(
@@ -157,12 +184,20 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
             worker_id=worker.id,
             intent_id=intent.id,
             event_type="worker.started",
-            payload_json={"image": get_settings().default_worker_image, "runtime": get_settings().worker_runtime},
+            payload_json={"image": preflight["image"], "profile": preflight["profile"], "runtime": get_settings().worker_runtime},
         )
     )
     session.commit()
 
-    attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id)
+    parent_attempt = session.exec(
+        select(Attempt).where(Attempt.intent_id == intent.parent_intent_id).order_by(Attempt.started_at.desc())
+    ).first() if intent.parent_intent_id else None
+    attempt = Attempt(
+        project_id=project_id,
+        intent_id=intent.id,
+        worker_id=worker.id,
+        parent_attempt_id=parent_attempt.id if parent_attempt else None,
+    )
     session.add(attempt)
     session.commit()
     session.refresh(attempt)
@@ -472,10 +507,10 @@ def _repeat_failure_count(
             ToolTrace.tool_name == tool_name,
         )
     ).all()
-    fingerprint = stable_json(request)
+    fingerprint = route_fingerprint(request)
     return sum(
         1
         for trace in traces
-        if stable_json(trace.request_json) == fingerprint
+        if route_fingerprint(trace.request_json) == fingerprint
         and (trace.policy_decision != "allow" or (trace.exit_code is not None and trace.exit_code != 0))
     )

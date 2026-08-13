@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import secrets
 import shlex
 import shutil
 import time
@@ -15,7 +17,7 @@ from typing import Any, Protocol
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, ContextSnapshot, LLMTrace, ToolTrace, Worker
+from aurora.models import Artifact, Attempt, ContextSnapshot, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
 from aurora.services.prompt_renderer import PromptRenderer
@@ -220,6 +222,17 @@ class CodexHarnessRuntime:
         model = self.settings.model_for_role(str(worker.budgets.get("model_role", "solver")))
         command = self._render_command(prompt_file, model=model)
         started = time.monotonic()
+        attempt = session.exec(
+            select(Attempt).where(Attempt.worker_id == worker.id, Attempt.status == "RUNNING").order_by(Attempt.started_at.desc())
+        ).first()
+        control_token = secrets.token_urlsafe(32)
+        resume_thread_id = self._prepare_attempt(
+            session,
+            worker=worker,
+            attempt=attempt,
+            control_token=control_token,
+            workspace=prompt_file.parent,
+        )
         tool_environment = snapshot.sections_json.get("tool_environment") or {}
         profile = str(tool_environment.get("profile") or "heavy")
         runner = self.command_runner or AutoCommandRunner(
@@ -231,9 +244,25 @@ class CodexHarnessRuntime:
                 "OPENAI_MODEL": model,
                 "AURORA_CODEX_MODEL_CONTEXT_WINDOW": str(self.settings.codex_model_context_window),
                 "AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT": str(self.settings.codex_auto_compact_token_limit),
+                "AURORA_WORKER_CONTROL_BASE_URL": self.settings.worker_control_base_url,
+                "AURORA_WORKER_ID": worker.id,
+                "AURORA_WORKER_CONTROL_TOKEN": control_token,
+                "AURORA_CODEX_RESUME_THREAD_ID": resume_thread_id or "",
             },
         )
-        completed = self._run_command(command, prompt_file.parent, timeout_seconds=worker.budgets.get("hard_timeout_seconds"), runner=runner)
+        try:
+            completed = self._run_command(
+                command,
+                prompt_file.parent,
+                timeout_seconds=worker.budgets.get("hard_timeout_seconds"),
+                runner=runner,
+                on_output=lambda stream, line: self._record_codex_event(session, worker=worker, attempt=attempt, stream=stream, line=line),
+            )
+        finally:
+            if attempt is not None:
+                attempt.codex_control_token_hash = None
+                session.add(attempt)
+                session.commit()
         elapsed_ms = round((time.monotonic() - started) * 1000)
         transcript = self._bounded_transcript(self._transcript(command, completed))
         artifact = self.artifact_store.write_text(
@@ -302,6 +331,107 @@ class CodexHarnessRuntime:
         session.refresh(trace)
         return RuntimeOutput(structured.get("status", "partial"), structured.get("summary", "Codex harness completed."), structured, trace)
 
+    def _prepare_attempt(self, session: Session, *, worker: Worker, attempt: Attempt | None, control_token: str, workspace: Path | None = None) -> str | None:
+        if attempt is None:
+            return None
+        parent = session.get(Attempt, attempt.parent_attempt_id) if attempt.parent_attempt_id else None
+        resume_thread_id = parent.codex_thread_id if parent and parent.codex_thread_id else None
+        attempt.codex_control_token_hash = hashlib.sha256(control_token.encode("utf-8")).hexdigest()
+        attempt.last_event_at = now_utc()
+        if resume_thread_id:
+            if workspace is not None:
+                source_home = self.settings.codex_workspace_dir / parent.project_id / parent.worker_id / "runtime" / "codex-home"
+                target_home = workspace / "runtime" / "codex-home"
+                if source_home.is_dir():
+                    skipped = self._copy_resume_home(source_home, target_home)
+                    if skipped:
+                        session.add(
+                            WorkerEvent(
+                                project_id=worker.project_id,
+                                worker_id=worker.id,
+                                intent_id=worker.intent_id,
+                                attempt_id=attempt.id,
+                                event_type="codex.resume_files_skipped",
+                                payload_json={"paths": skipped[:100], "count": len(skipped)},
+                            )
+                        )
+            attempt.codex_thread_id = resume_thread_id
+            attempt.resume_count = parent.resume_count + 1
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    attempt_id=attempt.id,
+                    event_type="codex.resume_scheduled",
+                    payload_json={"thread_id": resume_thread_id, "resume_count": attempt.resume_count, "parent_attempt_id": parent.id},
+                )
+            )
+        session.add(attempt)
+        session.commit()
+        return resume_thread_id
+
+    @staticmethod
+    def _copy_resume_home(source_home: Path, target_home: Path) -> list[str]:
+        """Copy resumable Codex state while tolerating legacy root-only files."""
+        skipped: list[str] = []
+
+        def ignore(directory: str, names: list[str]) -> set[str]:
+            ignored: set[str] = set()
+            base = Path(directory)
+            for name in names:
+                path = base / name
+                readable = os.access(path, os.R_OK)
+                traversable = not path.is_dir() or os.access(path, os.X_OK)
+                if not readable or not traversable:
+                    ignored.add(name)
+                    try:
+                        skipped.append(str(path.relative_to(source_home)))
+                    except ValueError:
+                        skipped.append(name)
+            return ignored
+
+        shutil.copytree(source_home, target_home, dirs_exist_ok=True, ignore=ignore)
+        return skipped
+
+    @staticmethod
+    def _record_codex_event(session: Session, *, worker: Worker, attempt: Attempt | None, stream: str, line: str) -> None:
+        if attempt is None or stream != "stdout" or not line.startswith("{"):
+            return
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "unknown")[:100]
+        thread_id = event.get("thread_id") or event.get("session_id")
+        turn_id = event.get("turn_id")
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if isinstance(thread_id, str) and thread_id:
+            attempt.codex_thread_id = thread_id[:200]
+        if isinstance(turn_id, str) and turn_id:
+            attempt.codex_turn_id = turn_id[:200]
+        attempt.last_event_at = now_utc()
+        session.add(attempt)
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type="codex.session_started" if event_type == "thread.started" else "codex.progress",
+                payload_json={
+                    "type": event_type,
+                    "thread_id": attempt.codex_thread_id,
+                    "turn_id": attempt.codex_turn_id,
+                    "item_type": str(item.get("type") or "")[:100],
+                    "item_status": str(item.get("status") or event.get("status") or "")[:100],
+                },
+            )
+        )
+        session.commit()
+
     def _write_prompt(self, session: Session, worker: Worker, snapshot: ContextSnapshot) -> Path:
         workspace = self.settings.codex_workspace_dir / snapshot.project_id / worker.id
         workspace.mkdir(parents=True, exist_ok=True)
@@ -339,6 +469,9 @@ class CodexHarnessRuntime:
                 target = runtime_dir / name
                 shutil.copy2(source, target)
                 target.chmod(target.stat().st_mode | 0o100)
+        config_source = Path.cwd() / "container" / "kali-codex" / "codex-config.toml"
+        if config_source.is_file():
+            shutil.copy2(config_source, runtime_dir / "codex-config.toml")
         return prompt_file
 
     def _import_mcp_events(
@@ -481,22 +614,29 @@ class CodexHarnessRuntime:
             base_url = f"{base_url}/v1"
         return base_url
 
-    def _run_command(self, command: str, cwd: Path, *, timeout_seconds: object = None, runner: CommandRunner | None = None) -> CommandResult:
+    def _run_command(self, command: str, cwd: Path, *, timeout_seconds: object = None, runner: CommandRunner | None = None, on_output=None) -> CommandResult:
         configured = self.settings.codex_timeout_seconds if self.settings.codex_timeout_seconds > 0 else None
         budget_timeout = int(timeout_seconds) if timeout_seconds else None
         timeout = min(value for value in (configured, budget_timeout) if value is not None) if configured or budget_timeout else None
         selected_runner = runner or self.command_runner
         if selected_runner is None:
             selected_runner = AutoCommandRunner(prefer_kali=True, allow_local_fallback=False)
+        if on_output is not None and hasattr(selected_runner, "run_streaming"):
+            return selected_runner.run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)
         return selected_runner.run(command=command, cwd=cwd, timeout=timeout)
 
     def _transcript(self, command: str, completed: CommandResult) -> str:
+        executed_command = re.sub(
+            r"(?i)(AURORA_WORKER_CONTROL_TOKEN=)[^\s]+",
+            r"\1<redacted>",
+            completed.executed_command,
+        )
         return (
             f"runtime=codex\n"
             f"backend={completed.backend}\n"
             f"cwd={completed.cwd}\n"
             f"command={command}\n"
-            f"executed_command={completed.executed_command}\n"
+            f"executed_command={executed_command}\n"
             f"exit_code={completed.exit_code}\n\n"
             f"failure_kind={completed.failure_kind or ''}\n\n"
             f"[stdout]\n{completed.stdout}\n\n"

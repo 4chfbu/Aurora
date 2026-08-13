@@ -18,6 +18,32 @@ def stable_json(value: Any) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+TRANSIENT_ROUTE_KEYS = {
+    "timeout_seconds",
+    "navigation_timeout_seconds",
+    "total_timeout_seconds",
+    "wait_seconds",
+    "max_output_bytes",
+}
+
+
+def route_fingerprint(value: Any) -> str:
+    def normalize(item: Any) -> Any:
+        if isinstance(item, dict):
+            normalized = {key: normalize(child) for key, child in item.items() if key not in TRANSIENT_ROUTE_KEYS}
+            command = normalized.get("command")
+            if isinstance(command, str):
+                normalized["command"] = re.sub(r"\s+", " ", command.strip())
+            return normalized
+        if isinstance(item, list):
+            return [normalize(child) for child in item]
+        if isinstance(item, str):
+            return item.strip()
+        return item
+
+    return stable_json(normalize(value))
+
+
 def normalize_evidence_items(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for item in (items or [])[:10]:

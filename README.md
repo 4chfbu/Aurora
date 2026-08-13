@@ -118,7 +118,7 @@ The capability gateway prefers Kali native tooling over MCP. It currently maps t
 
 The Worker build produces two shared-layer profiles. `core` contains the common Web, network, crypto, reverse, pwn, and forensic CLI suite. `heavy` adds Ghidra, angr, Volatility3, jadx/apktool, and hashcat with a Mesa CPU OpenCL backend. Web challenges use `core`; all other or unknown challenge types use `heavy`. The selected profile and command manifest are included in each Solver context.
 
-Stateful local analysis is exposed to Codex through two stdio MCP servers: `aurora_reverse` maintains Rizin sessions and optionally uses Ghidra decompilation, while `aurora_debug` maintains GDB/MI sessions. MCP calls are imported into Aurora as `ToolTrace` and Artifact records after the Worker exits.
+Stateful local analysis is exposed to Codex through stdio MCP servers: `aurora_reverse` maintains Rizin sessions and optionally uses Ghidra decompilation, `aurora_debug` maintains GDB/MI sessions, and `aurora_blackboard` reads and updates the scoped project state while the Worker is running. MCP calls are imported into Aurora as `ToolTrace` and Artifact records after the Worker exits.
 
 ## MCP Capabilities and FOFA
 

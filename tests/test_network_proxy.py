@@ -28,7 +28,7 @@ def test_custom_proxy_validation_and_runtime_shapes() -> None:
     assert config.environment()["HTTPS_PROXY"] == "http://proxy.example:8080"
     assert config.playwright_proxy() == {
         "server": "http://proxy.example:8080",
-        "bypass": "127.0.0.1,localhost,aurora-cc-switch,challenge.local,.internal",
+        "bypass": "127.0.0.1,localhost,aurora-cc-switch,host.docker.internal,challenge.local,.internal",
     }
     assert "aurora-cc-switch" in config.no_proxy
 
@@ -56,9 +56,28 @@ def test_worker_container_uses_selected_proxy_and_can_force_direct() -> None:
     network_proxy_registry.set(mode="custom", proxy_url="http://proxy.example:8080", no_proxy="ctf.local")
     custom_args = KaliContainerRunner()._env_args()
     assert "HTTP_PROXY=http://proxy.example:8080" in custom_args
-    assert "NO_PROXY=127.0.0.1,localhost,aurora-cc-switch,ctf.local" in custom_args
+    assert "NO_PROXY=127.0.0.1,localhost,aurora-cc-switch,host.docker.internal,ctf.local" in custom_args
 
     network_proxy_registry.set(mode="direct", proxy_url=None, no_proxy=None)
     direct_args = KaliContainerRunner()._env_args()
     assert "HTTP_PROXY=" in direct_args
     assert "HTTPS_PROXY=" in direct_args
+
+
+@pytest.mark.parametrize(
+    ("proxy", "expected"),
+    [
+        ("http://127.0.0.1:10808", ""),
+        ("localhost:10808", ""),
+        ("http://proxy.example:8080", "http://proxy.example:8080"),
+    ],
+)
+def test_worker_container_disables_only_unreachable_host_loopback_proxy(monkeypatch, proxy: str, expected: str) -> None:
+    monkeypatch.setenv("HTTP_PROXY", proxy)
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
+    network_proxy_registry.set(mode="system", proxy_url=None, no_proxy=None)
+
+    args = KaliContainerRunner()._env_args()
+
+    assert f"HTTP_PROXY={expected}" in args
+    assert f"HTTPS_PROXY={expected}" in args

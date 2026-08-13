@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from sqlmodel import Session, select
 
 from aurora.models import AuthorizationScope, DiscoveredTarget
+from aurora.services.browser_sessions import browser_session_registry
 
 
 METADATA_HOSTS = {
@@ -45,6 +46,13 @@ class PolicyEngine:
 
         if self._is_denied_management_host(host) and scope.deny_metadata_and_management_networks:
             return PolicyDecision(False, f"target is denied metadata/management host: {host}")
+
+        if tool_name == "browser.interact":
+            browser_session = browser_session_registry.get_project_session(project_id)
+            source_host = (urlparse(browser_session.source_url).hostname or "").lower().rstrip(".") if browser_session else ""
+            lowered_host = host.lower().rstrip(".")
+            if source_host and (lowered_host == source_host or lowered_host.endswith(f".{source_host}")):
+                return PolicyDecision(True, "host belongs to the project's authenticated browser session")
 
         if scope.allowed_hosts and host in scope.allowed_hosts:
             return PolicyDecision(True, "host explicitly allowed")

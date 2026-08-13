@@ -12,7 +12,7 @@ from aurora.models import NetworkProxySetting, now_utc
 
 
 PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
-REQUIRED_NO_PROXY = ("127.0.0.1", "localhost", "aurora-cc-switch")
+REQUIRED_NO_PROXY = ("127.0.0.1", "localhost", "aurora-cc-switch", "host.docker.internal")
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,17 @@ class NetworkProxyConfig:
             "https_proxy": proxy_url,
             "no_proxy": self.no_proxy,
         }
+
+    def container_environment(self) -> dict[str, str]:
+        """Render proxy variables from the container's network namespace."""
+        values = self.environment()
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            if values.get(key) and _is_loopback_proxy(values[key]):
+                # A host proxy bound only to loopback cannot be reached through
+                # the Docker bridge gateway.  Direct egress is preferable to
+                # injecting a proxy URL that deterministically fails.
+                values[key] = ""
+        return values
 
     def urllib_proxy_handler(self) -> ProxyHandler:
         if self.mode == "direct":
@@ -110,6 +121,11 @@ def validate_proxy_config(*, mode: str, proxy_url: str | None, no_proxy: str | N
 
 
 network_proxy_registry = NetworkProxyRegistry()
+
+
+def _is_loopback_proxy(value: str) -> bool:
+    parsed = urlparse(value if "://" in value else f"//{value}")
+    return (parsed.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
 
 
 def load_network_proxy(session: Session) -> NetworkProxyConfig:

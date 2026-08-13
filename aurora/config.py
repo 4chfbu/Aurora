@@ -40,6 +40,7 @@ class Settings(BaseModel):
     codex_auto_compact_token_limit: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT", "800000")))
     codex_transcript_max_bytes: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TRANSCRIPT_MAX_BYTES", str(2 * 1024 * 1024))))
     codex_workspace_dir: Path = Field(default_factory=lambda: Path(os.getenv("AURORA_CODEX_WORKSPACE_DIR", "./codex-workspaces")))
+    worker_control_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_CONTROL_BASE_URL", "http://host.docker.internal:8000"))
     worker_container_cpus: float = Field(default_factory=lambda: float(os.getenv("AURORA_WORKER_CONTAINER_CPUS", "2")))
     worker_container_memory: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_CONTAINER_MEMORY", "4g"))
     llm_api_key: str | None = Field(default_factory=lambda: os.getenv("AURORA_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"))

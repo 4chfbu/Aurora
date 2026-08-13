@@ -102,10 +102,11 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_WORKER_CONTAINER_MEMORY` | `4g` | Worker 容器的内存限额，传给 `docker/podman run --memory`。 |
 | `AURORA_BUILD_PROXY` | 未设置 | 可选的镜像构建 HTTP/HTTPS 代理；不会传入运行中的 Worker。 |
 | `AURORA_CODEX_WORKSPACE_DIR` | `./codex-workspaces` | 每个项目和 Worker 的提示词、输入附件、输出 schema 和 transcript 工作目录。 |
+| `AURORA_WORKER_CONTROL_BASE_URL` | `http://host.docker.internal:8000` | Worker 内 `aurora_blackboard` MCP 回连 Aurora 控制面的地址；令牌按 Attempt 生成且仅保存哈希。 |
 | `AURORA_CODEX_PROXY_BASE_URL` | `http://aurora-cc-switch:15723/v1` | Worker 内 Codex 使用的 CC Switch Responses 地址。 |
 | `AURORA_WORKER_REAP_INTERVAL_SECONDS` | `5` | API 后台线程清理过期 Worker lease 的间隔秒数。 |
 
-运行时网络出口通过 Web 界面的“网络代理”设置，或通过 `GET/PUT /api/settings/network-proxy` 管理。`direct` 强制直连，`system` 继承 API 进程的代理环境，`custom` 将指定 HTTP(S) 代理用于新 Worker、Cataloger、Playwright 和附件下载。设置持久化在数据库中；已运行的 Worker 不会被重启。`127.0.0.1`、`localhost` 和 `aurora-cc-switch` 始终加入 `NO_PROXY`。
+运行时网络出口通过 Web 界面的“网络代理”设置，或通过 `GET/PUT /api/settings/network-proxy` 管理。`direct` 强制直连，`system` 继承 API 进程的代理环境，`custom` 将指定 HTTP(S) 代理用于新 Worker、Cataloger、Playwright 和附件下载。设置持久化在数据库中；已运行的 Worker 不会被重启。`127.0.0.1`、`localhost` 和 `aurora-cc-switch` 始终加入 `NO_PROXY`。宿主机代理若绑定在回环地址，Worker 容器会自动改用直连，避免把容器自身的 `127.0.0.1` 误当作宿主代理。
 
 ### Browser interaction
 

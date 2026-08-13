@@ -17,6 +17,7 @@
 - 计算得到的 flag 必须通过解题结束后由外层调用的 `flag.verify`：验证工具把声明的题目 Artifact 打包到隔离环境的 `inputs/`，并将 `inputs/manifest.json` 作为验证脚本的第一个参数。脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`，且脚本本身不得包含候选值。没有通过验证时继续调查，不得宣告完成。
 - 仅可读取当前 Worker 的 `/workspace/inputs/manifest.json` 中列出的证据文件。其他题目、历史工作区或未在清单中的文件都不属于当前题目，不能作为事实或 flag 证据。
 - `context.tool_environment` 是当前 Worker 镜像的权威能力清单。优先直接调用已注册的 `aurora_reverse`、`aurora_debug` MCP 工具维持逆向或调试会话；这些本地 MCP 调用不要重复写入 `tool_requests`。
+- 使用 `aurora_blackboard.query` 获取运行中的最新事实；获得有 Artifact 支持的新结论后立即调用 `append_fact`。长操作前、发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。
 - 只有当上下文可见能力含有 `subagent.spawn` 时，才可在当前容器中执行 `python /workspace/scripts/aurora-subagent.py --request-json '<JSON>'`。JSON 仅含 `objective` 与可见的 `capability_tags`；该命令同步等待并禁止递归子代理。不要把 `subagent.spawn` 放进 `tool_requests`。
 
 ## 输出协议

@@ -4,6 +4,9 @@ import shutil
 import subprocess
 import os
 import json
+import selectors
+import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +30,13 @@ class CommandResult:
 class CommandRunner:
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
         raise NotImplementedError
+
+    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+        result = self.run(command=command, cwd=cwd, timeout=timeout)
+        for stream, content in (("stdout", result.stdout), ("stderr", result.stderr)):
+            for line in content.splitlines():
+                on_output(stream, line)
+        return result
 
 
 class LocalCommandRunner(CommandRunner):
@@ -97,7 +107,7 @@ class KaliContainerRunner(CommandRunner):
             "AURORA_SUBAGENTS_ENABLED": "true" if settings.subagents_enabled else "false",
             "AURORA_SUBAGENTS_MAX_PER_WORKER": str(settings.subagents_max_per_worker),
             "AURORA_SUBAGENTS_MAX_CONCURRENT": str(settings.subagents_max_concurrent),
-            **network_proxy_registry.get().environment(),
+            **network_proxy_registry.get().container_environment(),
         }
         values.update(self.environment_overrides)
         inherited_keys = [
@@ -127,7 +137,11 @@ class KaliContainerRunner(CommandRunner):
             check=False,
         )
         if inspected.returncode != 0:
-            self.availability_error = f"worker image is not available locally: {self.image}"
+            detail = (inspected.stderr or inspected.stdout or "").strip()
+            if "permission denied" in detail.lower():
+                self.availability_error = f"cannot access the container engine while checking {self.image}: {detail}"
+            else:
+                self.availability_error = f"worker image is not available locally: {self.image}{f': {detail}' if detail else ''}"
             return False
         if self.expected_profile:
             labels = subprocess.run(
@@ -155,33 +169,7 @@ class KaliContainerRunner(CommandRunner):
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
         if self.engine is None:
             raise RuntimeError("docker/podman not available")
-        # A solver only receives its own worker directory.  Mounting the
-        # repository root exposed unrelated challenge files to the model.
-        workspace = cwd.resolve()
-        relative_cwd = workspace.relative_to(Path.cwd().resolve())
-        container_cwd = Path("/workspace")
-        label_args = self._label_args(relative_cwd)
-        executed = [
-            self.engine,
-            "run",
-            "--rm",
-            "--network",
-            self.network,
-            "--cpus",
-            str(self.settings.worker_container_cpus),
-            "--memory",
-            self.settings.worker_container_memory,
-            *label_args,
-            *self._env_args(),
-            "-v",
-            f"{workspace}:/workspace:{'ro' if self.workspace_read_only else 'rw'}",
-            "-w",
-            str(container_cwd),
-            self.image,
-            "bash",
-            "-lc",
-            command,
-        ]
+        executed, relative_cwd, container_cwd = self._build_command(command, cwd)
         try:
             completed = subprocess.run(
                 executed,
@@ -212,6 +200,101 @@ class KaliContainerRunner(CommandRunner):
             backend="kali-container",
             failure_kind="resource_terminated" if completed.returncode == 137 else None,
         )
+
+    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+        if self.engine is None:
+            raise RuntimeError("docker/podman not available")
+        executed, relative_cwd, container_cwd = self._build_command(command, cwd)
+        process = subprocess.Popen(
+            executed,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            start_new_session=True,
+        )
+        selector = selectors.DefaultSelector()
+        assert process.stdout is not None and process.stderr is not None
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        captured = {"stdout": [], "stderr": []}
+        started = time.monotonic()
+        timed_out = False
+        interrupted_at: float | None = None
+        while selector.get_map():
+            now = time.monotonic()
+            if timeout is not None and not timed_out and now - started >= timeout:
+                timed_out = True
+                interrupted_at = now
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            if timed_out and interrupted_at is not None and now - interrupted_at >= 10 and process.poll() is None:
+                self._stop_container(relative_cwd)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for key, _ in selector.select(timeout=0.2):
+                line = key.fileobj.readline()
+                if line:
+                    captured[key.data].append(line)
+                    on_output(key.data, line.rstrip("\n"))
+                else:
+                    selector.unregister(key.fileobj)
+            if process.poll() is not None and not selector.get_map():
+                break
+        return_code = process.wait()
+        stderr = "".join(captured["stderr"])
+        if timed_out:
+            stderr = f"command timed out after {timeout}s; Codex received SIGINT and a 10s finalization grace period\n" + stderr
+        return CommandResult(
+            command=command,
+            executed_command=" ".join(executed),
+            cwd=str(container_cwd),
+            stdout="".join(captured["stdout"]),
+            stderr=stderr,
+            exit_code=124 if timed_out else return_code,
+            backend="kali-container",
+            failure_kind="command_timed_out" if timed_out else "resource_terminated" if return_code == 137 else None,
+        )
+
+    def _build_command(self, command: str, cwd: Path) -> tuple[list[str], Path, Path]:
+        # A solver only receives its own worker directory. Mounting the
+        # repository root exposed unrelated challenge files to the model.
+        workspace = cwd.resolve()
+        relative_cwd = workspace.relative_to(Path.cwd().resolve())
+        container_cwd = Path("/workspace")
+        workspace_stat = workspace.stat()
+        executed = [
+            self.engine,
+            "run",
+            "--rm",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--network",
+            self.network,
+            "--cpus",
+            str(self.settings.worker_container_cpus),
+            "--memory",
+            self.settings.worker_container_memory,
+            "--user",
+            f"{workspace_stat.st_uid}:{workspace_stat.st_gid}",
+            *self._label_args(relative_cwd),
+            *self._env_args(),
+            "-e",
+            "HOME=/workspace/runtime/home",
+            "-v",
+            f"{workspace}:/workspace:{'ro' if self.workspace_read_only else 'rw'}",
+            "-w",
+            str(container_cwd),
+            self.image,
+            "bash",
+            "-lc",
+            command,
+        ]
+        return executed, relative_cwd, container_cwd
 
     def _stop_container(self, relative_cwd: Path) -> None:
         """Best-effort cleanup when the docker client itself is timed out."""
@@ -282,3 +365,12 @@ class AutoCommandRunner(CommandRunner):
             reason = self.kali.availability_error or f"worker image is unavailable: {self.kali.image}"
             raise RuntimeError(f"{reason}. Build the configured core/heavy worker images before running this runtime.")
         return self.local.run(command=command, cwd=cwd, timeout=timeout)
+
+    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+        if self.prefer_kali and self.kali.available():
+            try:
+                return self.kali.run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)
+            except Exception as exc:
+                if not self.allow_local_fallback:
+                    raise RuntimeError(f"kali container execution failed and local fallback is disabled: {exc}") from exc
+        return super().run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)

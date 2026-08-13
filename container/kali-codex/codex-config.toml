@@ -15,3 +15,12 @@ tool_timeout_sec = 120
 
 [mcp_servers.aurora_debug.env]
 AURORA_MCP_EVENT_LOG = "/workspace/runtime/mcp-events.jsonl"
+
+[mcp_servers.aurora_blackboard]
+command = "/opt/aurora-venv/bin/python"
+args = ["/opt/aurora-mcp/blackboard_server.py"]
+startup_timeout_sec = 20
+tool_timeout_sec = 30
+
+[mcp_servers.aurora_blackboard.env]
+AURORA_MCP_EVENT_LOG = "/workspace/runtime/mcp-events.jsonl"

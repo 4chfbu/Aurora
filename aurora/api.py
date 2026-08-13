@@ -61,7 +61,9 @@ from aurora.services.challenge_group_runner import ChallengeGroupRunner, challen
 from aurora.services.project_deletion import ProjectDeletionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.target_verification import TargetVerificationService
+from aurora.services.target_management import TargetManagementService
 from aurora.services.network_proxy import load_network_proxy, network_proxy_registry, save_network_proxy
+from aurora.services.worker_control import WorkerControlService
 
 
 class CreateProjectRequest(BaseModel):
@@ -76,7 +78,7 @@ class CreateProjectRequest(BaseModel):
 class SolveProjectRequest(CreateProjectRequest):
     max_iterations: int = 20
     max_minutes: int = 0
-    no_progress_limit: int = 4
+    no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True
 
 
@@ -139,7 +141,7 @@ class BrowserSessionRequest(BaseModel):
 class AutoRunRequest(BaseModel):
     max_iterations: int = 20
     max_minutes: int = 0
-    no_progress_limit: int = 4
+    no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True
     background: bool = False
 
@@ -164,6 +166,15 @@ class HandsFreeConfirmRequest(BaseModel):
     name_overrides: dict[str, str] = Field(default_factory=dict)
 
 
+class ManualTargetRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2_048)
+    probe: bool = True
+
+
+class TargetVerifyRequest(BaseModel):
+    confirm_paid: bool = False
+
+
 class ManualFlagValidationRequest(BaseModel):
     accepted: bool
 
@@ -172,6 +183,21 @@ class NetworkProxyRequest(BaseModel):
     mode: str
     proxy_url: str | None = Field(default=None, max_length=1_000)
     no_proxy: str | None = Field(default=None, max_length=2_000)
+
+
+class WorkerFactRequest(BaseModel):
+    statement: str = Field(min_length=1, max_length=4_000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=100)
+    category: str = Field(default="analysis", min_length=1, max_length=100)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+class WorkerCheckpointRequest(BaseModel):
+    summary: str = Field(min_length=1, max_length=2_000)
+    completed_steps: list[str] = Field(default_factory=list, max_length=20)
+    failed_routes: list[str] = Field(default_factory=list, max_length=20)
+    next_step: str = Field(default="", max_length=1_000)
+    artifact_refs: list[str] = Field(default_factory=list, max_length=100)
 
 
 class ImportProgressRegistry:
@@ -362,7 +388,10 @@ def create_app() -> FastAPI:
     def confirm_hands_free_import(batch_id: str, payload: HandsFreeConfirmRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
             projects = HandsFreeService().confirm(session, batch_id, payload.candidate_ids, payload.name_overrides)
-            browser_session_registry.bind_batch_projects(batch_id=batch_id, project_ids=[project["project_id"] for project in projects])
+            browser_session_registry.bind_batch_project_sources(
+                batch_id=batch_id,
+                project_sources={project["project_id"]: project["challenge_url"] for project in projects if project.get("challenge_url")},
+            )
             verifier = TargetVerificationService()
             for project in projects:
                 if project["status"] == "created":
@@ -376,10 +405,26 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project_id}/target/verify")
-    def verify_project_target(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    def verify_project_target(project_id: str, payload: TargetVerifyRequest | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        result = TargetVerificationService().verify(session, project_id=project_id)
+        result = TargetVerificationService().verify(session, project_id=project_id, allow_paid_launch=bool(payload and payload.confirm_paid))
         return {"status": result.status, "reason": result.reason, "target_url": result.target_url}
+
+    @app.post("/api/projects/{project_id}/targets/manual")
+    def set_manual_project_target(project_id: str, payload: ManualTargetRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+        _require_project(session, project_id)
+        try:
+            return TargetManagementService().submit_manual(session, project_id=project_id, url=payload.url, probe=payload.probe).__dict__
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/targets/{target_id}/confirm")
+    def confirm_project_target(project_id: str, target_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+        _require_project(session, project_id)
+        try:
+            return TargetManagementService().activate(session, project_id=project_id, target_id=target_id).__dict__
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/solve")
     def solve_project(payload: SolveProjectRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
@@ -523,6 +568,37 @@ def create_app() -> FastAPI:
         session.add(WorkerEvent(project_id=project_id, event_type="browser.session.updated", payload_json={"source_url": payload.source_url}))
         session.commit()
         return {"status": "ready"}
+
+    @app.get("/internal/workers/{worker_id}/blackboard")
+    def worker_blackboard(worker_id: str, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:
+        service = WorkerControlService()
+        try:
+            worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        return service.query(session, worker=worker, attempt=attempt)
+
+    @app.post("/internal/workers/{worker_id}/facts")
+    def worker_append_fact(worker_id: str, payload: WorkerFactRequest, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:
+        service = WorkerControlService()
+        try:
+            worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+            return service.append_fact(session, worker=worker, attempt=attempt, **payload.model_dump())
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/internal/workers/{worker_id}/checkpoint")
+    def worker_save_checkpoint(worker_id: str, payload: WorkerCheckpointRequest, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:
+        service = WorkerControlService()
+        try:
+            worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+            return service.save_checkpoint(session, worker=worker, attempt=attempt, **payload.model_dump())
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project_id}/intents")
     def create_intent(project_id: str, payload: CreateIntentRequest, session: Session = Depends(get_session)) -> Intent:
@@ -1028,6 +1104,13 @@ def _require_project(session: Session, project_id: str) -> Project:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
+
+
+def _bearer_token(authorization: str | None) -> str:
+    scheme, separator, token = (authorization or "").partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token.strip():
+        return ""
+    return token.strip()
 
 
 def _require_mutable_project(session: Session, project_id: str) -> Project:

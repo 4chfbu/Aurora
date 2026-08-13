@@ -69,3 +69,22 @@ def tool_environment(settings: Settings, challenge_type: str | None) -> dict[str
         "manifest_sha256": manifest_sha256(),
         **capabilities,
     }
+
+
+def worker_preflight(settings: Settings, challenge_type: str | None) -> dict[str, Any]:
+    from aurora.services.command_runner import KaliContainerRunner
+    environment = tool_environment(settings, challenge_type)
+    runner = KaliContainerRunner(image=str(environment["image"]), expected_profile=str(environment["profile"]))
+    ready = runner.available()
+    return {
+        "ready": ready,
+        "challenge_type": environment["challenge_type"],
+        "profile": environment["profile"],
+        "image": environment["image"],
+        "manifest_sha256": environment["manifest_sha256"],
+        "commands_count": len(environment.get("commands", [])),
+        "python_modules_count": len(environment.get("python_modules", [])),
+        "mcp_servers": sorted(environment.get("mcp_servers", {})),
+        "error": runner.availability_error,
+        "build_command": "./scripts/build-kali-codex.sh",
+    }

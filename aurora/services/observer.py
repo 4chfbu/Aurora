@@ -6,7 +6,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.models import Attempt, ToolTrace, WorkerEvent
-from aurora.services.blackboard_repository import stable_json
+from aurora.services.blackboard_repository import route_fingerprint
 
 
 @dataclass
@@ -61,7 +61,7 @@ class ObserverService:
             return None
         latest = tool_traces[0]
         previous = tool_traces[1]
-        if previous.tool_name == latest.tool_name and stable_json(previous.request_json) == stable_json(latest.request_json):
+        if previous.tool_name == latest.tool_name and route_fingerprint(previous.request_json) == route_fingerprint(latest.request_json):
             return ObserverDecision(
                 "REDIRECT",
                 "The two latest tool routes are identical; redirect before repeating more work.",

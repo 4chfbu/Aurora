@@ -4,9 +4,11 @@ from dataclasses import dataclass
 
 from sqlmodel import Session, select
 
-from aurora.models import DiscoveredTarget, Project, WorkerEvent, now_utc
+from aurora.models import ImportCandidate, Project, WorkerEvent, now_utc
 from aurora.services.browser_interaction import BrowserInteractionService
 from aurora.services.browser_sessions import browser_session_registry
+from aurora.services.target_management import TargetManagementService
+from aurora.services.target_probe import TargetProbeService
 
 
 @dataclass(frozen=True)
@@ -19,7 +21,10 @@ class TargetVerificationResult:
 class TargetVerificationService:
     """Verify a challenge's launch page using the ephemeral project browser session."""
 
-    def verify(self, session: Session, *, project_id: str, source_url: str | None = None, source_metadata: dict | None = None) -> TargetVerificationResult:
+    def __init__(self, probe_service: TargetProbeService | None = None) -> None:
+        self.targets = TargetManagementService(probe_service=probe_service)
+
+    def verify(self, session: Session, *, project_id: str, source_url: str | None = None, source_metadata: dict | None = None, allow_paid_launch: bool = False) -> TargetVerificationResult:
         project = session.get(Project, project_id)
         if project is None:
             raise ValueError("project not found")
@@ -27,7 +32,11 @@ class TargetVerificationService:
         if browser_session is None:
             return self._record(session, project, "NEEDS_SESSION", "需要已登录的 Cookie 才能验证靶机启动", None)
 
-        request = {"url": source_url or browser_session.source_url, "wait_seconds": 5}
+        if source_url is None:
+            candidate = session.exec(select(ImportCandidate).where(ImportCandidate.project_id == project_id).order_by(ImportCandidate.created_at.desc())).first()
+            source_url = candidate.challenge_url if candidate is not None else browser_session.source_url
+
+        request = {"url": source_url or browser_session.source_url, "wait_seconds": 5, "allow_paid_launch": allow_paid_launch}
         locator = source_metadata.get("locator") if isinstance(source_metadata, dict) else None
         if isinstance(locator, dict):
             request["locator"] = locator
@@ -41,11 +50,16 @@ class TargetVerificationService:
         )
         if not result.success:
             return self._record(session, project, "UNVERIFIED", result.summary, None)
-        target = session.exec(select(DiscoveredTarget).where(DiscoveredTarget.project_id == project_id).order_by(DiscoveredTarget.created_at.desc())).first()
-        target_url = target.url if target else (result.target_urls[0] if result.target_urls else None)
-        if not target_url:
+        # Only probe targets returned by this interaction.  Looking up the
+        # newest historical row could revive an analytics/write-up URL from a
+        # previous bad extraction.
+        candidates = result.target_candidates or [{"url": url, "source": "browser", "score": 85, "artifact_ref": result.artifact_refs[0] if result.artifact_refs else None} for url in result.target_urls]
+        if not candidates:
+            if result.requires_confirmation:
+                return self._record(session, project, "NEEDS_CONFIRMATION", result.summary, None)
             return self._record(session, project, "UNVERIFIED", "未发现可访问的靶机地址", None)
-        return self._record(session, project, "VERIFIED", "已发现并验证靶机启动地址", target_url)
+        managed = self.targets.evaluate_automatic(session, project_id=project_id, candidates=candidates, requires_confirmation=result.requires_confirmation)
+        return TargetVerificationResult(managed.status, managed.reason, managed.target_url)
 
     @staticmethod
     def _record(session: Session, project: Project, status: str, reason: str, target_url: str | None) -> TargetVerificationResult:

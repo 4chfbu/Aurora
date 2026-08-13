@@ -1436,6 +1436,10 @@ def test_discovered_target_is_filtered_and_temporarily_authorized() -> None:
             "http://8.8.8.8:18080/",
             "http://169.254.169.254/latest/meta-data",
             "http://localhost:8080/",
+            "https://hm.baidu.com/hm.js?tracking=1",
+            "https://blog.csdn.net/example/writeup",
+            "http://网址/send就行",
+            "https://assets.example.org/app.js",
         ],
         "ctf.example",
     ) == ["http://8.8.8.8:18080/"]
@@ -1464,3 +1468,42 @@ def test_discovered_target_is_filtered_and_temporarily_authorized() -> None:
         )
         assert session_update.status_code == 200
         assert "test" not in session_update.text
+        with Session(engine) as session:
+            browser_allowed = PolicyEngine().check_tool_request(
+                session,
+                project_id=project_id,
+                tool_name="browser.interact",
+                request={"url": "https://ctf.example/challenge/1"},
+            )
+            assert browser_allowed.allowed is True
+
+
+def test_false_target_repair_is_idempotent() -> None:
+    from aurora.services.target_repair import invalidate_false_targets
+
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={"name": "target-repair", "goal": "Repair false targets.", "allowed_hosts": []},
+        ).json()["id"]
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            assert project is not None
+            project.target_url = "https://hm.baidu.com/hm.js?tracking=1"
+            session.add(project)
+            session.add(DiscoveredTarget(project_id=project_id, url=project.target_url, host="hm.baidu.com"))
+            session.add(Fact(project_id=project_id, statement=f"Browser interaction exposed target: {project.target_url}", category="target", confidence=0.9))
+            session.commit()
+
+            first = invalidate_false_targets(session)
+            second = invalidate_false_targets(session)
+            target = session.exec(select(DiscoveredTarget).where(DiscoveredTarget.project_id == project_id)).first()
+            fact = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.category == "target")).first()
+            session.refresh(project)
+
+        assert first == {"targets": 1, "facts": 1, "projects": 1}
+        assert second == {"targets": 0, "facts": 0, "projects": 0}
+        assert target is not None and target.status == "INVALIDATED"
+        assert fact is not None and fact.status == "RETRACTED"
+        assert project.target_url is None

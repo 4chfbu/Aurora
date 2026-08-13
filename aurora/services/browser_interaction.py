@@ -9,10 +9,9 @@ from urllib.parse import urlparse
 
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, DiscoveredTarget, WorkerEvent
+from aurora.models import WorkerEvent
 from aurora.config import get_settings
 from aurora.services.artifact_store import ArtifactStore
-from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.network_proxy import network_proxy_registry
 
@@ -23,6 +22,17 @@ LABELED_TARGET_PATTERN = re.compile(
     r"(https?://[^\s\"'<>]+|(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?:/[^\s\"'<>]*)?|[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?::\d{1,5})?(?:/[^\s\"'<>]*)?)"
 )
 DENIED_HOSTS = {"169.254.169.254", "metadata.google.internal", "localhost"}
+DENIED_TARGET_DOMAINS = {
+    "baidu.com",
+    "bdstatic.com",
+    "csdn.net",
+    "csdnimg.cn",
+    "google-analytics.com",
+    "googletagmanager.com",
+}
+STATIC_TARGET_SUFFIXES = {
+    ".css", ".gif", ".ico", ".jpeg", ".jpg", ".js", ".map", ".png", ".svg", ".webp", ".woff", ".woff2",
+}
 
 
 @dataclass
@@ -31,6 +41,8 @@ class BrowserInteractionResult:
     summary: str
     artifact_refs: list[str]
     target_urls: list[str]
+    target_candidates: list[dict[str, object]] | None = None
+    requires_confirmation: bool = False
 
 
 class BrowserInteractionService:
@@ -57,7 +69,7 @@ class BrowserInteractionService:
         except ImportError:
             return BrowserInteractionResult(False, "Playwright Chromium is not installed", [], [])
 
-        response_urls: list[str] = []
+        responses: list[dict[str, object]] = []
         browser = None
         settings = get_settings()
         navigation_timeout = max(1, min(int(request.get("navigation_timeout_seconds", settings.browser_navigation_timeout_seconds)), 60)) * 1_000
@@ -72,7 +84,8 @@ class BrowserInteractionService:
                 context = browser.new_context()
                 context.add_cookies(self._parse_cookie(browser_session.cookie, source_host))
                 page = context.new_page()
-                page.on("response", lambda response: response_urls.append(response.url))
+                page.on("dialog", lambda dialog: dialog.accept())
+                page.on("response", lambda response: self._capture_response(response, responses))
                 navigation_error = None
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=min(navigation_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
@@ -88,12 +101,14 @@ class BrowserInteractionService:
                     before_body = page.locator("body").inner_text(timeout=dom_timeout)[:80_000]
                 except Exception:
                     before_body = ""
-                if navigation_error is not None and not before_body and not response_urls:
+                if navigation_error is not None and not before_body and not responses:
                     browser.close()
-                    return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=response_urls, page_text=before_body, reason=f"browser navigation timeout: {navigation_error}")
-                candidates = self._labeled_target_urls(before_body, source_host)
+                    return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=[], page_text=before_body, reason=f"browser navigation timeout: {navigation_error}")
+                before_candidates = self._page_target_urls(page, source_host)
+                candidates = list(before_candidates)
                 clicked = False
                 auto_launch_label = ""
+                requires_confirmation = self._requires_confirmation(before_body)
                 if not candidates and not text and not selector:
                     launch_pattern = re.compile(r"(?:启动|开启|创建|获取|Start|Launch|Create|Get)\s*(?:靶机|环境|实例|Instance|Target|Environment)?", re.IGNORECASE)
                     auto_control = page.get_by_role("button", name=launch_pattern).first
@@ -114,24 +129,48 @@ class BrowserInteractionService:
                         )
                         browser.close()
                         return BrowserInteractionResult(False, "no labeled target address or launch control found", [artifact.id], [])
-                response_urls.clear()
+                responses.clear()
                 if not candidates:
+                    if requires_confirmation and not bool(request.get("allow_paid_launch")):
+                        artifact = ArtifactStore().write_text(
+                            session,
+                            project_id=project_id,
+                            source_attempt_id=attempt_id,
+                            artifact_type="browser-inspection",
+                            origin_kind="target_observation",
+                            summary="Browser found a paid launch confirmation and paused before accepting it",
+                            content=json.dumps({"page_url": url, "requires_confirmation": True, "page_text": before_body[:12_000]}, ensure_ascii=False, indent=2),
+                        )
+                        browser.close()
+                        return BrowserInteractionResult(True, "启动操作可能扣除积分或余额，需要用户确认", [artifact.id], [], [], True)
                     control = auto_control if auto_launch_label else (page.get_by_text(text, exact=False).first if text else page.locator(selector).first)
                     if control.count() < 1:
                         browser.close()
                         return BrowserInteractionResult(False, "declared browser control was not found", [], [])
                     control.click(timeout=min(action_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
                     clicked = True
-                    page.wait_for_timeout(min(min(max(int(request.get("wait_seconds", 5)), 1), 20) * 1_000, max(1, int((total_deadline - time.monotonic()) * 1_000))))
-                    page.wait_for_load_state("domcontentloaded", timeout=min(dom_timeout, max(1, int((total_deadline - time.monotonic()) * 1_000))))
+                    self._accept_web_confirmation(page, action_timeout)
+                    self._wait_for_provisioning(page, source_host, total_deadline, int(request.get("wait_seconds", 5)))
                 final_url = page.url
                 try:
                     body = page.locator("body").inner_text(timeout=dom_timeout)[:80_000]
                 except Exception:
                     body = before_body
-                candidates = list(dict.fromkeys([*candidates, *self._labeled_target_urls(body, source_host)]))
-                if clicked:
-                    candidates = list(dict.fromkeys([*candidates, *self._target_urls([before_url, final_url, *response_urls, *URL_PATTERN.findall(body)], source_host)]))
+                after_candidates = self._page_target_urls(page, source_host)
+                structured_candidates = self._structured_response_urls(responses, source_host)
+                navigation_candidates = self._target_urls([before_url, final_url], source_host) if clicked else []
+                candidates = list(dict.fromkeys([*candidates, *after_candidates, *structured_candidates, *navigation_candidates]))
+                scored_candidates = []
+                for candidate in candidates:
+                    if candidate in structured_candidates:
+                        source, score = "structured_response", 98
+                    elif candidate in after_candidates and candidate not in before_candidates:
+                        source, score = "new_target_control", 95
+                    elif candidate in before_candidates:
+                        source, score = "existing_target_control", 85
+                    else:
+                        source, score = "navigation", 75
+                    scored_candidates.append({"url": candidate, "source": source, "score": score})
                 artifact = ArtifactStore().write_text(
                     session,
                     project_id=project_id,
@@ -139,8 +178,10 @@ class BrowserInteractionService:
                     artifact_type="browser-interaction",
                     origin_kind="target_observation",
                     summary=f"Browser {'clicked ' + (auto_launch_label or text or selector) if clicked else 'inspected labeled fields'}; discovered {len(candidates)} target URL(s)",
-                    content=json.dumps({"page_url": url, "before_url": before_url, "final_url": final_url, "locator": {"text": text, "selector": selector}, "clicked": clicked, "response_urls": response_urls[-100:], "target_urls": candidates, "page_text": body[:12_000]}, ensure_ascii=False, indent=2),
+                    content=json.dumps({"page_url": url, "before_url": before_url, "final_url": final_url, "locator": {"text": text, "selector": selector}, "clicked": clicked, "responses": responses[-100:], "target_candidates": scored_candidates, "page_text": body[:12_000]}, ensure_ascii=False, indent=2),
                 )
+                for candidate in scored_candidates:
+                    candidate["artifact_ref"] = artifact.id
                 browser.close()
         except Exception as exc:
             if browser is not None:
@@ -148,18 +189,87 @@ class BrowserInteractionService:
                     browser.close()
                 except Exception:
                     pass
-            return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=response_urls, page_text="", reason=f"browser interaction failed: {exc}")
+            return self._record_execution_error(session, project_id=project_id, attempt_id=attempt_id, url=url, response_urls=[str(item.get("url") or "") for item in responses], page_text="", reason=f"browser interaction failed: {exc}")
 
-        for target_url in candidates:
-            host = (urlparse(target_url).hostname or "").lower().rstrip(".")
-            existing = session.exec(select(DiscoveredTarget).where(DiscoveredTarget.project_id == project_id, DiscoveredTarget.host == host, DiscoveredTarget.status == "ACTIVE")).first()
-            if existing is None:
-                session.add(DiscoveredTarget(project_id=project_id, url=target_url, host=host, source_artifact_id=artifact.id))
-                session.add(WorkerEvent(project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id, event_type="target.discovered", payload_json={"url": target_url, "host": host, "artifact_ref": artifact.id}))
-                BlackboardRepository().upsert_fact(session, project_id=project_id, statement=f"Browser interaction exposed target: {target_url}", category="target", confidence=0.9, evidence_refs=[artifact.id], source_intent_id=intent_id, source_attempt_id=attempt_id)
-                BlackboardRepository().upsert_intent(session, project_id=project_id, objective=f"Inspect provisioned target {target_url}", capability_tags=["http.request"], parent_intent_id=intent_id, priority=3.0, risk_level="low", budget={"tool_request": {"url": target_url, "timeout_seconds": 10}})
+        for candidate in scored_candidates:
+            session.add(WorkerEvent(project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id, event_type="target.discovered", payload_json={**candidate, "artifact_ref": artifact.id, "status": "CANDIDATE"}))
         session.commit()
-        return BrowserInteractionResult(True, f"browser interaction completed; discovered {len(candidates)} target URL(s)", [artifact.id], candidates)
+        return BrowserInteractionResult(True, f"browser interaction completed; discovered {len(candidates)} target URL(s)", [artifact.id], candidates, scored_candidates, requires_confirmation)
+
+    @classmethod
+    def _page_target_urls(cls, page, source_host: str) -> list[str]:
+        try:
+            values = page.locator("input, textarea, a, button, code, pre, [data-target-url], [data-instance-url]").evaluate_all(
+                """elements => elements.filter(element => {
+                    const excluded = element.closest('[class*=comment i], [id*=comment i], [class*=writeup i], [id*=writeup i]');
+                    const text = `${element.innerText || ''} ${element.value || ''} ${element.href || ''}`;
+                    return !excluded && /(target|instance|challenge|靶机|题目).{0,24}(https?:\\/\\/|(?:\\d{1,3}\\.){3}\\d{1,3})/i.test(text);
+                }).map(element => `${element.innerText || ''} ${element.value || ''} ${element.href || ''}`)"""
+            )
+        except Exception:
+            return []
+        return cls._labeled_target_urls("\n".join(str(value) for value in values), source_host)
+
+    @staticmethod
+    def _capture_response(response, responses: list[dict[str, object]]) -> None:
+        resource_type = str(response.request.resource_type or "")
+        if resource_type not in {"document", "xhr", "fetch"}:
+            return
+        item: dict[str, object] = {"url": response.url, "resource_type": resource_type, "status": response.status}
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "json" in content_type:
+            try:
+                item["json"] = response.json()
+            except Exception:
+                pass
+        responses.append(item)
+
+    @classmethod
+    def _structured_response_urls(cls, responses: list[dict[str, object]], source_host: str) -> list[str]:
+        values: list[str] = []
+
+        def visit(value: object, key: str = "") -> None:
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    visit(child, str(child_key))
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child, key)
+            elif isinstance(value, str) and re.search(r"(?:url|target|instance|host|address|靶机)", key, re.IGNORECASE):
+                values.extend(URL_PATTERN.findall(value))
+
+        for response in responses:
+            if "json" in response:
+                visit(response["json"])
+        return cls._target_urls(values, source_host)
+
+    @staticmethod
+    def _accept_web_confirmation(page, timeout_ms: int) -> None:
+        pattern = re.compile(r"^(?:确认|确定|继续|启动|创建|支付|Confirm|OK|Continue|Launch|Create|Pay)$", re.IGNORECASE)
+        for selector in (".swal2-confirm", ".bootbox-accept", ".modal.show .btn-primary"):
+            control = page.locator(selector).first
+            if control.count() > 0 and control.is_visible():
+                control.click(timeout=timeout_ms)
+                return
+        control = page.get_by_role("button", name=pattern).first
+        if control.count() > 0 and control.is_visible():
+            control.click(timeout=timeout_ms)
+
+    @classmethod
+    def _wait_for_provisioning(cls, page, source_host: str, deadline: float, minimum_wait_seconds: int) -> None:
+        end = min(deadline, time.monotonic() + max(5, min(minimum_wait_seconds + 15, 30)))
+        while time.monotonic() < end:
+            page.wait_for_timeout(min(1000, max(1, int((end - time.monotonic()) * 1000))))
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=1000)
+            except Exception:
+                pass
+            if cls._page_target_urls(page, source_host):
+                return
+
+    @staticmethod
+    def _requires_confirmation(text: str) -> bool:
+        return bool(re.search(r"(?:付费|支付|扣除|积分|金币|余额|cost|pay|credit|coin)", text, re.IGNORECASE))
 
     @staticmethod
     def _record_execution_error(session: Session, *, project_id: str, attempt_id: str | None, url: str, response_urls: list[str], page_text: str, reason: str) -> BrowserInteractionResult:
@@ -201,7 +311,12 @@ class BrowserInteractionService:
                 if address.is_loopback or address.is_link_local or address.is_reserved:
                     continue
             except ValueError:
-                pass
+                if "." not in host or not host.isascii() or any(not label or not re.fullmatch(r"[a-z0-9-]+", label) for label in host.split(".")):
+                    continue
+            if any(host == domain or host.endswith(f".{domain}") for domain in DENIED_TARGET_DOMAINS):
+                continue
+            if any(parsed.path.lower().endswith(suffix) for suffix in STATIC_TARGET_SUFFIXES):
+                continue
             normalized = parsed.geturl()
             if normalized not in targets:
                 targets.append(normalized)

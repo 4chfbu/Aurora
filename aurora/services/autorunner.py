@@ -11,14 +11,14 @@ from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, W
 from aurora.services.demo import run_one_demo_step
 from aurora.services.manager import ManagerService
 from aurora.services.observer import ObserverService
-from aurora.services.blackboard_repository import stable_json
+from aurora.services.blackboard_repository import route_fingerprint
 
 
 @dataclass
 class AutoRunLimits:
     max_iterations: int = 20
     max_minutes: int = 0
-    no_progress_limit: int = 4
+    no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True
 
 
@@ -125,7 +125,7 @@ class AutoRunnerService:
             if run_result.get("status") == "idle" and manager_decision.status == "NOOP":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)
-            if run_result.get("status") == "runtime_error":
+            if run_result.get("status") in {"runtime_error", "runtime_preflight_failed", "target_not_verified"}:
                 self._event(session, project_id, "autorun.blocked", {"reason": "runtime_error", "iteration": iteration, "message": run_result.get("message")})
                 return AutoRunResult("blocked", "runtime_error", iteration, project_id, events)
             if limits.no_progress_limit > 0 and no_progress_count >= limits.no_progress_limit:
@@ -179,10 +179,10 @@ class AutoRunnerService:
         if len(traces) < 2:
             return 0
         latest = traces[0]
-        latest_request = stable_json(latest.request_json)
+        latest_request = route_fingerprint(latest.request_json)
         streak = 0
         for trace in traces:
-            if trace.tool_name != latest.tool_name or stable_json(trace.request_json) != latest_request:
+            if trace.tool_name != latest.tool_name or route_fingerprint(trace.request_json) != latest_request:
                 break
             streak += 1
         return streak

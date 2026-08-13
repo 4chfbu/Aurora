@@ -19,14 +19,27 @@ def init_db() -> None:
     if settings.database_url.startswith("sqlite"):
         _add_sqlite_columns()
     _backfill_legacy_flag_candidates()
+    _invalidate_legacy_false_targets()
 
 
 def _add_sqlite_columns() -> None:
     expected = {
-        "attempt": {"parent_attempt_id": "TEXT"},
+        "attempt": {
+            "parent_attempt_id": "TEXT",
+            "codex_control_token_hash": "TEXT",
+            "last_event_at": "DATETIME",
+            "resume_count": "INTEGER DEFAULT 0",
+            "blackboard_version": "INTEGER DEFAULT 0",
+        },
         "attemptcheckpoint": {"generated_intent_ids": "JSON DEFAULT '[]'"},
         "fact": {"evidence_items": "JSON DEFAULT '[]'"},
         "artifact": {"origin_kind": "TEXT DEFAULT 'unclassified'"},
+        "discoveredtarget": {
+            "source": "TEXT DEFAULT 'automatic'",
+            "confidence": "FLOAT DEFAULT 0.0",
+            "probe_json": "JSON DEFAULT '{}'",
+            "updated_at": "DATETIME",
+        },
         "worker": {"parent_worker_id": "TEXT", "execution_kind": "TEXT DEFAULT 'primary'"},
         "importbatch": {
             "auth_method": "TEXT",
@@ -107,3 +120,10 @@ def _backfill_legacy_flag_candidates() -> None:
             changed = True
         if changed:
             session.commit()
+
+
+def _invalidate_legacy_false_targets() -> None:
+    from aurora.services.target_repair import invalidate_false_targets
+
+    with Session(engine) as session:
+        invalidate_false_targets(session)

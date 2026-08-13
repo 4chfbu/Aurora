@@ -11,7 +11,7 @@
   },
   "profiles": {
     "core": {
-      "description": "Common Kali CTF command-line tools plus Rizin and GDB MCP sessions.",
+      "description": "Common Kali CTF tools plus Rizin, GDB, and live Aurora Blackboard MCP sessions.",
       "commands": [
         "7zz", "binwalk", "checksec", "curl", "dirb", "dmg2img",
         "exiftool", "ffuf", "file", "foremost", "gdb", "gdbserver", "git",
@@ -30,6 +30,10 @@
         "aurora_debug": {
           "backend": "gdb-mi",
           "tools": ["start_session", "set_breakpoint", "run", "continue_execution", "step_instruction", "next_instruction", "read_registers", "read_memory", "evaluate", "backtrace", "disassemble", "stop_session"]
+        },
+        "aurora_blackboard": {
+          "backend": "aurora-control-api",
+          "tools": ["query", "append_fact", "save_checkpoint"]
         }
       },
       "heavy_only": ["angr", "ghidra", "hashcat", "jadx", "volatility3"]
