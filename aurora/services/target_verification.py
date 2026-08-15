@@ -30,7 +30,7 @@ class TargetVerificationService:
             raise ValueError("project not found")
         browser_session = browser_session_registry.get_project_session(project_id)
         if browser_session is None:
-            return self._record(session, project, "NEEDS_SESSION", "需要已登录的 Cookie 才能验证靶机启动", None)
+            return self._record(session, project, "NEEDS_SESSION", "未提供用于自动识别靶机的登录会话；这不影响附件和本地分析，也可稍后人工注入靶机", None)
 
         if source_url is None:
             candidate = session.exec(select(ImportCandidate).where(ImportCandidate.project_id == project_id).order_by(ImportCandidate.created_at.desc())).first()

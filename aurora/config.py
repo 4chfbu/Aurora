@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import os
 
 
@@ -53,6 +53,9 @@ class Settings(BaseModel):
     default_hard_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_HARD_TIMEOUT_SECONDS", "1800")))
     default_max_tool_calls: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_MAX_TOOL_CALLS", "12")))
     default_max_repeat_failures: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_MAX_REPEAT_FAILURES", "2")))
+    default_max_agent_actions: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_MAX_AGENT_ACTIONS", "20")))
+    default_max_route_repeats: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_MAX_ROUTE_REPEATS", "2")))
+    default_finalize_grace_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_FINALIZE_GRACE_SECONDS", "60")))
     browser_navigation_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_BROWSER_NAVIGATION_TIMEOUT_SECONDS", "15")))
     browser_retry_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_BROWSER_RETRY_TIMEOUT_SECONDS", "5")))
     browser_dom_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_BROWSER_DOM_TIMEOUT_SECONDS", "5")))
@@ -67,6 +70,7 @@ class Settings(BaseModel):
     cataloger_max_pages: int = Field(default_factory=lambda: int(os.getenv("AURORA_CATALOGER_MAX_PAGES", "20")))
     cataloger_max_candidates: int = Field(default_factory=lambda: int(os.getenv("AURORA_CATALOGER_MAX_CANDIDATES", "500")))
     cataloger_max_response_bytes: int = Field(default_factory=lambda: int(os.getenv("AURORA_CATALOGER_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024))))
+    cataloger_attachment_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_CATALOGER_ATTACHMENT_TIMEOUT_SECONDS", "20")))
     fofa_email: str | None = Field(default_factory=lambda: os.getenv("AURORA_FOFA_EMAIL"))
     fofa_key: str | None = Field(default_factory=lambda: os.getenv("AURORA_FOFA_KEY"))
     fofa_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_FOFA_BASE_URL", "https://api.fofa.info/v1/search/all"))
@@ -74,6 +78,15 @@ class Settings(BaseModel):
     subagents_enabled: bool = Field(default_factory=lambda: os.getenv("AURORA_SUBAGENTS_ENABLED", "false").lower() in {"1", "true", "yes"})
     subagents_max_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_CONCURRENT", "2")))
     subagents_max_per_worker: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_PER_WORKER", "4")))
+    max_challenge_group_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_MAX_CHALLENGE_GROUP_CONCURRENT", "2")))
+
+    @model_validator(mode="after")
+    def validate_codex_context_budget(self) -> "Settings":
+        if self.codex_model_context_window <= 0:
+            raise ValueError("AURORA_CODEX_MODEL_CONTEXT_WINDOW must be positive")
+        if self.codex_auto_compact_token_limit <= 0 or self.codex_auto_compact_token_limit >= self.codex_model_context_window:
+            raise ValueError("AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT must be positive and smaller than the Codex context window")
+        return self
 
     @property
     def fofa_configured(self) -> bool:

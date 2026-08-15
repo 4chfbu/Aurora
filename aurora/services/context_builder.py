@@ -38,6 +38,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "artifact_ref": "trusted artifact containing the exact value",
         "provenance_kind": "observed | derived_replay",
     }],
+    "blockers": [{"kind": "target | session | paid_confirmation | missing_evidence", "reason": "", "next_step": ""}],
     "decision_summary": {
         "selected_intent": "...",
         "reason_summary": "observable non-chain-of-thought rationale",
@@ -96,6 +97,12 @@ class ContextBuilder:
 
         sections: dict[str, Any] = {
             "project_goal": project.goal,
+            "target_access": {
+                "status": project.target_verification_status,
+                "url": project.target_url,
+                "reason": project.target_verification_reason,
+                "required_for_solver_start": False,
+            },
             "tool_environment": tool_environment(settings, project.challenge_type),
             "competition_context": {
                 "phase": group_item.phase,
@@ -151,6 +158,7 @@ class ContextBuilder:
             "operating_mode": {
                 "tooling": "Kali native tools first; MCP only when Kali lacks the capability.",
                 "context_policy": "intent-first; raw tool output stays in Artifact Store unless explicitly read by id.",
+                "target_policy": "A target is optional. If none is active, continue with imported artifacts and local analysis; never invent a target URL. Network requests remain authorization-gated.",
                 "hidden_chain_of_thought": "not captured; only observable decision summaries are stored.",
                 "subagents": {
                     "enabled": allow_subagents,

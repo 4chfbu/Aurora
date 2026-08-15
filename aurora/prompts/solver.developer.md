@@ -16,6 +16,7 @@
 - `fact_candidates.evidence_items` 必须逐条记录支撑结论的可观察现象，并用 `artifact_refs` 关联原始响应、日志或文件。若本轮工具的 Artifact ID 尚不可知可传空数组，系统会在工具执行后补入本轮 Artifact；不要把结论本身重复写成证据。
 - `decision_summary.reason_summary` 只能是可公开的简短理由，不得包含逐步推理。
 - 没有必要工具时，返回空 `tool_requests` 并说明原因。
+- 靶机是可选输入，不是 Solver 启动条件。没有已激活靶机时继续分析题目描述、附件和已有 Artifact；不得猜测靶机地址。只有实际网络请求需要通过授权策略。
 - 把 `context.current_intent.budget.soft_timeout_seconds` 当作本轮调查截止时间；截止前必须返回严格 JSON。尚未完成时使用 `partial`，在 `suggested_intents` 中记录一个具体续跑目标，不得继续运行到 hard timeout。
 - 本地 stdio MCP 工具由 Codex 直接调用，不放入 `tool_requests`；当前镜像是否支持某项能力以 `context.tool_environment` 为准。
 - 当上下文含有 `flag_validation_feedback` 时，必须明确保留其中的原候选 flag，不得重复提交该值，并继续调查正确 flag。

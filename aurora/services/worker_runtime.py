@@ -8,6 +8,7 @@ import secrets
 import shlex
 import shutil
 import time
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import Any, Protocol
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
+from aurora.db import engine
 from aurora.models import Artifact, Attempt, ContextSnapshot, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
@@ -142,6 +144,8 @@ class OpenAICompatibleRuntime:
     def _normalize_structured_output(self, structured: dict[str, Any], snapshot: ContextSnapshot) -> dict[str, Any]:
         intent = snapshot.sections_json.get("current_intent", {})
         status = structured.get("status") or "partial"
+        if status not in {"success", "partial", "failed"}:
+            status = "partial"
         summary = structured.get("summary") or "LLM generated a structured worker result."
         tool_requests = structured.get("tool_requests")
         if not isinstance(tool_requests, list):
@@ -179,6 +183,10 @@ class OpenAICompatibleRuntime:
                 "reason_summary": "模型生成了结构化工具计划。",
                 "next_tool_plan": [request["tool_name"] for request in filtered_tool_requests],
             }
+        suggested = self._normalize_suggested_intents(structured.get("suggested_intents"), intent)
+        blockers = self._normalize_blockers(structured.get("blockers"))
+        if status == "partial" and not suggested and not blockers:
+            blockers = [{"kind": "missing_evidence", "reason": "本轮没有形成可执行的续跑路线", "next_step": "查询最新 checkpoint 并提出唯一下一步"}]
         return {
             "status": status,
             "summary": summary,
@@ -186,13 +194,64 @@ class OpenAICompatibleRuntime:
             "hypotheses": structured.get("hypotheses") if isinstance(structured.get("hypotheses"), list) else [],
             "artifact_refs": structured.get("artifact_refs") if isinstance(structured.get("artifact_refs"), list) else [],
             "failed_attempts": structured.get("failed_attempts") if isinstance(structured.get("failed_attempts"), list) else [],
-            "suggested_intents": structured.get("suggested_intents") if isinstance(structured.get("suggested_intents"), list) else [],
+            "suggested_intents": suggested,
+            "blockers": blockers,
             "fork_recommendations": structured.get("fork_recommendations") if isinstance(structured.get("fork_recommendations"), list) else [],
             "subagent_reports": structured.get("subagent_reports") if isinstance(structured.get("subagent_reports"), list) else [],
             "candidate_flags": structured.get("candidate_flags") if isinstance(structured.get("candidate_flags"), list) else [],
             "decision_summary": decision_summary,
             "tool_requests": filtered_tool_requests,
         }
+
+    @staticmethod
+    def _normalize_suggested_intents(value: object, current_intent: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for item in value[:3]:
+            if isinstance(item, str):
+                objective = item.strip()[:2000]
+                if objective:
+                    normalized.append({"objective": objective, "capability_tags": ["blackboard.query"], "priority": 0.5, "risk_level": "low"})
+                continue
+            if not isinstance(item, dict) or not isinstance(item.get("objective"), str) or not item["objective"].strip():
+                continue
+            capabilities = item.get("capability_tags", item.get("capabilities", []))
+            if not isinstance(capabilities, list):
+                capabilities = []
+            risk = item.get("risk_level", "low")
+            try:
+                priority = float(item.get("priority", 0.5) or 0.5)
+            except (TypeError, ValueError):
+                priority = 0.5
+            normalized.append({
+                **item,
+                "objective": item["objective"].strip()[:2000],
+                "capability_tags": [str(tag) for tag in capabilities if str(tag).strip()][:8] or ["blackboard.query"],
+                "priority": priority,
+                "risk_level": risk if risk in {"low", "medium", "high"} else "low",
+            })
+        return normalized
+
+    @staticmethod
+    def _normalize_blockers(value: object) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[dict[str, str]] = []
+        for item in value[:4]:
+            if isinstance(item, str) and item.strip():
+                normalized.append({"kind": "missing_evidence", "reason": item.strip()[:1000]})
+            elif isinstance(item, dict):
+                kind = str(item.get("kind", item.get("type", "missing_evidence")))
+                if kind not in {"target", "session", "paid_confirmation", "missing_evidence"}:
+                    kind = "missing_evidence"
+                reason = str(item.get("reason", item.get("message", "blocker"))).strip()
+                if reason:
+                    entry = {"kind": kind, "reason": reason[:1000]}
+                    if item.get("next_step"):
+                        entry["next_step"] = str(item["next_step"])[:1000]
+                    normalized.append(entry)
+        return normalized
 
     def _select_tool(self, intent: dict[str, Any], visible_tool_names: set[str]) -> str:
         for tag in intent.get("capability_tags") or []:
@@ -250,6 +309,7 @@ class CodexHarnessRuntime:
                 "AURORA_CODEX_RESUME_THREAD_ID": resume_thread_id or "",
             },
         )
+        soft_deadline_timer = self._schedule_soft_deadline(worker=worker, attempt=attempt)
         try:
             completed = self._run_command(
                 command,
@@ -259,6 +319,8 @@ class CodexHarnessRuntime:
                 on_output=lambda stream, line: self._record_codex_event(session, worker=worker, attempt=attempt, stream=stream, line=line),
             )
         finally:
+            if soft_deadline_timer is not None:
+                soft_deadline_timer.cancel()
             if attempt is not None:
                 attempt.codex_control_token_hash = None
                 session.add(attempt)
@@ -330,6 +392,45 @@ class CodexHarnessRuntime:
         session.commit()
         session.refresh(trace)
         return RuntimeOutput(structured.get("status", "partial"), structured.get("summary", "Codex harness completed."), structured, trace)
+
+    def _schedule_soft_deadline(self, *, worker: Worker, attempt: Attempt | None) -> threading.Timer | None:
+        if attempt is None:
+            return None
+        seconds = int((worker.budgets or {}).get("soft_timeout_seconds", 0) or 0)
+        if seconds <= 0:
+            return None
+
+        def mark() -> None:
+            try:
+                with Session(engine) as deadline_session:
+                    live_attempt = deadline_session.get(Attempt, attempt.id)
+                    live_worker = deadline_session.get(Worker, worker.id)
+                    if live_attempt is None or live_worker is None or live_attempt.status != "RUNNING" or live_worker.status != "RUNNING":
+                        return
+                    deadline_session.add(WorkerEvent(
+                        project_id=worker.project_id,
+                        worker_id=worker.id,
+                        intent_id=worker.intent_id,
+                        attempt_id=attempt.id,
+                        event_type="attempt.soft_deadline",
+                        payload_json={"soft_timeout_seconds": seconds, "action": "stop_exploration_and_finalize"},
+                    ))
+                    deadline_session.add(WorkerEvent(
+                        project_id=worker.project_id,
+                        worker_id=worker.id,
+                        intent_id=worker.intent_id,
+                        attempt_id=attempt.id,
+                        event_type="attempt.finalization_started",
+                        payload_json={"mode": "runtime_checkpoint_fallback", "grace_seconds": int((worker.budgets or {}).get("finalize_grace_seconds", 60) or 60)},
+                    ))
+                    deadline_session.commit()
+            except Exception:
+                return
+
+        timer = threading.Timer(seconds, mark)
+        timer.daemon = True
+        timer.start()
+        return timer
 
     def _prepare_attempt(self, session: Session, *, worker: Worker, attempt: Attempt | None, control_token: str, workspace: Path | None = None) -> str | None:
         if attempt is None:
@@ -414,6 +515,62 @@ class CodexHarnessRuntime:
             attempt.codex_turn_id = turn_id[:200]
         attempt.last_event_at = now_utc()
         session.add(attempt)
+        item_type = str(item.get("type") or "")[:100]
+        if item_type == "command_execution" and str(item.get("status") or event.get("status") or "") in {"completed", "failed", "done", ""}:
+            command = CodexHarnessRuntime._redact_command(item.get("command") or event.get("command"))
+            exit_code = item.get("exit_code", event.get("exit_code"))
+            try:
+                exit_code = int(exit_code) if exit_code is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+            cwd = str(item.get("cwd") or event.get("cwd") or "")[:300]
+            trace = ToolTrace(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                tool_name="codex.shell",
+                request_json={"command": command, "cwd": cwd},
+                command=command,
+                cwd=cwd or None,
+                exit_code=exit_code,
+                summary=str(item.get("aggregated_output") or item.get("output") or event.get("output") or "")[-1000:] or None,
+            )
+            session.add(trace)
+            session.flush()
+            action_count = session.exec(
+                select(ToolTrace).where(ToolTrace.attempt_id == attempt.id, ToolTrace.tool_name == "codex.shell")
+            ).all()
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    attempt_id=attempt.id,
+                    event_type="agent.action.completed",
+                    payload_json={
+                        "action_index": len(action_count),
+                        "tool_trace_id": trace.id,
+                        "tool_name": "codex.shell",
+                        "command": command,
+                        "exit_code": exit_code,
+                        "duration_ms": item.get("duration_ms") or event.get("duration_ms"),
+                        "route_fingerprint": hashlib.sha256(json.dumps(trace.request_json, sort_keys=True).encode()).hexdigest()[:16],
+                    },
+                )
+            )
+            max_actions = int((worker.budgets or {}).get("max_agent_actions", 0) or 0)
+            if max_actions and len(action_count) >= max_actions:
+                session.add(
+                    WorkerEvent(
+                        project_id=worker.project_id,
+                        worker_id=worker.id,
+                        intent_id=worker.intent_id,
+                        attempt_id=attempt.id,
+                        event_type="attempt.action_budget_exhausted",
+                        payload_json={"max_agent_actions": max_actions, "observed": len(action_count)},
+                    )
+                )
         session.add(
             WorkerEvent(
                 project_id=worker.project_id,
@@ -425,12 +582,18 @@ class CodexHarnessRuntime:
                     "type": event_type,
                     "thread_id": attempt.codex_thread_id,
                     "turn_id": attempt.codex_turn_id,
-                    "item_type": str(item.get("type") or "")[:100],
+                    "item_type": item_type,
                     "item_status": str(item.get("status") or event.get("status") or "")[:100],
                 },
             )
         )
         session.commit()
+
+    @staticmethod
+    def _redact_command(value: object) -> str:
+        command = str(value or "").strip()
+        command = re.sub(r"(?i)(authorization|cookie|token|password|api[_-]?key)\s*[:=]\s*[^\s]+", r"\1=<redacted>", command)
+        return command[:2000]
 
     def _write_prompt(self, session: Session, worker: Worker, snapshot: ContextSnapshot) -> Path:
         workspace = self.settings.codex_workspace_dir / snapshot.project_id / worker.id
@@ -817,6 +980,7 @@ class CodexHarnessRuntime:
             "fork_recommendations",
             "subagent_reports",
             "candidate_flags",
+            "blockers",
             "tool_requests",
         ]:
             if not isinstance(structured.get(key), list):
@@ -847,6 +1011,9 @@ class CodexHarnessRuntime:
                 normalized["activity_label"] = tool_request["activity_label"]
             normalized_requests.append(normalized)
         structured["tool_requests"] = normalized_requests
+        structured["blockers"] = OpenAICompatibleRuntime._normalize_blockers(structured.get("blockers"))
+        if structured.get("status") == "partial" and not structured.get("suggested_intents") and not structured["blockers"]:
+            structured["blockers"] = [{"kind": "missing_evidence", "reason": "本轮没有形成可执行的续跑路线", "next_step": "查询最新 checkpoint 并提出唯一下一步"}]
         structured.setdefault(
             "decision_summary",
             {

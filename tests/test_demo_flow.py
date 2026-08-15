@@ -396,6 +396,48 @@ def test_scheduler_runs_semantic_tool_intent() -> None:
         assert {"worker.started", "context.built", "llm.completed", "tool.executed", "attempt.completed"}.issubset(event_types)
 
 
+def test_imported_project_runs_without_a_verified_target() -> None:
+    client = TestClient(create_app())
+    with client:
+        project = client.post(
+            "/api/projects",
+            json={"name": "offline-import", "goal": "Analyze imported files before a target is available.", "allowed_hosts": []},
+        ).json()
+        project_id = project["id"]
+        with Session(engine) as session:
+            imported = session.get(Project, project_id)
+            assert imported is not None
+            imported.target_verification_status = "NEEDS_SESSION"
+            imported.target_verification_reason = "target session not available"
+            session.add(imported)
+            session.add(
+                ImportCandidate(
+                    batch_id="import_optional_target",
+                    title="Offline challenge",
+                    challenge_url="https://catalog.example/challenge/1",
+                    project_id=project_id,
+                    confirmed=True,
+                )
+            )
+            session.commit()
+
+        result = client.post(f"/api/projects/{project_id}/scheduler/run-next")
+        assert result.status_code == 200
+        assert result.json()["status"] == "completed"
+
+        contexts = client.get(f"/api/projects/{project_id}/debug/context-snapshots").json()
+        assert contexts[0]["sections_json"]["target_access"] == {
+            "status": "NEEDS_SESSION",
+            "url": None,
+            "reason": "target session not available",
+            "required_for_solver_start": False,
+        }
+        events = client.get(f"/api/projects/{project_id}/events").json()
+        event_types = {event["event_type"] for event in events}
+        assert "worker.started" in event_types
+        assert "worker.preflight_blocked" not in event_types
+
+
 def test_scheduler_heartbeat_and_reap_expired_leases() -> None:
     client = TestClient(create_app())
     with client:

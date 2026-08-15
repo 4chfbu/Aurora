@@ -4,7 +4,10 @@ import hashlib
 import ipaddress
 import json
 import mimetypes
+import queue
 import re
+import threading
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -317,13 +320,13 @@ class HandsFreeService:
                 allowed_hosts=[],
                 hint="Challenge page retained as import evidence; do not treat the training platform as a target.",
             )
-            project.target_verification_status = "NEEDS_SESSION"
-            project.target_verification_reason = "导入后等待登录会话以验证靶机启动"
+            project.target_verification_status = "UNVERIFIED"
+            project.target_verification_reason = "靶机为可选项；可继续分析题目与附件，也可稍后自动识别或人工注入"
             session.add(project)
             artifacts = self._attach_staged_artifacts(session, candidate, project.id)
             session.add(Fact(
                 project_id=project.id,
-                statement="Challenge source page was imported as evidence; await an explicitly discovered target URL before network actions.",
+                statement="Challenge source page and attachments were imported as evidence. Continue local analysis without a target; network actions require an explicitly discovered or manually injected target URL.",
                 category="import",
                 confidence=candidate.confidence,
                 evidence_refs=artifacts,
@@ -981,8 +984,11 @@ class HandsFreeService:
 
     def _collect_candidate_browser_attachments(self, context: Any, candidate: dict[str, Any]) -> None:
         page = context.new_page()
+        navigation_timeout = max(1, self.settings.browser_navigation_timeout_seconds) * 1_000
+        action_timeout = max(1, self.settings.browser_action_timeout_seconds) * 1_000
+        attachment_timeout = max(1, self.settings.cataloger_attachment_timeout_seconds) * 1_000
         try:
-            response = page.goto(candidate["challenge_url"], wait_until="domcontentloaded", timeout=30_000)
+            response = page.goto(candidate["challenge_url"], wait_until="domcontentloaded", timeout=navigation_timeout)
             if response is not None and response.status in {401, 403}:
                 candidate["_attachment_needs_session"] = True
                 candidate.setdefault("_attachment_issues", []).append({"status": "needs_session", "reason": "attachment requires a logged-in Cookie"})
@@ -995,7 +1001,7 @@ class HandsFreeService:
             seen: set[str] = set()
             for index in range(controls.count()):
                 control = controls.nth(index)
-                label = (control.get_attribute("aria-label") or control.inner_text(timeout=5_000) or control.get_attribute("download") or "attachment.bin").strip()
+                label = (control.get_attribute("aria-label") or control.inner_text(timeout=action_timeout) or control.get_attribute("download") or "attachment.bin").strip()
                 href = control.get_attribute("href") or ""
                 signature = f"{label}|{href}"
                 if signature in seen:
@@ -1010,22 +1016,73 @@ class HandsFreeService:
                     candidate.setdefault("_attachment_issues", []).append({"filename": label, "status": "dynamic_attachment", "reason": "dynamic attachment must be obtained from the challenge page"})
                     continue
                 try:
-                    with page.expect_download(timeout=30_000) as event:
-                        control.click(timeout=10_000)
+                    with page.expect_download(timeout=attachment_timeout) as event:
+                        control.click(timeout=action_timeout)
                     download = event.value
-                    path = download.path()
-                    if path is None:
-                        raise ValueError("download did not provide a local file")
-                    data = Path(path).read_bytes()
-                    if len(data) > MAX_ATTACHMENT_BYTES:
-                        raise ValueError("attachment exceeds size limit")
-                    candidate.setdefault("_downloaded_attachments", []).append({"filename": download.suggested_filename or label, "data": data, "mime_type": mimetypes.guess_type(download.suggested_filename or label)[0], "source_url": candidate["challenge_url"]})
+                    data, mime_type, source_url = self._read_browser_download(context, download)
+                    filename = download.suggested_filename or label
+                    candidate.setdefault("_downloaded_attachments", []).append({"filename": filename, "data": data, "mime_type": mime_type or mimetypes.guess_type(filename)[0], "source_url": source_url})
                 except Exception as exc:
                     candidate.setdefault("_attachment_issues", []).append({"filename": label, "status": "download_failed", "reason": str(exc)[:300]})
         except Exception as exc:
             candidate.setdefault("_attachment_issues", []).append({"status": "download_failed", "reason": f"detail attachment inspection failed: {exc}"[:300]})
         finally:
             page.close()
+
+    def _read_browser_download(self, context: Any, download: Any) -> tuple[bytes, str | None, str]:
+        """Read the original browser download with a hard completion deadline."""
+        timeout = max(1, self.settings.cataloger_attachment_timeout_seconds)
+        deadline = time.monotonic() + timeout
+        source_url = str(download.url)
+        artifact = getattr(getattr(download, "_impl_obj", None), "_artifact", None)
+        absolute_path = getattr(artifact, "absolute_path", None)
+
+        # Chromium writes to a temporary .crdownload and only exposes this
+        # final artifact path after completion. Polling it avoids the unbounded
+        # wait in download.path() while preserving one-shot, POST and blob URLs.
+        if absolute_path:
+            path = Path(str(absolute_path))
+            while time.monotonic() < deadline:
+                if path.is_file():
+                    with path.open("rb") as handle:
+                        data = handle.read(MAX_ATTACHMENT_BYTES + 1)
+                    if len(data) > MAX_ATTACHMENT_BYTES:
+                        raise ValueError("attachment exceeds size limit")
+                    return data, mimetypes.guess_type(download.suggested_filename or "")[0], source_url
+                time.sleep(0.05)
+            try:
+                download.cancel()
+            except Exception:
+                pass
+            raise TimeoutError(f"browser attachment download timed out after {timeout} seconds")
+
+        # Remote Playwright connections do not expose a local artifact path.
+        # Re-fetch there as a compatibility fallback, retaining browser cookies
+        # and a Referer when one is available.
+        source_url = self._safe_url(source_url)
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1_000))
+        page = getattr(download, "page", None)
+        referer = str(getattr(page, "url", "") or "")
+        headers = {"Accept": "application/octet-stream,*/*"}
+        if referer.startswith(("http://", "https://")):
+            headers["Referer"] = referer
+        try:
+            response = context.request.get(source_url, timeout=remaining_ms, max_redirects=5, headers=headers)
+            final_url = self._safe_url(str(response.url))
+            if not response.ok:
+                raise ValueError(f"attachment request failed with HTTP {response.status}")
+            content_length = response.headers.get("content-length")
+            if content_length and content_length.isdigit() and int(content_length) > MAX_ATTACHMENT_BYTES:
+                raise ValueError("attachment exceeds size limit")
+            data = response.body()
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                raise ValueError("attachment exceeds size limit")
+            return data, response.headers.get("content-type"), final_url
+        finally:
+            try:
+                download.cancel()
+            except Exception:
+                pass
 
     @staticmethod
     def _parse_browser_cookie(raw_cookie: str, domain: str) -> list[dict[str, str]]:
@@ -1103,7 +1160,9 @@ class HandsFreeService:
                 # Authenticated fetchers carry platform cookies, so external CDN
                 # downloads always use the service's unauthenticated downloader.
                 downloader = (fetch_bytes or self.fetch_bytes) if same_domain else self.fetch_bytes
-                data, mime_type = downloader(url, MAX_ATTACHMENT_BYTES)
+                if getattr(downloader, "__self__", None) is self and getattr(downloader, "__func__", None) is HandsFreeService._fetch_bytes:
+                    downloader = lambda target, limit: self._fetch_bytes(target, limit, referer=page_url)
+                data, mime_type = self._download_with_timeout(downloader, url, MAX_ATTACHMENT_BYTES)
                 if len(data) > MAX_ATTACHMENT_BYTES:
                     raise ValueError("attachment exceeds size limit")
                 if self._attachment_response_requires_login(data, mime_type):
@@ -1126,6 +1185,37 @@ class HandsFreeService:
                 status = "external_review_required" if "exceeds size limit" in reason else "download_failed"
                 external.append({"url": url, "status": status, "reason": reason})
         return staged, external
+
+    def _download_with_timeout(self, downloader: FetchBytes, url: str, max_bytes: int) -> tuple[bytes, str | None]:
+        """Bound the total wall-clock time of an attachment reader."""
+        owner = getattr(downloader, "__self__", None)
+        if isinstance(owner, _PlaywrightAuthenticatedFetcher):
+            # The synchronous Playwright API is thread-affine. Its request gets
+            # the same configured timeout in fetch_bytes().
+            return downloader(url, max_bytes)
+
+        timeout = max(1, self.settings.cataloger_attachment_timeout_seconds)
+        results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def run() -> None:
+            try:
+                results.put((True, downloader(url, max_bytes)))
+            except Exception as exc:
+                results.put((False, exc))
+
+        worker = threading.Thread(target=run, daemon=True, name="cataloger-attachment-download")
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise TimeoutError(f"attachment download timed out after {timeout} seconds")
+        succeeded, result = results.get_nowait()
+        if not succeeded:
+            if isinstance(result, Exception):
+                raise result
+            raise RuntimeError("attachment download failed without an error")
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise ValueError("attachment downloader returned an invalid response")
+        return result
 
     @staticmethod
     def _attachment_response_requires_login(data: bytes, mime_type: str | None) -> bool:
@@ -1193,9 +1283,8 @@ class HandsFreeService:
         lowered = (html[:200_000] + " " + final_url).lower()
         return bool(re.search(r"(?:/login|/signin|/auth|登录|sign[ -]?in|log[ -]?in)", lowered) and re.search(r"(?:password|密码|type=[\"']password)", lowered))
 
-    @staticmethod
-    def _authenticated_fetcher(source_url: str, cookie: str | None, username: str | None, password: str | None, login_url: str | None) -> AuthenticatedFetcher:
-        return _PlaywrightAuthenticatedFetcher(source_url, cookie, username, password, login_url)
+    def _authenticated_fetcher(self, source_url: str, cookie: str | None, username: str | None, password: str | None, login_url: str | None) -> AuthenticatedFetcher:
+        return _PlaywrightAuthenticatedFetcher(source_url, cookie, username, password, login_url, self.settings.cataloger_attachment_timeout_seconds)
 
     @staticmethod
     def _safe_url(url: str) -> str:
@@ -1306,36 +1395,41 @@ class HandsFreeService:
             raise ValueError("platform API returned an invalid response")
         return body
 
-    @staticmethod
-    def _fetch_bytes(url: str, max_bytes: int) -> tuple[bytes, str | None]:
+    def _fetch_bytes(self, url: str, max_bytes: int, *, referer: str | None = None) -> tuple[bytes, str | None]:
         class _SafeRedirectHandler(HTTPRedirectHandler):
             def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
                 HandsFreeService._safe_url(newurl)
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         HandsFreeService._safe_url(url)
-        headers = {"User-Agent": "Aurora-Cataloger/1.0"}
+        headers = {"User-Agent": "Aurora-Cataloger/1.0", "Accept": "application/octet-stream,*/*"}
+        if referer:
+            headers["Referer"] = referer
         opener = build_opener(network_proxy_registry.get().urllib_proxy_handler(), _SafeRedirectHandler())
-        try:
-            head_request = Request(url, headers=headers, method="HEAD")
-            with opener.open(head_request, timeout=15) as head_response:
-                HandsFreeService._safe_url(head_response.geturl())
-                content_length = head_response.headers.get("Content-Length")
-                if content_length is not None and int(content_length) > max_bytes:
-                    raise ValueError("attachment exceeds size limit")
-        except ValueError:
-            raise
-        except (HTTPError, URLError, TimeoutError, OSError):
-            # Some download endpoints do not implement HEAD; the bounded GET
-            # below remains the authoritative size check.
-            pass
         request = Request(url, headers=headers)
-        with opener.open(request, timeout=30) as response:
-            HandsFreeService._safe_url(response.geturl())
-            data = response.read(max_bytes + 1)
-            if len(data) > max_bytes:
-                raise ValueError("attachment exceeds size limit")
-            return data, response.headers.get_content_type()
+        timeout = max(1, self.settings.cataloger_attachment_timeout_seconds)
+        for attempt in range(2):
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    HandsFreeService._safe_url(response.geturl())
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None and int(content_length) > max_bytes:
+                        raise ValueError("attachment exceeds size limit")
+                    data = response.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        raise ValueError("attachment exceeds size limit")
+                    return data, response.headers.get_content_type()
+            except HTTPError as exc:
+                if attempt == 0 and (exc.code == 429 or 500 <= exc.code < 600):
+                    time.sleep(0.1)
+                    continue
+                raise
+            except (URLError, TimeoutError, OSError):
+                if attempt == 0:
+                    time.sleep(0.1)
+                    continue
+                raise
+        raise RuntimeError("attachment download failed")
 
     @staticmethod
     def open_external_attachment(url: str):
@@ -1354,13 +1448,14 @@ class HandsFreeService:
 class _PlaywrightAuthenticatedFetcher:
     """Ephemeral authenticated browser context. Credentials never leave this object."""
 
-    def __init__(self, source_url: str, cookie: str | None, username: str | None, password: str | None, login_url: str | None) -> None:
+    def __init__(self, source_url: str, cookie: str | None, username: str | None, password: str | None, login_url: str | None, attachment_timeout_seconds: int = 20) -> None:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise ValueError("authenticated imports require Playwright; install the browser runtime first") from exc
         self.source_url = HandsFreeService._safe_url(source_url)
         self.source_host = urlparse(self.source_url).hostname or ""
+        self.attachment_timeout_ms = max(1, attachment_timeout_seconds) * 1_000
         self._playwright = None
         self._browser = None
         self._context = None
@@ -1396,7 +1491,12 @@ class _PlaywrightAuthenticatedFetcher:
             page.close()
 
     def fetch_bytes(self, url: str, max_bytes: int) -> tuple[bytes, str | None]:
-        response = self._context.request.get(url, timeout=30_000, max_redirects=5)
+        response = self._context.request.get(
+            url,
+            timeout=self.attachment_timeout_ms,
+            max_redirects=5,
+            headers={"Accept": "application/octet-stream,*/*", "Referer": self.source_url},
+        )
         final_url = HandsFreeService._safe_url(response.url)
         if not HandsFreeService._same_domain(self.source_url, final_url):
             raise ValueError("attachment redirected outside the source domain")

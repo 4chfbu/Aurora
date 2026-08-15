@@ -4,6 +4,7 @@ import threading
 import time
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,11 @@ class ChallengeGroupRunner:
         self._event(session, group_id, None, "group.started", {})
         session.add(group)
         session.commit()
+        self._reactivate_waiting_inputs(session, group_id=group_id)
+
+        if min(int(group.max_concurrent or 1), max(1, get_settings().max_challenge_group_concurrent)) > 1:
+            self._run_concurrent(session, group_id=group_id, should_stop=should_stop, on_project=on_project)
+            return
 
         while True:
             if should_stop and should_stop():
@@ -82,8 +88,21 @@ class ChallengeGroupRunner:
                 self._write_done_marker(group_id)
                 return
 
-            active_phase = min(item.phase for item in unresolved)
-            candidates = [item for item in unresolved if item.phase == active_phase and item.fused_status == "PENDING"]
+            pending = [item for item in unresolved if item.fused_status == "PENDING"]
+            if not pending:
+                if any(item.fused_status == "WAITING_INPUT" for item in unresolved):
+                    group.status = "WAITING_INPUT"
+                    group.current_item_id = None
+                    group.updated_at = now_utc()
+                    session.add(group)
+                    self._event(session, group_id, None, "group.waiting_input", {"reason": "one or more challenges require external input"})
+                    session.commit()
+                    return
+                if any(item.fused_status == "RUNNING" for item in unresolved):
+                    return
+                raise RuntimeError("group has unresolved items but no runnable phase candidate")
+            active_phase = min(item.phase for item in pending)
+            candidates = [item for item in pending if item.phase == active_phase]
             deadline_fraction = self._deadline_fraction(group)
             if deadline_fraction is not None and deadline_fraction <= 0.03:
                 group.status = "STOPPED"
@@ -142,6 +161,21 @@ class ChallengeGroupRunner:
                 # whose statement explicitly says that no flag is required.
                 # They are terminal analysis tasks, not failed flag recovery.
                 outcome, reason = "NO_FLAG_COMPLETED", "statement_explicitly_requires_no_flag"
+            elif self._requires_target(project):
+                item.fused_status = "WAITING_INPUT"
+                item.status = "WAITING_INPUT"
+                item.stop_reason = "target_required_before_web_actions"
+                item.finished_at = None
+                project.status = "WAITING_INPUT"
+                project.updated_at = now_utc()
+                session.add(project)
+                self._event(session, group_id, item.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "target", "resume_when": "project.target_url is set"})
+                session.add(item)
+                group.current_item_id = None
+                group.updated_at = now_utc()
+                session.add(group)
+                session.commit()
+                continue
             elif project.status in {"COMPLETED", "FLAG_READY"}:
                 outcome, reason = "COMPLETED", "project_terminal"
             else:
@@ -153,21 +187,31 @@ class ChallengeGroupRunner:
                     stop_on_observer_escalate=True,
                 )
                 self._apply_phase_attempt_budget(session, project_id=project.id, phase=item.phase)
-                health = self.competition.ensure_environment(session, project_id=project.id)
+                environment_warning: str | None = None
+                try:
+                    health = self.competition.ensure_environment(session, project_id=project.id)
+                    if not health.available:
+                        environment_warning = health.reason or "environment_unavailable"
+                except Exception as exc:
+                    environment_warning = str(exc)[:1000] or type(exc).__name__
+                if environment_warning:
+                    self._event(
+                        session,
+                        group_id,
+                        item.id,
+                        "group.item.environment_unavailable",
+                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": True},
+                    )
+                self._maybe_fetch_hint(session, item=item, project=project)
                 task = self._task_payload(session, item=item, project=project)
-                if not health.available:
-                    outcome, reason = "STUCK", health.reason or "environment_unavailable"
+                self._event(session, group_id, item.id, "group.item.dispatched", {"project_id": project.id, "phase": item.phase, "hint_taken": item.hint_taken, "environment_warning": environment_warning})
+                session.commit()
+                result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
+                project = session.get(Project, project.id)
+                if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
+                    outcome, reason = ("COMPLETED" if project.status == "COMPLETED" else "CANDIDATE_READY"), result.reason
                 else:
-                    self._maybe_fetch_hint(session, item=item, project=project)
-                    task = self._task_payload(session, item=item, project=project)
-                    self._event(session, group_id, item.id, "group.item.dispatched", {"project_id": project.id, "phase": item.phase, "hint_taken": item.hint_taken})
-                    session.commit()
-                    result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
-                    project = session.get(Project, project.id)
-                    if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
-                        outcome, reason = ("COMPLETED" if project.status == "COMPLETED" else "CANDIDATE_READY"), result.reason
-                    else:
-                        outcome, reason = self._failure_outcome(result.status), result.reason
+                    outcome, reason = self._failure_outcome(result.status), result.reason
             self._resolve_phase(session, group=group, item=item, project=project, outcome=outcome, reason=reason)
             # An unavailable flag-submission API requires a human decision.
             # Leave the group paused instead of immediately redispatching the
@@ -175,6 +219,122 @@ class ChallengeGroupRunner:
             # solved).
             if item.fused_status == "AWAITING_MANUAL_VALIDATION":
                 return
+
+    def _run_concurrent(self, session: Session, *, group_id: str, should_stop: callable | None, on_project: callable | None) -> None:
+        """Run independent projects in bounded waves while preserving phase order."""
+        max_workers = min(max(1, int(session.get(ChallengeGroup, group_id).max_concurrent or 1)), max(1, get_settings().max_challenge_group_concurrent))
+        while True:
+            if should_stop and should_stop():
+                group = session.get(ChallengeGroup, group_id)
+                if group:
+                    group.status = "STOPPED"
+                    group.current_item_id = None
+                    group.updated_at = now_utc()
+                    session.add(group)
+                    self._event(session, group_id, None, "group.stopped", {"reason": "manual_stop"})
+                    session.commit()
+                return
+            group = session.get(ChallengeGroup, group_id)
+            if group is None:
+                raise ValueError("challenge group not found")
+            items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id).order_by(ChallengeGroupItem.position)).all()
+            unresolved = [item for item in items if item.fused_status not in {"COMPLETED", "FAILED"}]
+            if not unresolved:
+                group.status = "COMPLETED"
+                group.current_item_id = None
+                group.finished_at = now_utc()
+                group.updated_at = now_utc()
+                session.add(group)
+                self._event(session, group_id, None, "group.completed", {"terminal_items": len(items), "max_concurrent": max_workers})
+                session.commit()
+                self._write_done_marker(group_id)
+                return
+            pending = [item for item in unresolved if item.fused_status == "PENDING"]
+            if not pending:
+                if any(item.fused_status == "WAITING_INPUT" for item in unresolved):
+                    group.status = "WAITING_INPUT"
+                    group.current_item_id = None
+                    group.updated_at = now_utc()
+                    session.add(group)
+                    self._event(session, group_id, None, "group.waiting_input", {"reason": "one or more challenges require external input"})
+                    session.commit()
+                    return
+                return
+            active_phase = min(item.phase for item in pending)
+            candidates = [item for item in pending if item.phase == active_phase][:max_workers]
+            if not candidates:
+                if any(item.fused_status == "RUNNING" for item in unresolved):
+                    return
+                raise RuntimeError("group has unresolved items but no runnable phase candidate")
+            dispatch: list[tuple[str, int]] = []
+            for item in candidates:
+                item.status = "RUNNING"
+                item.fused_status = "RUNNING"
+                item.started_at = now_utc()
+                item.stop_reason = None
+                item.updated_at = now_utc()
+                phase_key = str(item.phase)
+                item.phase_attempts = {**item.phase_attempts, phase_key: int(item.phase_attempts.get(phase_key, 0)) + 1}
+                group.current_item_id = item.id
+                group.updated_at = now_utc()
+                session.add(item)
+                self._event(session, group_id, item.id, "group.item.started", {"project_id": item.project_id, "position": item.position, "phase": item.phase, "max_concurrent": max_workers})
+                dispatch.append((item.id, item.phase))
+                if on_project:
+                    on_project(item.project_id)
+            session.add(group)
+            session.commit()
+
+            def run_item(item_id: str) -> tuple[str, str, str]:
+                with Session(engine) as worker_session:
+                    current = worker_session.get(ChallengeGroupItem, item_id)
+                    current_group = worker_session.get(ChallengeGroup, group_id)
+                    project = worker_session.get(Project, current.project_id) if current else None
+                    if current is None or current_group is None:
+                        return item_id, "CRASHED", "group_item_missing"
+                    if project is None:
+                        outcome, reason = "CRASHED", "project_missing"
+                    elif self._is_explicit_no_flag_challenge(project):
+                        outcome, reason = "NO_FLAG_COMPLETED", "statement_explicitly_requires_no_flag"
+                    elif self._requires_target(project):
+                        current.fused_status = "WAITING_INPUT"
+                        current.status = "WAITING_INPUT"
+                        current.stop_reason = "target_required_before_web_actions"
+                        project.status = "WAITING_INPUT"
+                        project.updated_at = now_utc()
+                        worker_session.add(project)
+                        worker_session.add(current)
+                        self._event(worker_session, group_id, current.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "target"})
+                        worker_session.commit()
+                        return item_id, "WAITING_INPUT", "target_required_before_web_actions"
+                    elif project.status in {"COMPLETED", "FLAG_READY"}:
+                        outcome, reason = "COMPLETED", "project_terminal"
+                    else:
+                        self._apply_phase_attempt_budget(worker_session, project_id=project.id, phase=current.phase)
+                        warning = None
+                        try:
+                            health = self.competition.ensure_environment(worker_session, project_id=project.id)
+                            if not health.available:
+                                warning = health.reason or "environment_unavailable"
+                        except Exception as exc:
+                            warning = str(exc)[:1000]
+                        self._maybe_fetch_hint(worker_session, item=current, project=project)
+                        task = self._task_payload(worker_session, item=current, project=project)
+                        self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
+                        worker_session.commit()
+                        result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=AutoRunLimits(max_iterations=0, max_minutes=30 if current.phase == 1 else 60, no_progress_limit=0, stop_on_observer_escalate=True), should_stop=should_stop)
+                        project = worker_session.get(Project, project.id)
+                        outcome, reason = (("COMPLETED" if project and project.status == "COMPLETED" else "CANDIDATE_READY", result.reason) if project and project.status in {"COMPLETED", "FLAG_READY"} else (self._failure_outcome(result.status), result.reason))
+                    current_group = worker_session.get(ChallengeGroup, group_id)
+                    current = worker_session.get(ChallengeGroupItem, item_id)
+                    self._resolve_phase(worker_session, group=current_group, item=current, project=project, outcome=outcome, reason=reason)
+                    return item_id, outcome, reason
+
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"aurora-group-{group_id}") as pool:
+                futures = [pool.submit(run_item, item_id) for item_id, _ in dispatch]
+                for future in as_completed(futures):
+                    future.result()
+            session.expire_all()
 
     @staticmethod
     def _priority_key(item: ChallengeGroupItem) -> tuple[int, float, int, int]:
@@ -206,6 +366,30 @@ class ChallengeGroupRunner:
         ))
 
     @staticmethod
+    def _requires_target(project: Project) -> bool:
+        return (project.challenge_type or "").strip().lower() in {"web", "webapp", "web_app"} and not bool(project.target_url)
+
+    @classmethod
+    def _reactivate_waiting_inputs(cls, session: Session, *, group_id: str) -> None:
+        items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id, ChallengeGroupItem.fused_status == "WAITING_INPUT")).all()
+        changed = False
+        for item in items:
+            project = session.get(Project, item.project_id)
+            if project is not None and not cls._requires_target(project):
+                item.status = "PENDING"
+                item.fused_status = "PENDING"
+                item.stop_reason = "external_input_satisfied"
+                item.updated_at = now_utc()
+                if project.status == "WAITING_INPUT":
+                    project.status = "ACTIVE"
+                    project.updated_at = now_utc()
+                    session.add(project)
+                session.add(item)
+                changed = True
+        if changed:
+            session.commit()
+
+    @staticmethod
     def _apply_phase_attempt_budget(session: Session, *, project_id: str, phase: int) -> None:
         # A P1 phase has a 30 minute wall-clock budget.  Without a per-worker
         # cap, one Codex Harness request may consume the whole phase and leave
@@ -221,7 +405,17 @@ class ChallengeGroupRunner:
                 configured_seconds = int(configured) if configured is not None else cap_seconds
             except (TypeError, ValueError):
                 configured_seconds = cap_seconds
-            budget["hard_timeout_seconds"] = min(configured_seconds, cap_seconds)
+            budget["phase"] = phase
+            phase_defaults = {
+                1: (300, 420, 12, 2),
+                2: (480, 600, 20, 2),
+                3: (720, 900, 30, 3),
+            }.get(phase, (300, 420, 12, 2))
+            budget.setdefault("soft_timeout_seconds", phase_defaults[0])
+            budget["hard_timeout_seconds"] = min(configured_seconds, phase_defaults[1], cap_seconds)
+            budget.setdefault("max_agent_actions", phase_defaults[2])
+            budget.setdefault("max_route_repeats", phase_defaults[3])
+            budget.setdefault("finalize_grace_seconds", 60)
             intent.budget = budget
             intent.updated_at = now_utc()
             session.add(intent)
@@ -660,6 +854,80 @@ def recover_interrupted_groups(session: Session) -> list[str]:
     return sorted(recovered_groups)
 
 
+def recover_legacy_target_blocked_groups(session: Session) -> list[str]:
+    """Requeue groups failed by the removed target-verification preflight.
+
+    The legacy path failed before claiming an Intent, so a project with any
+    persisted Worker is deliberately excluded. This keeps the repair from
+    reopening genuine runtime failures that happened after Solver execution.
+    """
+    recovered_groups: set[str] = set()
+    failed_items = session.exec(
+        select(ChallengeGroupItem).where(
+            ChallengeGroupItem.fused_status == "FAILED",
+            ChallengeGroupItem.stop_reason == "runtime_error",
+        )
+    ).all()
+    for item in failed_items:
+        project = session.get(Project, item.project_id)
+        group = session.get(ChallengeGroup, item.group_id)
+        if project is None or group is None or project.target_verification_status == "VERIFIED":
+            continue
+        if session.exec(select(Worker).where(Worker.project_id == project.id)).first() is not None:
+            continue
+        history = list(item.failure_history or [])
+        if item.phase < 3 or not history or any(entry.get("reason") != "runtime_error" for entry in history):
+            continue
+        preflight_events = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project.id,
+                WorkerEvent.event_type == "worker.preflight_blocked",
+            )
+        ).all()
+        if not any(event.payload_json.get("kind") == "target" for event in preflight_events):
+            continue
+
+        item.status = "PENDING"
+        item.fused_status = "PENDING"
+        item.phase = 1
+        item.phase_attempts = {}
+        item.failure_history = []
+        item.stop_reason = "recovered_after_optional_target_migration"
+        item.started_at = None
+        item.finished_at = None
+        item.updated_at = now_utc()
+        project.status = "ACTIVE"
+        project.updated_at = now_utc()
+        group.status = "READY"
+        group.current_item_id = None
+        group.finished_at = None
+        group.updated_at = now_utc()
+        session.add(item)
+        session.add(project)
+        session.add(group)
+        session.add(
+            WorkerEvent(
+                project_id=project.id,
+                event_type="project.recovered_after_optional_target_migration",
+                payload_json={"group_id": group.id, "item_id": item.id, "solver_continues_without_target": True},
+            )
+        )
+        ChallengeGroupRunner._event(
+            session,
+            group.id,
+            item.id,
+            "group.item.recovered_after_optional_target_migration",
+            {"project_id": project.id, "new_status": "PENDING"},
+        )
+        recovered_groups.add(group.id)
+
+    session.commit()
+    for group_id in recovered_groups:
+        marker = Path(get_settings().artifact_dir) / "groups" / group_id / "done.flag"
+        marker.unlink(missing_ok=True)
+    return sorted(recovered_groups)
+
+
 def fail_group_run(session: Session, *, group_id: str, error: str) -> None:
     """Persist a runner failure without leaving its active item or lease live."""
     group = session.get(ChallengeGroup, group_id)
@@ -810,7 +1078,12 @@ class ChallengeGroupRegistry:
                 )
                 group = session.get(ChallengeGroup, state.group_id)
             with self._lock:
-                state.status = "stopped" if state.stop_requested or (group is not None and group.status == "STOPPED") else "completed"
+                if state.stop_requested or (group is not None and group.status == "STOPPED"):
+                    state.status = "stopped"
+                elif group is not None and group.status == "WAITING_INPUT":
+                    state.status = "waiting_input"
+                else:
+                    state.status = "completed"
                 state.current_project_id = None
                 state.finished_at = now_utc()
         except Exception as exc:

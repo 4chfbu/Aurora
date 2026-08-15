@@ -161,6 +161,10 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_DEFAULT_HARD_TIMEOUT_SECONDS` | `1800` | Intent 的硬超时预算，也用于 Codex Harness 的有效超时和 lease 计算。 |
 | `AURORA_DEFAULT_MAX_TOOL_CALLS` | `12` | 单次 Worker 最多执行的工具请求数。 |
 | `AURORA_DEFAULT_MAX_REPEAT_FAILURES` | `2` | 同一工具失败达到该次数后跳过后续重复请求。 |
+| `AURORA_DEFAULT_MAX_AGENT_ACTIONS` | `20` | Codex 内部 shell 动作预算；达到后进入结构化收尾。 |
+| `AURORA_DEFAULT_MAX_ROUTE_REPEATS` | `2` | 同一路线连续失败的 Observer 纠偏阈值。 |
+| `AURORA_DEFAULT_FINALIZE_GRACE_SECONDS` | `60` | 软截止后的收尾宽限时间。 |
+| `AURORA_MAX_CHALLENGE_GROUP_CONCURRENT` | `2` | 题目组并行项目的全局上限；单项目仍保持单 Worker。 |
 
 ### Hands-free Cataloger
 
@@ -177,6 +181,7 @@ Hands-free URL 导入优先使用平台适配器和浏览器已观察到的 JSON
 | `AURORA_CATALOGER_MAX_PAGES` | `20` | 从当前筛选页开始允许扫描的最大页数。 |
 | `AURORA_CATALOGER_MAX_CANDIDATES` | `500` | 单次导入最多保留的已验证候选数。 |
 | `AURORA_CATALOGER_MAX_RESPONSE_BYTES` | `2097152` | 单个同域 JSON 响应允许采集的最大字节数。 |
+| `AURORA_CATALOGER_ATTACHMENT_TIMEOUT_SECONDS` | `20` | 单个附件从连接到读取完成的硬超时；超时后转为人工处理，不阻塞整批导入。 |
 
 只有 API Key、Base URL 和模型都存在时，LLM/Agent 路径才算已配置。Agent 只能操作当前 DOM 中已观察到的控件，并拒绝登录、注册、提交答案/flag、启动题目环境和创建实例等动作。
 

@@ -125,7 +125,7 @@ class AutoRunnerService:
             if run_result.get("status") == "idle" and manager_decision.status == "NOOP":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)
-            if run_result.get("status") in {"runtime_error", "runtime_preflight_failed", "target_not_verified"}:
+            if run_result.get("status") in {"runtime_error", "runtime_preflight_failed"}:
                 self._event(session, project_id, "autorun.blocked", {"reason": "runtime_error", "iteration": iteration, "message": run_result.get("message")})
                 return AutoRunResult("blocked", "runtime_error", iteration, project_id, events)
             if limits.no_progress_limit > 0 and no_progress_count >= limits.no_progress_limit:

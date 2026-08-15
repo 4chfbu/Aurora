@@ -171,6 +171,8 @@ Container execution uses Docker/Podman `bridge` networking by default so authori
 AURORA_CONTAINER_NETWORK=none uv run uvicorn apps.api.main:app --reload
 ```
 
+An imported project does not require a live target to start solving. Workers continue with challenge text, attachments, and local analysis; a target can be discovered or manually supplied later, and every network request remains authorization-gated.
+
 ## Authorization Policy
 
 Semantic tools are checked against `AuthorizationScope` before command generation:

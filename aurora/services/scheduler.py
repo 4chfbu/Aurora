@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from aurora.models import Attempt, Intent, Project, Worker, WorkerEvent, now_utc, new_id
 from aurora.services.round_summary import RoundReflectionService
+from aurora.services.container_control import stop_worker_containers
 
 
 class Scheduler:
@@ -46,6 +47,20 @@ class Scheduler:
         # worker no longer owns the intent and must not overwrite the timeout
         # state (or a retry claimed by a newer worker).
         if intent.status != "RUNNING" or intent.lease_owner != worker.id or worker.status != "RUNNING":
+            return
+        # Publish a single concluding barrier before writing the terminal
+        # state. Reapers only claim RUNNING rows, so a late result cannot win
+        # after this transaction has acquired the barrier.
+        intent.status = "CONCLUDING"
+        worker.status = "CONCLUDING"
+        intent.updated_at = now_utc()
+        worker.updated_at = now_utc()
+        session.add(intent)
+        session.add(worker)
+        session.commit()
+        session.refresh(intent)
+        session.refresh(worker)
+        if intent.status != "CONCLUDING" or worker.status != "CONCLUDING":
             return
         intent.status = status
         intent.lease_owner = None
@@ -132,6 +147,7 @@ class Scheduler:
             if worker_id:
                 worker = session.get(Worker, worker_id)
                 if worker:
+                    cleanup = stop_worker_containers(worker_id)
                     worker.status = "TIMEOUT"
                     worker.lease = {}
                     worker.heartbeat = now_utc()
@@ -143,7 +159,7 @@ class Scheduler:
                             worker_id=worker_id,
                             intent_id=intent.id,
                             event_type="worker.timed_out",
-                            payload_json={"reason": "lease_expired", "status": "TIMEOUT"},
+                            payload_json={"reason": "lease_expired", "status": "TIMEOUT", "container_cleanup": cleanup},
                         )
                     )
                 running_attempts = session.exec(

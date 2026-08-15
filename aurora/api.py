@@ -46,6 +46,7 @@ from aurora.services.artifact_store import ArtifactStore
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.scheduler import Scheduler
 from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.services.blackboard_repository import route_fingerprint
 from aurora.services.observer import ObserverService
 from aurora.services.manager import ManagerService
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
@@ -57,7 +58,7 @@ from aurora.services.project_rethink import rethink_project
 from aurora.services.project_rethink_registry import project_rethink_registry
 from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_active_runtime_warnings
 from aurora.services.browser_sessions import browser_session_registry
-from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry
+from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry, recover_legacy_target_blocked_groups
 from aurora.services.project_deletion import ProjectDeletionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.target_verification import TargetVerificationService
@@ -238,8 +239,11 @@ def create_app() -> FastAPI:
             init_db()
             with Session(engine) as session:
                 load_network_proxy(session)
+                recovered_target_groups = recover_legacy_target_blocked_groups(session)
             settings.artifact_dir.mkdir(parents=True, exist_ok=True)
             challenge_group_registry.resume_interrupted_groups()
+            for group_id in recovered_target_groups:
+                challenge_group_registry.start(group_id)
             stop_reaper = Event()
 
             def reap_worker_leases() -> None:
@@ -392,13 +396,13 @@ def create_app() -> FastAPI:
                 batch_id=batch_id,
                 project_sources={project["project_id"]: project["challenge_url"] for project in projects if project.get("challenge_url")},
             )
-            verifier = TargetVerificationService()
             for project in projects:
                 if project["status"] == "created":
-                    verification = verifier.verify(session, project_id=project["project_id"], source_url=project.get("challenge_url"), source_metadata=project.get("source_metadata"))
-                    project["target_verification_status"] = verification.status
-                    project["target_verification_reason"] = verification.reason
-                    project["target_url"] = verification.target_url
+                    created = session.get(Project, project["project_id"])
+                    if created is not None:
+                        project["target_verification_status"] = created.target_verification_status
+                        project["target_verification_reason"] = created.target_verification_reason
+                        project["target_url"] = created.target_url
             group = session.get(ChallengeGroup, projects[0]["group_id"]) if projects else None
             return {"projects": projects, "group": group}
         except ValueError as exc:
@@ -831,6 +835,17 @@ def create_app() -> FastAPI:
         checkpoints = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at.desc())).all()
         events = session.exec(select(WorkerEvent).where(WorkerEvent.project_id == project_id).order_by(WorkerEvent.created_at.desc()).limit(200)).all()
         flag_candidates = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id).order_by(FlagCandidate.created_at.desc())).all()
+        codex_actions = [trace for trace in tool_traces if trace.tool_name == "codex.shell"]
+        route_counts: dict[str, int] = {}
+        for trace in codex_actions:
+            route = route_fingerprint(trace.request_json)
+            route_counts[route] = route_counts.get(route, 0) + 1
+        repeated_actions = sum(count - 1 for count in route_counts.values() if count > 1)
+        first_checkpoint_seconds = None
+        if checkpoints and attempts:
+            first_checkpoint_seconds = max(0, int((checkpoints[-1].created_at - attempts[-1].started_at).total_seconds()))
+        finalization_started = sum(1 for event in events if event.event_type == "attempt.finalization_started")
+        checkpoint_created = sum(1 for event in events if event.event_type in {"attempt.checkpoint_created", "checkpoint.saved"})
         return {
             "project": project,
             "counts": {
@@ -845,6 +860,14 @@ def create_app() -> FastAPI:
                 "checkpoints": len(checkpoints),
                 "events_returned": len(events),
                 "flag_candidates": len(flag_candidates),
+            },
+            "execution_metrics": {
+                "effective_action_count": len(tool_traces),
+                "codex_action_count": len(codex_actions),
+                "repeated_route_rate": (repeated_actions / len(codex_actions)) if codex_actions else 0.0,
+                "first_checkpoint_seconds": first_checkpoint_seconds,
+                "finalizer_success_rate": (checkpoint_created / finalization_started) if finalization_started else None,
+                "evidence_increment": sum(1 for event in events if event.event_type in {"fact.created", "artifact.created", "checkpoint.saved"}),
             },
             "findings": findings,
             "flag_candidates": flag_candidates,

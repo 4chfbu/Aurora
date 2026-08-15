@@ -6,10 +6,10 @@ import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import Settings
-from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent
-from aurora.services.hands_free import HandsFreeService
+from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
+from aurora.services.hands_free import MAX_ATTACHMENT_BYTES, HandsFreeService
 from aurora.services.challenge_group_runner import ChallengeGroupRegistry, ChallengeGroupRunner, GroupRunState
-from aurora.services.challenge_group_runner import fail_group_run, recover_interrupted_groups
+from aurora.services.challenge_group_runner import fail_group_run, recover_interrupted_groups, recover_legacy_target_blocked_groups
 from aurora.services.harvester_runner import HarvesterResult
 
 
@@ -282,7 +282,11 @@ def test_hands_free_stages_same_domain_attachments_and_confirms_projects(tmp_pat
         assert scope.allowed_hosts == []
         import_fact = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.category == "import")).one()
         assert "catalog.example" not in import_fact.statement
-        assert "explicitly discovered target" in import_fact.statement
+        assert "Continue local analysis without a target" in import_fact.statement
+        imported_project = session.get(Project, project_id)
+        assert imported_project is not None
+        assert imported_project.target_verification_status == "UNVERIFIED"
+        assert "可继续分析题目与附件" in (imported_project.target_verification_reason or "")
         repeated = service.confirm(session, result.batch.id, [candidate.id for candidate in result.candidates])
         assert {item["status"] for item in repeated} == {"existing"}
 
@@ -390,6 +394,54 @@ def test_challenge_group_runs_phase_waves_before_marking_final_failure() -> None
         assert [(item.phase, item.fused_status, item.status) for item in items] == [(3, "FAILED", "FAILED"), (3, "FAILED", "FAILED")]
         assert all(item.hint_taken and item.hint_content == "platform hint" for item in items)
         assert phase_events == [1, 1, 2, 2, 3, 3]
+
+
+def test_unavailable_target_environment_warns_but_still_dispatches_solver() -> None:
+    calls: list[dict] = []
+
+    class RecordingHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            calls.append(task)
+            return HarvesterResult(status="FAILED", reason="analysis_incomplete")
+
+    class UnavailableEnvironmentAdapter:
+        def ensure_environment(self, session, *, project_id):
+            from aurora.services.competition_adapter import EnvironmentHealth
+            return EnvironmentHealth(False, "target instance is not available")
+
+        def close_environment(self, *, project_id):
+            return None
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+        def submit_flag(self, session, *, project_id, value):
+            return None
+
+    with Session(service_session_engine()) as session:
+        project = Project(name="offline-target", goal="Analyze the imported attachment.")
+        group = ChallengeGroup(name="optional-target")
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1)
+        session.add(item)
+        session.commit()
+
+        ChallengeGroupRunner(
+            harvester=RecordingHarvester(),
+            competition=UnavailableEnvironmentAdapter(),
+        ).run(session, group_id=group.id)
+
+        warnings = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.item.environment_unavailable",
+            )
+        ).all()
+        assert len(calls) == 3
+        assert all(call["target"] is None for call in calls)
+        assert len(warnings) == 3
+        assert all(event.payload_json["solver_continues"] is True for event in warnings)
 
 
 def test_competition_flag_rejection_reopens_project_with_worker_feedback() -> None:
@@ -573,6 +625,55 @@ def test_recover_interrupted_group_requeues_its_running_item() -> None:
         assert group.current_item_id is None
 
 
+def test_recover_legacy_target_blocked_group_is_scoped_and_idempotent() -> None:
+    with Session(service_session_engine()) as session:
+        project = Project(
+            name="legacy-target-block",
+            goal="analyze offline",
+            status="FAILED",
+            target_verification_status="UNVERIFIED",
+        )
+        group = ChallengeGroup(name="legacy-target-block", status="COMPLETED", finished_at=now_utc())
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            status="FAILED",
+            fused_status="FAILED",
+            phase=3,
+            phase_attempts={"1": 1, "2": 1, "3": 1},
+            failure_history=[
+                {"phase": 1, "outcome": "FAILED", "reason": "runtime_error"},
+                {"phase": 2, "outcome": "FAILED", "reason": "runtime_error"},
+            ],
+            stop_reason="runtime_error",
+            finished_at=now_utc(),
+        )
+        session.add_all([
+            item,
+            Intent(project_id=project.id, objective="bootstrap", status="PENDING"),
+            WorkerEvent(
+                project_id=project.id,
+                event_type="worker.preflight_blocked",
+                payload_json={"kind": "target", "status": "UNVERIFIED"},
+            ),
+        ])
+        session.commit()
+
+        assert recover_legacy_target_blocked_groups(session) == [group.id]
+        assert recover_legacy_target_blocked_groups(session) == []
+        session.refresh(project)
+        session.refresh(group)
+        session.refresh(item)
+
+        assert project.status == "ACTIVE"
+        assert group.status == "READY" and group.finished_at is None
+        assert item.status == item.fused_status == "PENDING"
+        assert item.phase == 1 and item.failure_history == [] and item.phase_attempts == {}
+
+
 def test_group_runner_failure_requeues_active_item_and_releases_worker(monkeypatch) -> None:
     monkeypatch.setattr("aurora.services.challenge_group_runner.stop_project_containers", lambda _project_id: [])
     with Session(service_session_engine()) as session:
@@ -731,6 +832,171 @@ def test_non_login_html_response_is_not_staged_as_attachment(tmp_path: Path) -> 
         candidate = result.candidates[0]
         assert candidate.staged_attachments_json == []
         assert candidate.external_attachments_json[0]["status"] == "download_failed"
+
+
+def test_stalled_attachment_does_not_block_the_import_batch(tmp_path: Path) -> None:
+    def fetch_text(url: str) -> tuple[str, str]:
+        if url == "https://catalog.example/tasks":
+            return "<a href='/tasks/42'>Challenge 42</a>", url
+        return "<a href='/files/challenge.zip'>download</a>", url
+
+    def stalled_fetch_bytes(_: str, __: int) -> tuple[bytes, str | None]:
+        time.sleep(5)
+        return b"late attachment", "application/zip"
+
+    service = HandsFreeService(
+        settings=Settings(
+            artifact_dir=tmp_path,
+            cataloger_llm_api_key="test-key",
+            cataloger_attachment_timeout_seconds=1,
+        ),
+        fetch_text=fetch_text,
+        fetch_bytes=stalled_fetch_bytes,
+        cataloger=lambda _: {"summary": "", "candidates": [{"title": "Challenge 42", "challenge_url": "https://catalog.example/tasks/42", "attachment_urls": [], "confidence": 1}]},
+        ctfplus_attachment_collector=lambda _candidates, _cookie: None,
+    )
+    started = time.monotonic()
+    with Session(service_session_engine()) as session:
+        result = service.scan(session, "https://catalog.example/tasks")
+        batch_status = result.batch.status
+        staged = result.candidates[0].staged_attachments_json
+        issue = result.candidates[0].external_attachments_json[0]
+
+    assert time.monotonic() - started < 2
+    assert batch_status == "READY"
+    assert staged == []
+    assert issue["status"] == "download_failed"
+    assert issue["reason"] == "attachment download timed out after 1 seconds"
+
+
+def test_browser_download_remote_fallback_uses_a_bounded_request(tmp_path: Path) -> None:
+    class FakeDownload:
+        url = "https://catalog.example/files/challenge.zip"
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        def path(self) -> Path:
+            raise AssertionError("download.path() must not be used")
+
+    class FakeResponse:
+        url = "https://cdn.example/challenge.zip"
+        ok = True
+        status = 200
+        headers = {"content-type": "application/zip", "content-length": "7"}
+
+        @staticmethod
+        def body() -> bytes:
+            return b"zipdata"
+
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int, int]] = []
+
+        def get(self, url: str, *, timeout: int, max_redirects: int, headers: dict[str, str]) -> FakeResponse:
+            assert headers == {"Accept": "application/octet-stream,*/*"}
+            self.calls.append((url, timeout, max_redirects))
+            return FakeResponse()
+
+    request = FakeRequest()
+    context = type("FakeContext", (), {"request": request})()
+    download = FakeDownload()
+    service = HandsFreeService(settings=Settings(artifact_dir=tmp_path, cataloger_attachment_timeout_seconds=3))
+
+    data, mime_type, source_url = service._read_browser_download(context, download)
+
+    assert download.cancelled
+    assert len(request.calls) == 1
+    assert request.calls[0][0] == download.url
+    assert 2_900 <= request.calls[0][1] <= 3_000
+    assert request.calls[0][2] == 5
+    assert (data, mime_type, source_url) == (b"zipdata", "application/zip", FakeResponse.url)
+
+
+def test_browser_download_preserves_original_one_shot_artifact(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "playwright-download"
+    artifact_path.write_bytes(b"one-shot-data")
+
+    class FakeDownload:
+        url = "blob:https://catalog.example/one-shot"
+        suggested_filename = "challenge.zip"
+        _impl_obj = type("Impl", (), {"_artifact": type("Artifact", (), {"absolute_path": str(artifact_path)})()})()
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        def path(self) -> Path:
+            raise AssertionError("download.path() must not be used")
+
+    class RejectRequest:
+        @staticmethod
+        def get(*_args, **_kwargs):
+            raise AssertionError("a completed original download must not be replayed")
+
+    context = type("FakeContext", (), {"request": RejectRequest()})()
+    download = FakeDownload()
+    service = HandsFreeService(settings=Settings(artifact_dir=tmp_path, cataloger_attachment_timeout_seconds=1))
+
+    data, mime_type, source_url = service._read_browser_download(context, download)
+
+    assert not download.cancelled
+    assert (data, mime_type, source_url) == (b"one-shot-data", "application/zip", download.url)
+
+
+def test_direct_attachment_download_retries_transient_failures_with_referer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeHeaders(dict[str, str]):
+        @staticmethod
+        def get_content_type() -> str:
+            return "application/zip"
+
+    class FakeResponse:
+        headers = FakeHeaders({"Content-Length": "7"})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        @staticmethod
+        def geturl() -> str:
+            return "https://catalog.example/files/challenge.zip"
+
+        @staticmethod
+        def read(_: int) -> bytes:
+            return b"zipdata"
+
+    class FakeOpener:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def open(self, request, *, timeout: int):
+            assert timeout == 2
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise OSError("connection reset")
+            return FakeResponse()
+
+    opener = FakeOpener()
+    monkeypatch.setattr("aurora.services.hands_free.build_opener", lambda *_args: opener)
+    service = HandsFreeService(settings=Settings(artifact_dir=tmp_path, cataloger_attachment_timeout_seconds=2))
+
+    data, mime_type = service._fetch_bytes(
+        "https://catalog.example/files/challenge.zip",
+        MAX_ATTACHMENT_BYTES,
+        referer="https://catalog.example/tasks/42",
+    )
+
+    assert len(opener.requests) == 2
+    assert opener.requests[0].get_header("Referer") == "https://catalog.example/tasks/42"
+    assert opener.requests[0].get_header("Accept") == "application/octet-stream,*/*"
+    assert (data, mime_type) == (b"zipdata", "application/zip")
 
 
 def service_session_engine():

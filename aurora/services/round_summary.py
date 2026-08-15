@@ -18,7 +18,7 @@ from aurora.services.mcp_registry import visible_mcp_tools
 class RoundReflectionService:
     """Reflect on a primary solver round and author its follow-up intents."""
 
-    def create(self, session: Session, *, attempt: Attempt, output: dict[str, Any], budget: dict[str, Any]) -> AttemptCheckpoint:
+    def create(self, session: Session, *, attempt: Attempt, output: dict[str, Any], budget: dict[str, Any], skip_planner: bool = False) -> AttemptCheckpoint:
         existing = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.attempt_id == attempt.id)).first()
         if existing is not None:
             return existing
@@ -29,7 +29,7 @@ class RoundReflectionService:
             .order_by(AttemptCheckpoint.created_at.desc())
         ).first()
         fallback = self._fallback(session=session, attempt=attempt, output=output, facts=facts, budget=budget)
-        planned = self._planner_summary(fallback)
+        planned = None if skip_planner else self._planner_summary(fallback)
         data = planned or fallback
         # Timeout recovery is operational control data. Preserve it when the
         # reflection model returns prose without a runnable continuation.
@@ -117,6 +117,12 @@ class RoundReflectionService:
         active_facts = session.exec(
             select(Fact).where(Fact.project_id == attempt.project_id, Fact.status == "ACTIVE").limit(25)
         ).all()
+        blockers = output.get("blockers") if isinstance(output.get("blockers"), list) else []
+        blocker_steps = [
+            str(item.get("next_step") or item.get("reason") or "").strip()
+            for item in blockers[:4]
+            if isinstance(item, dict) and str(item.get("next_step") or item.get("reason") or "").strip()
+        ]
         return {
             "project_goal": project.goal if project else None,
             "current_intent": {
@@ -129,7 +135,7 @@ class RoundReflectionService:
             "conclusions": fact_lines[:8],
             "hypotheses": [self._text(item) for item in output.get("hypotheses", [])[:6]],
             "failed_routes": [self._text(item) for item in output.get("failed_attempts", [])[:6]],
-            "next_steps": self._next_steps(output),
+            "next_steps": list(dict.fromkeys([*self._next_steps(output), *blocker_steps]))[:6],
             "intents": output.get("suggested_intents", []) if isinstance(output.get("suggested_intents"), list) else [],
             "active_facts": [
                 {"id": fact.id, "statement": fact.statement, "evidence_items": fact.evidence_items}
@@ -254,7 +260,7 @@ class RoundReflectionService:
         model_role = raw_budget.get("model_role")
         if model_role in {"solver", "planner"}:
             budget["model_role"] = model_role
-        for key in ("soft_timeout_seconds", "hard_timeout_seconds", "max_tool_calls", "token_budget"):
+        for key in ("soft_timeout_seconds", "hard_timeout_seconds", "max_tool_calls", "max_agent_actions", "max_route_repeats", "finalize_grace_seconds", "token_budget"):
             value = raw_budget.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 budget[key] = value

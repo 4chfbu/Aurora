@@ -6,7 +6,7 @@ import threading
 from sqlmodel import Session, select
 
 from aurora.db import engine
-from aurora.models import Attempt, AuthorizationScope, DiscoveredTarget, Hint, ImportCandidate, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
+from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
 from aurora.config import get_settings
 from aurora.services.blackboard_repository import BlackboardRepository, route_fingerprint
 from aurora.services.browser_sessions import browser_session_registry
@@ -24,14 +24,27 @@ from aurora.services.tool_profiles import worker_preflight
 def _execution_budget(intent: object) -> dict:
     settings = get_settings()
     raw = getattr(intent, "budget", {}) or {}
-    return {
+    phase = int(raw.get("phase", 1) or 1)
+    phase_defaults = {
+        1: {"soft_timeout_seconds": 300, "hard_timeout_seconds": 420, "max_agent_actions": 12, "max_route_repeats": 2},
+        2: {"soft_timeout_seconds": 480, "hard_timeout_seconds": 600, "max_agent_actions": 20, "max_route_repeats": 2},
+        3: {"soft_timeout_seconds": 720, "hard_timeout_seconds": 900, "max_agent_actions": 30, "max_route_repeats": 3},
+    }.get(phase, {})
+    budget = {
         **raw,
         "model_role": raw.get("model_role", "solver"),
-        "soft_timeout_seconds": int(raw.get("soft_timeout_seconds", settings.default_soft_timeout_seconds)),
-        "hard_timeout_seconds": int(raw.get("hard_timeout_seconds", settings.default_hard_timeout_seconds)),
+        "phase": phase,
+        "soft_timeout_seconds": int(raw.get("soft_timeout_seconds", phase_defaults.get("soft_timeout_seconds", settings.default_soft_timeout_seconds))),
+        "hard_timeout_seconds": int(raw.get("hard_timeout_seconds", phase_defaults.get("hard_timeout_seconds", settings.default_hard_timeout_seconds))),
         "max_tool_calls": int(raw.get("max_tool_calls", settings.default_max_tool_calls)),
         "max_repeat_failures": int(raw.get("max_repeat_failures", settings.default_max_repeat_failures)),
+        "max_agent_actions": int(raw.get("max_agent_actions", phase_defaults.get("max_agent_actions", settings.default_max_agent_actions))),
+        "max_route_repeats": int(raw.get("max_route_repeats", phase_defaults.get("max_route_repeats", settings.default_max_route_repeats))),
+        "finalize_grace_seconds": int(raw.get("finalize_grace_seconds", settings.default_finalize_grace_seconds)),
     }
+    if budget["hard_timeout_seconds"] <= budget["soft_timeout_seconds"]:
+        budget["hard_timeout_seconds"] = budget["soft_timeout_seconds"] + max(60, budget["finalize_grace_seconds"])
+    return budget
 
 
 def _lease_seconds_for_intent(intent: object) -> int:
@@ -134,20 +147,6 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         return {"status": "project_completed", "message": "project is already completed"}
     if project is None:
         return {"status": "project_missing", "message": "project not found"}
-
-    has_target_workflow = bool(
-        session.exec(select(ImportCandidate).where(ImportCandidate.project_id == project_id)).first()
-        or session.exec(select(DiscoveredTarget).where(DiscoveredTarget.project_id == project_id)).first()
-    )
-    if has_target_workflow and project.target_verification_status != "VERIFIED":
-        payload = {
-            "status": project.target_verification_status,
-            "reason": project.target_verification_reason,
-            "target_url": project.target_url,
-        }
-        session.add(WorkerEvent(project_id=project_id, event_type="worker.preflight_blocked", payload_json={"kind": "target", **payload}))
-        session.commit()
-        return {"status": "target_not_verified", "message": project.target_verification_reason or "target is not verified", "target": payload}
 
     preflight = worker_preflight(get_settings(), project.challenge_type)
     session.add(WorkerEvent(project_id=project_id, event_type="worker.preflight", payload_json=preflight))
@@ -322,9 +321,22 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         session.commit()
     max_tool_calls = worker.budgets["max_tool_calls"]
     max_repeat_failures = worker.budgets["max_repeat_failures"]
+    max_agent_actions = int(worker.budgets.get("max_agent_actions", 0) or 0)
+    internal_action_count = len(session.exec(select(ToolTrace).where(ToolTrace.attempt_id == attempt.id, ToolTrace.tool_name == "codex.shell")).all())
     skipped_tools = 0
     raw_tool_requests = structured.get("tool_requests", [])
     valid_tool_requests = [item for item in raw_tool_requests if isinstance(item, dict)] if isinstance(raw_tool_requests, list) else []
+    if max_agent_actions and internal_action_count >= max_agent_actions:
+        valid_tool_requests = []
+        session.add(WorkerEvent(
+            project_id=project_id,
+            worker_id=worker.id,
+            intent_id=intent.id,
+            attempt_id=attempt.id,
+            event_type="attempt.finalization_started",
+            payload_json={"reason": "max_agent_actions", "observed": internal_action_count, "budget": max_agent_actions},
+        ))
+        session.commit()
     # Verification is a post-solver gate, not another exploratory action.
     # Run it first so a valid derivation cannot be dropped merely because the
     # model also returned enough ordinary requests to fill the tool budget.
@@ -338,7 +350,9 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
             tool_name=tool_name,
             request=request,
         )
-        if repeat_failures >= max_repeat_failures:
+        route_repeat_budget = int(worker.budgets.get("max_route_repeats", max_repeat_failures) or max_repeat_failures)
+        repeat_limit = min(max_repeat_failures, route_repeat_budget) if max_repeat_failures and route_repeat_budget else max(max_repeat_failures, route_repeat_budget)
+        if repeat_failures >= repeat_limit:
             skipped_tools += 1
             summary = f"skipped repeated failed route after {repeat_failures} failure(s)"
             tool_calls.append({
@@ -435,6 +449,17 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     if not scheduler.owns_active_lease(session, intent=intent, worker=worker):
         # A background reaper already made the authoritative timeout decision.
         # Do not let a late runtime result create facts or overwrite its state.
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                event_type="attempt.late_output_discarded",
+                payload_json={"llm_trace_id": runtime_output.llm_trace.id, "tool_call_count": len(tool_calls), "reason": "lease_no_longer_owned"},
+            )
+        )
+        session.commit()
         return {
             "status": "timeout",
             "message": "worker lease expired before result publication",
@@ -450,7 +475,14 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     if candidate_flags:
         structured.setdefault("candidate_flags", []).extend(candidate_flags)
     ResultProcessor().apply(session, attempt=attempt, output=structured, llm_trace=runtime_output.llm_trace)
-    checkpoint = RoundReflectionService().create(session, attempt=attempt, output=structured, budget=worker.budgets)
+    terminal_project = session.get(Project, project_id)
+    checkpoint = RoundReflectionService().create(
+        session,
+        attempt=attempt,
+        output=structured,
+        budget=worker.budgets,
+        skip_planner=bool(terminal_project and terminal_project.status in {"COMPLETED", "FLAG_READY"}),
+    )
     estimated_tokens = runtime_output.llm_trace.estimated_input_tokens + runtime_output.llm_trace.estimated_output_tokens
     token_budget = worker.budgets.get("token_budget")
     if token_budget and estimated_tokens > int(token_budget):

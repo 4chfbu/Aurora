@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
 from sqlmodel import Session, select
 
-from aurora.models import AttemptCheckpoint, Hint, Intent, WorkerEvent
+from aurora.models import AttemptCheckpoint, Hint, ImportCandidate, Intent, Project, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
 
 
@@ -24,6 +25,7 @@ class ManagerDecision:
 class ManagerService:
     def run_project(self, session: Session, *, project_id: str) -> ManagerDecision:
         repository = BlackboardRepository()
+        project = session.get(Project, project_id)
         hints = session.exec(
             select(Hint).where(Hint.project_id == project_id, Hint.consumed == False).order_by(Hint.created_at)  # noqa: E712
         ).all()
@@ -52,22 +54,15 @@ class ManagerService:
                     }
                 )
             else:
+                objective, capabilities, tool_request = self._intent_for_local_challenge(session, project=project, hint=hint.content)
                 result = repository.upsert_intent(
                     session,
                     project_id=project_id,
-                    objective=f"Review user hint and identify the next concrete action: {hint.content[:160]}",
-                    capability_tags=["sandbox.exec"],
-                    priority=1.2,
+                    objective=objective,
+                    capability_tags=capabilities,
+                    priority=1.8,
                     risk_level="low",
-                    budget={
-                        "model_role": "planner",
-                        "max_tool_calls": 3,
-                        "tool_request": {
-                            "command": "printf 'Manager queued a non-URL hint for review.\\n'",
-                            "cwd": ".",
-                            "timeout_seconds": 5,
-                        }
-                    },
+                    budget={"model_role": "solver", "max_tool_calls": 3, **({"tool_request": tool_request} if tool_request else {})},
                 )
                 hint.consumed = True
                 session.add(hint)
@@ -90,16 +85,22 @@ class ManagerService:
                 (str(step).strip() for step in (checkpoint.next_steps if checkpoint else []) if str(step).strip()),
                 "Inspect current project evidence and produce the next evidence-backed result.",
             )
+            failed_route = next(
+                (str(route).strip() for route in (checkpoint.failed_routes if checkpoint else []) if str(route).strip()),
+                "",
+            )
+            route_hint = f" Do not repeat failed route {hashlib.sha256(failed_route.encode()).hexdigest()[:12]}." if failed_route else ""
             result = repository.upsert_intent(
                 session,
                 project_id=project_id,
-                objective=f"Continue from the latest checkpoint: {next_step[:500]}",
-                capability_tags=["sandbox.exec", "blackboard.query"],
+                objective=f"Continue from the latest checkpoint with exactly one evidence-backed next step: {next_step[:500]}.{route_hint}",
+                capability_tags=self._continuation_capabilities(checkpoint),
                 priority=0.8,
                 risk_level="low",
                 budget={
-                    "model_role": "planner",
+                    "model_role": "solver",
                     "max_tool_calls": 3,
+                    **({"failed_route_fingerprint": hashlib.sha256(failed_route.encode()).hexdigest()[:16]} if failed_route else {}),
                 },
             )
             proposed.append({"intent_id": result.item.id, "created": result.created, "objective": result.item.objective})
@@ -115,6 +116,37 @@ class ManagerService:
         )
         session.commit()
         return ManagerDecision(status=status, reason=reason, proposed_intents=proposed)
+
+    def _intent_for_local_challenge(self, session: Session, *, project: Project | None, hint: str) -> tuple[str, list[str], dict[str, Any] | None]:
+        challenge_type = (project.challenge_type if project else "") or "generic"
+        kind = challenge_type.lower()
+        attachments: list[dict[str, Any]] = []
+        candidate = session.exec(select(ImportCandidate).where(ImportCandidate.project_id == project.id).order_by(ImportCandidate.created_at.desc())).first() if project else None
+        if candidate is not None:
+            attachments = [*candidate.staged_attachments_json, *candidate.external_attachments_json]
+        names = [str(item.get("filename") or item.get("name") or item.get("path") or "") for item in attachments if isinstance(item, dict)]
+        attachment_note = f" Available attachments: {', '.join(name for name in names if name)[:500]}." if names else ""
+        playbooks = {
+            "reverse": ("Identify the attached binary, inspect protections and entry points, then use aurora_reverse to locate the validation path." + attachment_note, ["binary.inspect", "sandbox.exec"]),
+            "crypto": ("Inventory the attached data and identify encoding, key material, and algebraic structure before writing a reproducible verifier." + attachment_note, ["python.analyze", "sandbox.exec"]),
+            "forensics": ("Identify the attached evidence formats, preserve hashes, and extract the highest-signal metadata or embedded payloads." + attachment_note, ["forensic.inspect", "sandbox.exec"]),
+            "pwn": ("Inspect the attached executable and identify architecture, mitigations, and the first controllable input before attempting exploitation." + attachment_note, ["binary.inspect", "sandbox.exec"]),
+            "web": ("Use the supplied web context to map the application surface and identify the next authorized request; a target is required for network actions." + attachment_note, ["blackboard.query", "http.request"]),
+        }
+        objective, capabilities = next((value for key, value in playbooks.items() if key in kind), (f"Inspect the supplied challenge evidence and perform the first concrete local analysis step.{attachment_note}", ["blackboard.query", "sandbox.exec"]))
+        objective = f"{objective} Operator hint: {hint[:500]}"
+        return objective, capabilities, None
+
+    @staticmethod
+    def _continuation_capabilities(checkpoint: AttemptCheckpoint | None) -> list[str]:
+        text = " ".join((checkpoint.next_steps if checkpoint else []) or []).lower()
+        if any(token in text for token in ("binary", "逆向", "elf", "disassemble")):
+            return ["binary.inspect", "sandbox.exec"]
+        if any(token in text for token in ("http", "web", "request", "靶机")):
+            return ["http.request", "blackboard.query"]
+        if any(token in text for token in ("python", "decode", "crypto", "解码")):
+            return ["python.analyze", "sandbox.exec"]
+        return ["blackboard.query", "sandbox.exec"]
 
     def _extract_url(self, content: str) -> str | None:
         match = URL_PATTERN.search(content)

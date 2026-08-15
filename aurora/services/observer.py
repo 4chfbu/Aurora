@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from aurora.models import Attempt, ToolTrace, WorkerEvent
+from aurora.models import Artifact, Attempt, AttemptCheckpoint, Fact, ToolTrace, Worker, WorkerEvent
 from aurora.services.blackboard_repository import route_fingerprint
 
 
@@ -26,7 +26,12 @@ class ObserverService:
             select(Attempt).where(Attempt.project_id == project_id).order_by(Attempt.started_at.desc()).limit(5)
         ).all()
 
-        decision = self._find_policy_denial(tool_traces) or self._find_duplicate_tool_call(tool_traces) or self._find_no_evidence_attempt(attempts)
+        decision = (
+            self._find_policy_denial(tool_traces)
+            or self._find_route_budget(session, project_id, tool_traces)
+            or self._find_duplicate_tool_call(tool_traces)
+            or self._find_no_evidence_attempt(attempts)
+        )
         if decision is None:
             decision = ObserverDecision("CONTINUE", "No immediate repetition, authorization, or evidence issue detected.")
 
@@ -44,6 +49,39 @@ class ObserverService:
         )
         session.commit()
         return decision
+
+    def _find_route_budget(self, session: Session, project_id: str, tool_traces: list[ToolTrace]) -> ObserverDecision | None:
+        codex = [trace for trace in tool_traces if trace.tool_name == "codex.shell"]
+        worker = session.exec(select(Worker).where(Worker.project_id == project_id).order_by(Worker.created_at.desc())).first()
+        budget = worker.budgets if worker else {}
+        max_actions = int((budget or {}).get("max_agent_actions", 0) or 0)
+        if max_actions and len(codex) >= max_actions:
+            return ObserverDecision(
+                "STOP",
+                f"Codex internal action budget exhausted ({len(codex)}/{max_actions}); finalize from the latest evidence.",
+                severity="high",
+                references={"action_count": len(codex), "max_agent_actions": max_actions},
+            )
+        if len(codex) >= 2:
+            fingerprints = [route_fingerprint(trace.request_json) for trace in codex]
+            latest = fingerprints[0]
+            streak = 0
+            for fingerprint, trace in zip(fingerprints, codex):
+                if fingerprint != latest:
+                    break
+                if trace.exit_code not in (None, 0):
+                    streak += 1
+                else:
+                    break
+            max_repeats = int((budget or {}).get("max_route_repeats", 2) or 2)
+            if streak >= max_repeats:
+                return ObserverDecision(
+                    "REDIRECT",
+                    "The same failing Codex shell route repeated; conclude or choose a materially different route.",
+                    severity="high",
+                    references={"route_fingerprint": latest, "failed_streak": streak, "max_route_repeats": max_repeats},
+                )
+        return None
 
     def _find_policy_denial(self, tool_traces: list[ToolTrace]) -> ObserverDecision | None:
         for trace in tool_traces:
