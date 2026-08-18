@@ -29,6 +29,14 @@ cp .env.example .env
 
 See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the complete environment-variable reference, runtime matrix, and deployment notes.
 
+After configuring `.env`, start the complete stack with one command:
+
+```bash
+./start.sh
+```
+
+The script reuses current Worker, OpenVPN, and CC Switch images, builds only missing or outdated images, installs dependencies when needed, builds the Web UI, starts the private runtime, and serves Aurora on port `8000`. Use `./start.sh --rebuild` to force image rebuilds.
+
 Target runtime: Solver Worker runs inside Codex Harness:
 
 ```bash
@@ -98,6 +106,7 @@ Useful endpoints:
 - `GET /api/artifacts/{artifact_id}/content`
 - `GET /api/projects/{project_id}/findings`
 - `GET /api/projects/{project_id}/summary`
+- `GET /api/projects/{project_id}/reliability`
 - `POST /api/projects/{project_id}/tools/{tool_name}/execute`
 - `POST /api/projects/{project_id}/observer/run`
 - `POST /api/projects/{project_id}/manager/run`

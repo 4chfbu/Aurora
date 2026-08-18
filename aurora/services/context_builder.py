@@ -108,6 +108,7 @@ class ContextBuilder:
                 "phase": group_item.phase,
                 "attachments": list((group_item.competition_meta or {}).get("attachments", [])),
                 "target": project.target_url,
+                "targets": list((group_item.competition_meta or {}).get("container_addr", [])) if isinstance((group_item.competition_meta or {}).get("container_addr"), list) else ([project.target_url] if project.target_url else []),
                 "hint": group_item.hint_content,
                 "previous_attempts": list(group_item.failure_history),
             } if group_item else None,

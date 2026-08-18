@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import json
+import logging
 from threading import Event, Lock, Thread
 import time
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,7 +17,7 @@ from sqlmodel import Session, select
 from pathlib import Path
 
 from aurora.config import get_settings
-from aurora.db import engine, get_session, init_db
+from aurora.db import SCHEMA_VERSION, engine, get_session, init_db
 from aurora.models import (
     Artifact,
     Attempt,
@@ -65,6 +66,12 @@ from aurora.services.target_verification import TargetVerificationService
 from aurora.services.target_management import TargetManagementService
 from aurora.services.network_proxy import load_network_proxy, network_proxy_registry, save_network_proxy
 from aurora.services.worker_control import WorkerControlService
+from aurora.services.reliability import ReliabilityService
+from aurora.services.tsecbench import TSecBenchError, TSecBenchNeedsSession, configure_tsecbench, public_tsecbench_config, test_tsecbench_connection
+from aurora.services.openvpn_gateway import OpenVPNConflict, OpenVPNError, OpenVPNLocked, OpenVPNRuntimeError, openvpn_gateway_registry
+
+
+logger = logging.getLogger("aurora.api")
 
 
 class CreateProjectRequest(BaseModel):
@@ -186,6 +193,18 @@ class NetworkProxyRequest(BaseModel):
     no_proxy: str | None = Field(default=None, max_length=2_000)
 
 
+class OpenVPNUnlockRequest(BaseModel):
+    vault_password: str = Field(min_length=10, max_length=1_024)
+
+
+class TSecBenchConfigRequest(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2_048)
+    token: str | None = Field(default=None, max_length=4_096)
+    clear_token: bool = False
+    timeout_seconds: int = Field(default=20, ge=1, le=300)
+    max_concurrent: int = Field(default=3, ge=1, le=3)
+
+
 class WorkerFactRequest(BaseModel):
     statement: str = Field(min_length=1, max_length=4_000)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
@@ -235,11 +254,14 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         settings = get_settings()
-        with acquire_api_instance_lock(settings.database_url):
+        with acquire_api_instance_lock(settings.database_url, lock_dir=settings.api_lock_dir):
             init_db()
+            openvpn_gateway_registry.initialize()
             with Session(engine) as session:
                 load_network_proxy(session)
+                reconciled_workers = Scheduler().reconcile_orphans(session)
                 recovered_target_groups = recover_legacy_target_blocked_groups(session)
+            logger.info(json.dumps({"event": "api.started", "reconciled_workers": reconciled_workers, "schema_ready": True}))
             settings.artifact_dir.mkdir(parents=True, exist_ok=True)
             challenge_group_registry.resume_interrupted_groups()
             for group_id in recovered_target_groups:
@@ -252,10 +274,10 @@ def create_app() -> FastAPI:
                     try:
                         with Session(engine) as session:
                             Scheduler().reap_all_expired(session)
-                    except Exception:
+                    except Exception as exc:
                         # The next pass retries; worker execution must never be
                         # brought down by maintenance failure.
-                        pass
+                        logger.warning(json.dumps({"event": "worker_reaper.failed", "error": str(exc)[:500]}))
                     stop_reaper.wait(interval)
 
             reaper_thread = Thread(target=reap_worker_leases, name="aurora-worker-reaper", daemon=True)
@@ -265,6 +287,7 @@ def create_app() -> FastAPI:
             finally:
                 stop_reaper.set()
                 reaper_thread.join(timeout=max(1, settings.worker_reap_interval_seconds) + 1)
+                openvpn_gateway_registry.initialize()
 
     app = FastAPI(title="Aurora API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -276,8 +299,17 @@ def create_app() -> FastAPI:
     )
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        settings = get_settings()
+        return {
+            "status": "ok",
+            "schema_version": SCHEMA_VERSION,
+            "model_metadata": {
+                "required": settings.codex_require_explicit_model_metadata,
+                "context_window": settings.codex_model_context_window,
+                "auto_compact_token_limit": settings.codex_auto_compact_token_limit,
+            },
+        }
 
     @app.api_route("/favicon.ico", methods=["GET", "HEAD"])
     def favicon() -> Response:
@@ -293,6 +325,103 @@ def create_app() -> FastAPI:
             return save_network_proxy(session, mode=payload.mode, proxy_url=payload.proxy_url, no_proxy=payload.no_proxy).public_dict()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def openvpn_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, OpenVPNLocked):
+            return HTTPException(status_code=401, detail=str(exc))
+        if isinstance(exc, OpenVPNConflict):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, OpenVPNRuntimeError):
+            return HTTPException(status_code=502, detail=str(exc))
+        return HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/settings/openvpn")
+    def get_openvpn_config(session: Session = Depends(get_session)) -> dict[str, Any]:
+        return openvpn_gateway_registry.public_config(session)
+
+    @app.put("/api/settings/openvpn")
+    async def save_openvpn_config(
+        ovpn: UploadFile = File(...),
+        vault_password: str = Form(..., min_length=10, max_length=1_024),
+        routes: str = Form(..., max_length=16_384),
+        username: str | None = Form(default=None, max_length=1_024),
+        password: str | None = Form(default=None, max_length=4_096),
+        session: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        try:
+            content = await ovpn.read(1024 * 1024 + 1)
+            route_values = [value.strip() for value in routes.replace(",", "\n").splitlines() if value.strip()]
+            return openvpn_gateway_registry.save(
+                session,
+                ovpn=content,
+                vault_password=vault_password,
+                routes=route_values,
+                username=username,
+                password=password,
+            )
+        except (ValueError, OpenVPNError) as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.post("/api/settings/openvpn/unlock")
+    def unlock_openvpn(payload: OpenVPNUnlockRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return openvpn_gateway_registry.unlock(session, payload.vault_password)
+        except (ValueError, OpenVPNError) as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.post("/api/settings/openvpn/lock")
+    def lock_openvpn(session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return openvpn_gateway_registry.lock(session)
+        except OpenVPNError as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.post("/api/settings/openvpn/connect")
+    def connect_openvpn(session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return openvpn_gateway_registry.connect(session)
+        except OpenVPNError as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.post("/api/settings/openvpn/disconnect")
+    def disconnect_openvpn(session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return openvpn_gateway_registry.disconnect(session)
+        except OpenVPNError as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.delete("/api/settings/openvpn")
+    def clear_openvpn(session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return openvpn_gateway_registry.clear(session)
+        except OpenVPNError as exc:
+            raise openvpn_error(exc) from exc
+
+    @app.get("/api/settings/tsecbench")
+    def get_tsecbench_config() -> dict[str, Any]:
+        return public_tsecbench_config()
+
+    @app.put("/api/settings/tsecbench")
+    def update_tsecbench_config(payload: TSecBenchConfigRequest) -> dict[str, Any]:
+        try:
+            return configure_tsecbench(
+                base_url=payload.base_url,
+                token=payload.token,
+                clear_token=payload.clear_token,
+                timeout_seconds=payload.timeout_seconds,
+                max_concurrent=payload.max_concurrent,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/settings/tsecbench/test")
+    def test_tsecbench_config() -> dict[str, Any]:
+        try:
+            return test_tsecbench_connection()
+        except TSecBenchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except TSecBenchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
 
     @app.post("/api/projects")
     def create_project(payload: CreateProjectRequest, session: Session = Depends(get_session)) -> Project:
@@ -886,6 +1015,11 @@ def create_app() -> FastAPI:
     def list_findings(project_id: str, session: Session = Depends(get_session)) -> list[Finding]:
         _require_project(session, project_id)
         return session.exec(select(Finding).where(Finding.project_id == project_id).order_by(Finding.created_at.desc())).all()
+
+    @app.get("/api/projects/{project_id}/reliability")
+    def get_project_reliability(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+        _require_project(session, project_id)
+        return ReliabilityService().project_report(session, project_id=project_id)
 
     @app.get("/api/projects/{project_id}/flag-candidates")
     def list_flag_candidates(project_id: str, session: Session = Depends(get_session)) -> list[FlagCandidate]:

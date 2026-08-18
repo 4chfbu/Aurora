@@ -7,12 +7,14 @@ import json
 import selectors
 import signal
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 
 from aurora.config import get_settings
 from aurora.services.tool_profiles import manifest_sha256
 from aurora.services.network_proxy import network_proxy_registry
+from aurora.services.openvpn_gateway import OpenVPNError, openvpn_gateway_registry
 
 
 @dataclass
@@ -25,13 +27,23 @@ class CommandResult:
     exit_code: int
     backend: str
     failure_kind: str | None = None
+    finalization_reason: str | None = None
 
 
 class CommandRunner:
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
         raise NotImplementedError
 
-    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
         result = self.run(command=command, cwd=cwd, timeout=timeout)
         for stream, content in (("stdout", result.stdout), ("stderr", result.stderr)):
             for line in content.splitlines():
@@ -129,6 +141,11 @@ class KaliContainerRunner(CommandRunner):
         if self.engine is None:
             self.availability_error = "docker/podman not available"
             return False
+        try:
+            openvpn_gateway_registry.worker_network()
+        except OpenVPNError as exc:
+            self.availability_error = str(exc)
+            return False
         inspected = subprocess.run(
             [self.engine, "image", "inspect", self.image],
             text=True,
@@ -163,7 +180,38 @@ class KaliContainerRunner(CommandRunner):
                     f"actual_profile={actual_profile or 'missing'}"
                 )
                 return False
+        if not self._proxy_available():
+            return False
         self.availability_error = None
+        return True
+
+    def _proxy_available(self) -> bool:
+        """Fail preflight before starting a Worker when its LLM proxy is down."""
+        settings = get_settings()
+        proxy_host = urlparse(settings.codex_proxy_base_url).hostname
+        if proxy_host != "aurora-cc-switch":
+            return True
+
+        inspected = subprocess.run(
+            [self.engine, "inspect", "--format", "{{json .State}}", "aurora-cc-switch"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            detail = (inspected.stderr or inspected.stdout or "").strip()
+            self.availability_error = f"CC Switch proxy container is unavailable{f': {detail}' if detail else ''}"
+            return False
+        try:
+            state = json.loads(inspected.stdout or "{}")
+        except json.JSONDecodeError:
+            state = {}
+        status = str(state.get("Status") or "unknown")
+        health = str((state.get("Health") or {}).get("Status") or "none")
+        if status != "running" or health not in {"healthy", "none"}:
+            self.availability_error = f"CC Switch proxy is not ready: container_status={status}, health={health}"
+            return False
         return True
 
     def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
@@ -201,7 +249,16 @@ class KaliContainerRunner(CommandRunner):
             failure_kind="resource_terminated" if completed.returncode == 137 else None,
         )
 
-    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
         if self.engine is None:
             raise RuntimeError("docker/podman not available")
         executed, relative_cwd, container_cwd = self._build_command(command, cwd)
@@ -219,18 +276,33 @@ class KaliContainerRunner(CommandRunner):
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         captured = {"stdout": [], "stderr": []}
         started = time.monotonic()
-        timed_out = False
+        finalization_reason: str | None = None
         interrupted_at: float | None = None
+
+        def request_finalization(reason: str, now: float) -> None:
+            nonlocal finalization_reason, interrupted_at
+            if finalization_reason is not None:
+                return
+            finalization_reason = reason
+            interrupted_at = now
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                on_output("control", reason)
+            except Exception:
+                # Process control is authoritative even if checkpoint/event
+                # persistence is temporarily unavailable.
+                pass
+
         while selector.get_map():
             now = time.monotonic()
-            if timeout is not None and not timed_out and now - started >= timeout:
-                timed_out = True
-                interrupted_at = now
-                try:
-                    os.killpg(process.pid, signal.SIGINT)
-                except ProcessLookupError:
-                    pass
-            if timed_out and interrupted_at is not None and now - interrupted_at >= 10 and process.poll() is None:
+            if soft_timeout is not None and now - started >= soft_timeout:
+                request_finalization("soft_timeout", now)
+            if timeout is not None and now - started >= timeout:
+                request_finalization("hard_timeout", now)
+            if finalization_reason and interrupted_at is not None and now - interrupted_at >= max(1, finalize_grace) and process.poll() is None:
                 self._stop_container(relative_cwd)
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -240,24 +312,38 @@ class KaliContainerRunner(CommandRunner):
                 line = key.fileobj.readline()
                 if line:
                     captured[key.data].append(line)
-                    on_output(key.data, line.rstrip("\n"))
+                    callback_reason = on_output(key.data, line.rstrip("\n"))
+                    if isinstance(callback_reason, str) and callback_reason:
+                        request_finalization(callback_reason, time.monotonic())
                 else:
                     selector.unregister(key.fileobj)
             if process.poll() is not None and not selector.get_map():
                 break
         return_code = process.wait()
         stderr = "".join(captured["stderr"])
-        if timed_out:
-            stderr = f"command timed out after {timeout}s; Codex received SIGINT and a 10s finalization grace period\n" + stderr
+        if finalization_reason:
+            stderr = (
+                f"command finalization requested ({finalization_reason}); Codex received SIGINT "
+                f"and a {max(1, finalize_grace)}s finalization grace period\n" + stderr
+            )
         return CommandResult(
             command=command,
             executed_command=" ".join(executed),
             cwd=str(container_cwd),
             stdout="".join(captured["stdout"]),
             stderr=stderr,
-            exit_code=124 if timed_out else return_code,
+            exit_code=124 if finalization_reason else return_code,
             backend="kali-container",
-            failure_kind="command_timed_out" if timed_out else "resource_terminated" if return_code == 137 else None,
+            failure_kind=(
+                "command_timed_out"
+                if finalization_reason in {"soft_timeout", "hard_timeout"}
+                else finalization_reason
+                if finalization_reason
+                else "resource_terminated"
+                if return_code == 137
+                else None
+            ),
+            finalization_reason=finalization_reason,
         )
 
     def _build_command(self, command: str, cwd: Path) -> tuple[list[str], Path, Path]:
@@ -267,14 +353,16 @@ class KaliContainerRunner(CommandRunner):
         relative_cwd = workspace.relative_to(Path.cwd().resolve())
         container_cwd = Path("/workspace")
         workspace_stat = workspace.stat()
+        vpn_network = openvpn_gateway_registry.worker_network()
+        selected_network = vpn_network or self.network
+        network_args = ["--network", selected_network]
+        if vpn_network is None:
+            network_args = ["--add-host", "host.docker.internal:host-gateway", *network_args]
         executed = [
             self.engine,
             "run",
             "--rm",
-            "--add-host",
-            "host.docker.internal:host-gateway",
-            "--network",
-            self.network,
+            *network_args,
             "--cpus",
             str(self.settings.worker_container_cpus),
             "--memory",
@@ -366,11 +454,34 @@ class AutoCommandRunner(CommandRunner):
             raise RuntimeError(f"{reason}. Build the configured core/heavy worker images before running this runtime.")
         return self.local.run(command=command, cwd=cwd, timeout=timeout)
 
-    def run_streaming(self, *, command: str, cwd: Path, timeout: int | None, on_output) -> CommandResult:
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
         if self.prefer_kali and self.kali.available():
             try:
-                return self.kali.run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)
+                return self.kali.run_streaming(
+                    command=command,
+                    cwd=cwd,
+                    timeout=timeout,
+                    on_output=on_output,
+                    soft_timeout=soft_timeout,
+                    finalize_grace=finalize_grace,
+                )
             except Exception as exc:
                 if not self.allow_local_fallback:
                     raise RuntimeError(f"kali container execution failed and local fallback is disabled: {exc}") from exc
-        return super().run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)
+        return super().run_streaming(
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+            on_output=on_output,
+            soft_timeout=soft_timeout,
+            finalize_grace=finalize_grace,
+        )

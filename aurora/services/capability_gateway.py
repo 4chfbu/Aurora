@@ -13,9 +13,10 @@ import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 
-from sqlmodel import Session
+from pydantic import BaseModel, Field, ValidationError
+from sqlmodel import Session, select
 
-from aurora.models import Artifact, Intent, ToolTrace
+from aurora.models import Artifact, FlagCandidate, Intent, ToolTrace
 from aurora.services.command_runner import AutoCommandRunner, CommandRunner
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.policy import PolicyEngine
@@ -25,6 +26,12 @@ from aurora.services.flag_validator import FlagValidator
 
 
 DENIED_TOKENS = ["rm -rf", "mkfs", ":(){", "dd if=", "shutdown", "reboot", "docker.sock"]
+
+
+class FlagVerifyRequest(BaseModel):
+    source_artifact_refs: list[str] = Field(min_length=1, max_length=20)
+    verification_script: str = Field(min_length=1, max_length=1000)
+    timeout_seconds: int = Field(default=30, ge=1, le=60)
 
 
 @dataclass
@@ -93,7 +100,23 @@ class CapabilityGateway:
             return self._blackboard_query(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "browser.interact":
             return self._browser_interact(session, project_id, request, worker_id, intent_id, attempt_id)
-        command = self._semantic_command(tool_name, request)
+        if tool_name in {"binary.inspect", "forensic.inspect"} and not request.get("path") and request.get("artifact_ref"):
+            artifact = session.get(Artifact, str(request["artifact_ref"]))
+            if artifact is None or artifact.project_id != project_id:
+                return self._tool_error_result(
+                    session, project_id, tool_name, request, worker_id, intent_id, attempt_id,
+                    "artifact_ref does not identify an artifact in this project",
+                )
+            request = {**request, "path": artifact.path}
+        try:
+            command = self._semantic_command(tool_name, request)
+        except (TypeError, ValueError) as exc:
+            # A malformed model-authored tool request is an ordinary tool
+            # failure.  It must not escape the gateway and fail the whole
+            # challenge-group runner.
+            return self._tool_error_result(
+                session, project_id, tool_name, request, worker_id, intent_id, attempt_id, str(exc),
+            )
         if command is not None:
             semantic_request = {
                 "command": command,
@@ -106,6 +129,32 @@ class CapabilityGateway:
             return self._sandbox_exec(session, project_id, semantic_request, worker_id, intent_id, attempt_id, tool_name=tool_name)
         return self._semantic_stub(session, project_id, tool_name, request, worker_id, intent_id, attempt_id)
 
+    @staticmethod
+    def _tool_error_result(
+        session: Session,
+        project_id: str,
+        tool_name: str,
+        request: dict[str, Any],
+        worker_id: str | None,
+        intent_id: str | None,
+        attempt_id: str | None,
+        reason: str,
+    ) -> ToolResult:
+        trace = ToolTrace(
+            project_id=project_id,
+            worker_id=worker_id,
+            intent_id=intent_id,
+            attempt_id=attempt_id,
+            tool_name=tool_name,
+            request_json=request,
+            policy_decision="execution_error",
+            summary=reason[:1000],
+        )
+        session.add(trace)
+        session.commit()
+        session.refresh(trace)
+        return ToolResult(False, reason[:1000], [], {"exit_code": None, "backend": "validation"}, [reason[:1000]], trace.id)
+
     def _flag_verify(
         self,
         session: Session,
@@ -116,9 +165,26 @@ class CapabilityGateway:
         attempt_id: str | None,
     ) -> ToolResult:
         """Replay a model-authored Python derivation without supplying an expected flag."""
-        refs = request.get("source_artifact_refs")
-        script_name = str(request.get("verification_script") or "").strip()
-        timeout = max(1, min(int(request.get("timeout_seconds", 30)), 60))
+        if not isinstance(request.get("source_artifact_refs"), list) or not request.get("source_artifact_refs"):
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                "flag.verify requires a non-empty source_artifact_refs array",
+            )
+        if not str(request.get("verification_script") or "").strip():
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                "flag.verify requires verification_script",
+            )
+        try:
+            validated = FlagVerifyRequest.model_validate(request)
+        except ValidationError as exc:
+            return self._verification_failure(
+                session, project_id, request, worker_id, intent_id, attempt_id,
+                f"invalid flag.verify request: {exc.errors(include_url=False)}",
+            )
+        refs = validated.source_artifact_refs
+        script_name = validated.verification_script.strip()
+        timeout = validated.timeout_seconds
         if not worker_id:
             return self._verification_failure(
                 session, project_id, request, worker_id, intent_id, attempt_id,
@@ -162,6 +228,8 @@ class CapabilityGateway:
             return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "no valid source artifacts were declared")
 
         script_bytes = script_path.read_bytes()
+        if len(script_bytes) > 1_000_000:
+            return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification script exceeds 1 MB")
         runs: list[dict[str, Any]] = []
         verify_root = Path(tempfile.mkdtemp(prefix=".aurora-flag-verify-", dir=Path.cwd()))
         try:
@@ -195,6 +263,16 @@ class CapabilityGateway:
             value = runs[0]["stdout"]
             if runs[1]["stdout"] != value:
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification replay produced inconsistent results", runs=runs)
+            value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            rejected = session.exec(
+                select(FlagCandidate).where(
+                    FlagCandidate.project_id == project_id,
+                    FlagCandidate.value_hash == value_hash,
+                    FlagCandidate.status == "REJECTED",
+                )
+            ).first()
+            if rejected is not None:
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification produced a previously rejected candidate", runs=runs)
             request_text = json.dumps(request, ensure_ascii=False, sort_keys=True)
             script_text = script_bytes.decode("utf-8", errors="replace")
             if value in request_text or value in script_text:

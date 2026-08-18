@@ -5,8 +5,10 @@ description = "Aurora v2 MVP: Fact-Intent blackboard, Kali-first worker tooling,
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=44.0.0",
   "fastapi>=0.115.0",
   "playwright>=1.50.0",
+  "python-multipart>=0.0.20",
   "sqlmodel>=0.0.22",
   "uvicorn[standard]>=0.30.0",
 ]

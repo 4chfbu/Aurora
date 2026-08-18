@@ -9,16 +9,23 @@ provider_id="aurora-llm"
 mkdir -p "${CC_SWITCH_CONFIG_DIR}" "${HOME}" "${XDG_RUNTIME_DIR}"
 chmod 0700 "${CC_SWITCH_CONFIG_DIR}" "${HOME}" "${XDG_RUNTIME_DIR}"
 
-# This container owns an isolated database, so recreating its sole provider is
-# deterministic and never changes the operator's host-side CC Switch config.
-cc-switch --app codex provider delete "${provider_id}" >/dev/null 2>&1 || true
-cc-switch --app codex provider add \
-  --id "${provider_id}" \
-  --name "Aurora LLM" \
-  --base-url "${AURORA_LLM_BASE_URL}" \
-  --api-key "${AURORA_LLM_API_KEY}" \
-  --model "${AURORA_LLM_MODEL}" \
-  --api-format chat
+# The container filesystem survives a normal Docker restart. The previous
+# implementation deleted the active provider, which cc-switch rejects, then
+# failed to add the same ID on every restart. Keep initialization idempotent;
+# compose recreation still creates a fresh provider when configuration changes.
+current_provider="$(cc-switch --app codex provider current 2>/dev/null || true)"
+if ! printf '%s\n' "${current_provider}" | grep -Eq "ID:[[:space:]]*${provider_id}([[:space:]]|$)"; then
+  provider_list="$(cc-switch --app codex provider list 2>/dev/null || true)"
+  if ! printf '%s\n' "${provider_list}" | grep -Eq "(^|[^[:alnum:]_-])${provider_id}([^[:alnum:]_-]|$)"; then
+    cc-switch --app codex provider add \
+      --id "${provider_id}" \
+      --name "Aurora LLM" \
+      --base-url "${AURORA_LLM_BASE_URL}" \
+      --api-key "${AURORA_LLM_API_KEY}" \
+      --model "${AURORA_LLM_MODEL}" \
+      --api-format chat
+  fi
+fi
 cc-switch --app codex provider switch "${provider_id}"
 
 exec cc-switch --app codex proxy serve \

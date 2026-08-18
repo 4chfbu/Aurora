@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlmodel import Session, select
 
@@ -23,6 +23,7 @@ class Scheduler:
             return None
 
         worker_id = new_id("worker")
+        intent.lease_generation += 1
         intent.status = "RUNNING"
         intent.lease_owner = worker_id
         intent.lease_expires_at = now_utc() + timedelta(seconds=lease_seconds)
@@ -34,6 +35,7 @@ class Scheduler:
             status="RUNNING",
             capability_set=intent.capability_tags or ["sandbox.exec"],
             lease={"expires_at": intent.lease_expires_at.isoformat()},
+            lease_generation=intent.lease_generation,
         )
         session.add(intent)
         session.add(worker)
@@ -46,7 +48,14 @@ class Scheduler:
         # A lease may have expired while a runtime was still unwinding.  That
         # worker no longer owns the intent and must not overwrite the timeout
         # state (or a retry claimed by a newer worker).
-        if intent.status != "RUNNING" or intent.lease_owner != worker.id or worker.status != "RUNNING":
+        session.refresh(intent)
+        session.refresh(worker)
+        if (
+            intent.status != "RUNNING"
+            or intent.lease_owner != worker.id
+            or worker.status != "RUNNING"
+            or intent.lease_generation != worker.lease_generation
+        ):
             return
         # Publish a single concluding barrier before writing the terminal
         # state. Reapers only claim RUNNING rows, so a late result cannot win
@@ -93,7 +102,12 @@ class Scheduler:
         if worker is None or worker.status != "RUNNING":
             return None
         intent = session.get(Intent, worker.intent_id)
-        if intent is None or intent.status != "RUNNING" or intent.lease_owner != worker.id:
+        if (
+            intent is None
+            or intent.status != "RUNNING"
+            or intent.lease_owner != worker.id
+            or intent.lease_generation != worker.lease_generation
+        ):
             return None
 
         expires_at = now_utc() + timedelta(seconds=lease_seconds)
@@ -204,4 +218,112 @@ class Scheduler:
         project_ids = session.exec(
             select(Project.id).where(Project.status.not_in(["COMPLETED", "CANCELLED", "FAILED"]))
         ).all()
-        return sum(self.reap_expired(session, project_id=project_id) for project_id in project_ids)
+        expired = sum(self.reap_expired(session, project_id=project_id) for project_id in project_ids)
+        return expired + self.reconcile_orphans(session)
+
+    def reconcile_orphans(self, session: Session, *, concluding_grace_seconds: int = 300) -> int:
+        """Close active-looking rows that no longer own a live scheduler lease."""
+        cutoff = now_utc() - timedelta(seconds=max(1, concluding_grace_seconds))
+        workers = session.exec(
+            select(Worker).where(Worker.status.in_(["RUNNING", "STARTING", "CONCLUDING"]))
+        ).all()
+        checkpoint_inputs: list[tuple[Attempt, dict]] = []
+        reconciled = 0
+        for worker in workers:
+            intent = session.get(Intent, worker.intent_id)
+            owns_live_lease = bool(
+                intent
+                and intent.status == "RUNNING"
+                and intent.lease_owner == worker.id
+                and intent.lease_generation == worker.lease_generation
+                and intent.lease_expires_at
+                and self._at_or_after(intent.lease_expires_at, now_utc())
+            )
+            concluding_recently = bool(
+                intent
+                and intent.status == "CONCLUDING"
+                and worker.status == "CONCLUDING"
+                and intent.lease_owner == worker.id
+                and intent.lease_generation == worker.lease_generation
+                and self._at_or_after(worker.updated_at, cutoff)
+            )
+            if owns_live_lease or concluding_recently:
+                continue
+
+            cleanup = stop_worker_containers(worker.id)
+            worker.status = "TIMEOUT"
+            worker.lease = {}
+            worker.updated_at = now_utc()
+            session.add(worker)
+            if intent and intent.lease_owner == worker.id:
+                intent.status = "PENDING" if intent.retry_count < intent.max_retries else "FAILED"
+                intent.retry_count += 1
+                intent.lease_owner = None
+                intent.lease_expires_at = None
+                intent.updated_at = now_utc()
+                session.add(intent)
+            attempts = session.exec(
+                select(Attempt).where(Attempt.worker_id == worker.id, Attempt.status.in_(["RUNNING", "FINALIZING"]))
+            ).all()
+            for attempt in attempts:
+                attempt.status = "TIMEOUT"
+                attempt.finalization_reason = "orphan_reconciled"
+                attempt.failure_reason = "worker no longer owns a live scheduler lease"
+                attempt.finished_at = now_utc()
+                session.add(attempt)
+                if worker.execution_kind == "primary":
+                    checkpoint_inputs.append((attempt, worker.budgets or {}))
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    event_type="worker.reconciled",
+                    payload_json={
+                        "reason": "missing_or_expired_lease",
+                        "status": "TIMEOUT",
+                        "container_cleanup": cleanup,
+                    },
+                )
+            )
+            reconciled += 1
+        session.commit()
+        for attempt, budget in checkpoint_inputs:
+            try:
+                RoundReflectionService().create(
+                    session,
+                    attempt=attempt,
+                    output={
+                        "status": "partial",
+                        "summary": attempt.failure_reason,
+                        "failed_attempts": [{"reason": attempt.failure_reason}],
+                        "hypotheses": [],
+                        "suggested_intents": [],
+                        "decision_summary": {"next_tool_plan": []},
+                    },
+                    budget=budget,
+                    skip_planner=True,
+                )
+            except Exception as exc:
+                session.add(
+                    WorkerEvent(
+                        project_id=attempt.project_id,
+                        worker_id=attempt.worker_id,
+                        intent_id=attempt.intent_id,
+                        attempt_id=attempt.id,
+                        event_type="checkpoint.failed",
+                        payload_json={"reason": str(exc)[:500], "source": "orphan_reconciliation"},
+                    )
+                )
+                session.commit()
+        return reconciled
+
+    @staticmethod
+    def _at_or_after(value: datetime | None, reference: datetime) -> bool:
+        if value is None:
+            return False
+        if value.tzinfo is None and reference.tzinfo is not None:
+            reference = reference.replace(tzinfo=None)
+        elif value.tzinfo is not None and reference.tzinfo is None:
+            value = value.replace(tzinfo=None)
+        return value >= reference

@@ -93,6 +93,7 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | --- | --- | --- |
 | `AURORA_DB_URL` | `sqlite:///./aurora.db` | SQLModel/SQLAlchemy 数据库 URL。默认数据库位于当前工作目录。使用其他数据库时还需要对应驱动。 |
 | `AURORA_ARTIFACT_DIR` | `./artifacts` | 原始工具输出、导入附件和 Codex transcript 的存储目录。API 启动时会自动创建。 |
+| `AURORA_API_LOCK_DIR` | 系统临时目录 | API 单实例锁目录；测试和多环境部署应分别配置。 |
 | `AURORA_WORKER_RUNTIME` | `codex` | `codex`/`codex_harness`/`harness` 使用 Codex Harness；`openai_direct`/`openai`/`llm`/`real` 使用直接兼容接口。其他值直接报错。 |
 | `AURORA_WORKER_IMAGE` | `aurora-kali-codex:latest` | 包含 Codex CLI 的 Kali Worker 镜像名。只有本地已存在的镜像才会被容器执行器使用。 |
 | `AURORA_WORKER_IMAGE_CORE` | `AURORA_WORKER_IMAGE` 或 `aurora-kali-codex:core` | Web 题和手工语义工具使用的常用 CTF 工具镜像。 |
@@ -138,6 +139,7 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | --- | --- | --- |
 | `AURORA_CODEX_MODEL_CONTEXT_WINDOW` | `1000000` | 传给 Codex 的自定义模型上下文上限，避免未知模型使用错误的 fallback 元数据。 |
 | `AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT` | `800000` | 达到此 token 数后触发 Codex 自动压缩，为最终结构化输出保留空间。 |
+| `AURORA_CODEX_REQUIRE_EXPLICIT_MODEL_METADATA` | `true` | 要求显式设置上面两个模型预算变量；缺失时启动失败，禁止静默使用未知模型 fallback。 |
 | `AURORA_CODEX_TRANSCRIPT_MAX_BYTES` | `2097152` | 单份 Harness transcript 的存储上限；超限时保留头尾并写入截断标记。 |
 
 ### LLM 与角色路由
@@ -157,13 +159,16 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AURORA_DEFAULT_SOFT_TIMEOUT_SECONDS` | `300` | Intent 的软超时预算字段；当前不会单独终止底层命令。 |
+| `AURORA_DEFAULT_SOFT_TIMEOUT_SECONDS` | `300` | 到期后写入强制 checkpoint、向 Codex 发送 SIGINT 并进入收尾宽限。 |
 | `AURORA_DEFAULT_HARD_TIMEOUT_SECONDS` | `1800` | Intent 的硬超时预算，也用于 Codex Harness 的有效超时和 lease 计算。 |
 | `AURORA_DEFAULT_MAX_TOOL_CALLS` | `12` | 单次 Worker 最多执行的工具请求数。 |
 | `AURORA_DEFAULT_MAX_REPEAT_FAILURES` | `2` | 同一工具失败达到该次数后跳过后续重复请求。 |
 | `AURORA_DEFAULT_MAX_AGENT_ACTIONS` | `20` | Codex 内部 shell 动作预算；达到后进入结构化收尾。 |
 | `AURORA_DEFAULT_MAX_ROUTE_REPEATS` | `2` | 同一路线连续失败的 Observer 纠偏阈值。 |
+| `AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS` | `5` | 没有新增 Fact 或实时 checkpoint 时允许的连续 Codex shell 动作数；达到后强制收尾。 |
 | `AURORA_DEFAULT_FINALIZE_GRACE_SECONDS` | `60` | 软截止后的收尾宽限时间。 |
+| `AURORA_RESUME_MAX_FILES` | `100` | 单个 Attempt 可进入恢复 manifest 的工作文件和 Codex 状态文件数量上限。 |
+| `AURORA_RESUME_MAX_BYTES` | `67108864` | `/workspace/work` 持久文件的总字节上限。 |
 | `AURORA_MAX_CHALLENGE_GROUP_CONCURRENT` | `2` | 题目组并行项目的全局上限；单项目仍保持单 Worker。 |
 
 ### Hands-free Cataloger
@@ -184,6 +189,37 @@ Hands-free URL 导入优先使用平台适配器和浏览器已观察到的 JSON
 | `AURORA_CATALOGER_ATTACHMENT_TIMEOUT_SECONDS` | `20` | 单个附件从连接到读取完成的硬超时；超时后转为人工处理，不阻塞整批导入。 |
 
 只有 API Key、Base URL 和模型都存在时，LLM/Agent 路径才算已配置。Agent 只能操作当前 DOM 中已观察到的控件，并拒绝登录、注册、提交答案/flag、启动题目环境和创建实例等动作。
+
+### TSecBench
+
+设置 `AURORA_TSECBENCH_BASE_URL`（默认 `https://tsecbench.zc.tencent.com`）和
+`AURORA_TSECBENCH_TOKEN` 后，Cataloger 会识别平台根地址或 `/openapi/v1/challenges` 地址并读取题目列表。
+也可直接使用平台跑分任务下发的 `BENCHMARK_BASE_URL` 和 `BENCHMARK_TOKEN`；若两组变量同时存在，
+`AURORA_TSECBENCH_*` 优先，以保持现有部署行为不变。
+也可以在 Web 左侧的 `TSecBench` 设置中配置 Base URL、Token、请求超时和实例并发上限。网页提交的 Token
+只保存在当前 API 进程内存，重启后回退到环境变量；GET 配置接口不会返回 Token。Token 不会写入
+ImportBatch、Project、ChallengeGroupItem、数据库设置或 Artifact。
+`AURORA_TSECBENCH_TIMEOUT_SECONDS` 控制 API 请求超时，`AURORA_TSECBENCH_MAX_CONCURRENT` 最大为 `3`，对应平台同时最多启动 3 道题的限制。
+
+导入候选保存 `platform=tsecbench` 和 `unique_code`。Runner 在 Solver 前调用 start，使用返回的 `container_addr`
+建立项目目标和授权主机，按阶段获取 Hint、提交 Flag，并在终态调用 close。Token 缺失或认证失败时导入进入
+`NEEDS_SESSION`；Runner 的启动/Hint/关闭失败只记录诊断，不覆盖题目结果。
+
+平台下发的 `container_addr` 是 SSLVPN 内的直连地址。Web 的“测试连接”会先验证 Challenge API；若题目列表中已有
+`available` 容器，则从 API 宿主机对第一个地址执行短 TCP 探测并显示 VPN 路由状态。Aurora 不保存 VPN 凭据，也不自动拨号；
+具体 SSLVPN 客户端或配置文件格式未包含在 Challenges API 文档中，需要先在宿主机建立平台下发的 VPN 连接。
+
+### 容器化 OpenVPN（可选）
+
+Web 左侧的 `OpenVPN` 设置可上传单文件 OVPN、配置可选账号密码和需要经隧道访问的 IPv4/CIDR。
+配置使用网页主密码加密后落库，主密码只驻留当前 API 进程；重启后必须重新解锁并手动连接。
+VPN 运行在独立容器网络命名空间中，不修改宿主机路由。连接时强制忽略服务端下发的默认路由和 DNS，
+仅网页列出的网段走隧道。连接健康时新 Solver Worker 共享该网络命名空间；掉线时阻止新 Worker，
+不会回退直连。存在运行中的 Solver Worker 时不能连接、断开或修改配置。
+
+首版只接受带内联证书/私钥的 TUN 配置；不支持 ZIP、外部证书路径、脚本/plugin 或 OVPN 内自定义路由。
+运行 `scripts/runtime-up.sh` 会构建默认镜像 `aurora-openvpn:latest`，也可通过
+`AURORA_OPENVPN_IMAGE`、`AURORA_OPENVPN_CONTAINER_NAME` 和 `AURORA_OPENVPN_CONNECT_TIMEOUT_SECONDS` 调整。连接等待默认 75 秒，且不会低于 OpenVPN 默认的 60 秒 TLS 握手窗口。
 
 ### FOFA 能力
 

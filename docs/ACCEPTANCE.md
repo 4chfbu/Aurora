@@ -28,6 +28,7 @@ AURORA_CODEX_TIMEOUT_SECONDS=1800
 ```
 
 `runtime-up.sh` starts the private CC Switch service and builds the Codex Worker image. The runtime disables local fallback: a missing image, proxy, model, or credential fails explicitly. `openai_direct` remains an explicit debugging mode only.
+It also builds the optional `aurora-openvpn:latest` gateway. Without an uploaded and manually connected profile, Worker networking remains unchanged. For VPN acceptance, verify the host routes and DNS are unchanged, configured CIDRs resolve through `tun0` inside the gateway, and a disconnected unhealthy gateway prevents new Solver Workers.
 
 Restart the API after editing `.env`.
 
@@ -80,3 +81,11 @@ curl http://localhost:8000/api/projects/<project_id>/summary
 ```
 
 The summary contains project status, counts, findings, recent facts, intent/attempt status counts, recent artifacts, traces, latest context snapshot, and recent events.
+
+可靠性闸门可单独检查：
+
+```bash
+curl http://localhost:8000/api/projects/<project_id>/reliability
+```
+
+超时或动作预算触发后，终止 Attempt 必须有 checkpoint 或明确的 `checkpoint.failed`；完整性校验失败的恢复必须记录 `codex.resume_rejected` 并开启新 thread。

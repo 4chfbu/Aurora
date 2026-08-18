@@ -13,11 +13,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from aurora.api import create_app  # noqa: E402
 from aurora.db import engine  # noqa: E402
-from aurora.models import Attempt, AttemptCheckpoint, ChallengeGroup, ChallengeGroupItem, DiscoveredTarget, Fact, Finding, FlagCandidate, ImportCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc  # noqa: E402
+from aurora.models import Attempt, AttemptCheckpoint, AuthorizationScope, ChallengeGroup, ChallengeGroupItem, DiscoveredTarget, Fact, Finding, FlagCandidate, ImportCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc  # noqa: E402
 from aurora.services.challenge_group_runner import GroupRunState  # noqa: E402
 from aurora.services.artifact_store import ArtifactStore  # noqa: E402
 from aurora.services.browser_interaction import BrowserInteractionService  # noqa: E402
 from aurora.services.capability_gateway import CapabilityGateway  # noqa: E402
+from aurora.services.command_runner import LocalCommandRunner  # noqa: E402
 from aurora.services.demo import _repeat_failure_count, _route_request  # noqa: E402
 from aurora.services.flag_validator import FlagValidator  # noqa: E402
 from aurora.services.policy import PolicyEngine  # noqa: E402
@@ -707,6 +708,37 @@ def test_browser_execution_error_does_not_escalate_as_policy_denial(monkeypatch)
             trace = session.get(ToolTrace, result.trace_id)
             assert trace is not None
             assert trace.policy_decision == "execution_error"
+
+
+def test_semantic_artifact_ref_is_resolved_and_invalid_request_does_not_escape(tmp_path) -> None:
+    project_id = "proj_semantic_artifact"
+    with Session(engine) as session:
+        session.add(Project(id=project_id, name="semantic artifact", goal="inspect evidence"))
+        session.add(AuthorizationScope(project_id=project_id))
+        session.commit()
+        artifact = ArtifactStore(tmp_path).write_text(
+            session,
+            project_id=project_id,
+            content="evidence",
+            summary="evidence",
+        )
+        gateway = CapabilityGateway(artifact_store=ArtifactStore(tmp_path), command_runner=LocalCommandRunner())
+        resolved = gateway.execute(
+            session,
+            project_id=project_id,
+            tool_name="forensic.inspect",
+            request={"artifact_ref": artifact.id},
+        )
+        invalid = gateway.execute(
+            session,
+            project_id=project_id,
+            tool_name="forensic.inspect",
+            request={},
+        )
+
+        assert resolved.trace_id
+        assert "path contains unsafe characters" in invalid.summary
+        assert session.get(ToolTrace, invalid.trace_id).policy_decision == "execution_error"
 
 
 def test_repeat_failure_count_matches_non_adjacent_failed_routes() -> None:

@@ -159,7 +159,14 @@ class AutoRunnerService:
     def _counts(self, session: Session, project_id: str) -> dict[str, int]:
         return {
             "facts": len(session.exec(select(Fact).where(Fact.project_id == project_id)).all()),
-            "artifacts": len(session.exec(select(Artifact).where(Artifact.project_id == project_id, Artifact.type != "codex-transcript")).all()),
+            "artifacts": len(
+                session.exec(
+                    select(Artifact).where(
+                        Artifact.project_id == project_id,
+                        Artifact.type.not_in(["codex-transcript", "resume-manifest", "resume-work-file"]),
+                    )
+                ).all()
+            ),
             "findings": len(session.exec(select(Finding).where(Finding.project_id == project_id)).all()),
             "attempts": len(session.exec(select(Intent).where(Intent.project_id == project_id, Intent.status.in_(["COMPLETED", "FAILED"]))).all()),
         }

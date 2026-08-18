@@ -8,19 +8,19 @@ import secrets
 import shlex
 import shutil
 import time
-import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.db import engine
 from aurora.models import Artifact, Attempt, ContextSnapshot, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.artifact_store import ArtifactStore
+from aurora.services.blackboard_repository import route_fingerprint
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
 from aurora.services.prompt_renderer import PromptRenderer
 from aurora.services.tool_profiles import image_for_profile
@@ -50,6 +50,13 @@ EXECUTABLE_TOOLS = [
     "flag.verify",
     "sandbox.exec",
 ]
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """Treat SQLite's timezone-less timestamps as UTC for runtime ordering."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class OpenAICompatibleRuntime:
@@ -309,18 +316,17 @@ class CodexHarnessRuntime:
                 "AURORA_CODEX_RESUME_THREAD_ID": resume_thread_id or "",
             },
         )
-        soft_deadline_timer = self._schedule_soft_deadline(worker=worker, attempt=attempt)
         try:
             completed = self._run_command(
                 command,
                 prompt_file.parent,
                 timeout_seconds=worker.budgets.get("hard_timeout_seconds"),
+                soft_timeout_seconds=worker.budgets.get("soft_timeout_seconds"),
+                finalize_grace_seconds=worker.budgets.get("finalize_grace_seconds"),
                 runner=runner,
                 on_output=lambda stream, line: self._record_codex_event(session, worker=worker, attempt=attempt, stream=stream, line=line),
             )
         finally:
-            if soft_deadline_timer is not None:
-                soft_deadline_timer.cancel()
             if attempt is not None:
                 attempt.codex_control_token_hash = None
                 session.add(attempt)
@@ -341,6 +347,11 @@ class CodexHarnessRuntime:
             snapshot=snapshot,
             workspace=prompt_file.parent,
         )
+        resume_manifest = self._persist_resume_manifest(
+            session,
+            attempt=attempt,
+            workspace=prompt_file.parent,
+        ) if attempt is not None else None
 
         output_file = prompt_file.parent / "aurora-last-message.json"
         structured, output_diagnostic = self._parse_or_synthesize(
@@ -382,8 +393,14 @@ class CodexHarnessRuntime:
                 "model_context_window": self.settings.codex_model_context_window,
                 "auto_compact_token_limit": self.settings.codex_auto_compact_token_limit,
                 "hard_timeout_seconds": worker.budgets.get("hard_timeout_seconds"),
+                "soft_timeout_seconds": worker.budgets.get("soft_timeout_seconds"),
+                "finalize_grace_seconds": worker.budgets.get("finalize_grace_seconds"),
+                "finalization_reason": completed.finalization_reason,
+                "model_metadata_source": "explicit" if self.settings.codex_require_explicit_model_metadata else "configured_default",
+                "model_metadata_warning": "model metadata not found" in f"{completed.stdout}\n{completed.stderr}".lower(),
                 "output": output_diagnostic,
                 "mcp": mcp_import,
+                "resume_manifest_artifact_id": resume_manifest.id if resume_manifest else None,
             },
             decision_summary=decision_summary,
             structured_output=structured,
@@ -392,45 +409,6 @@ class CodexHarnessRuntime:
         session.commit()
         session.refresh(trace)
         return RuntimeOutput(structured.get("status", "partial"), structured.get("summary", "Codex harness completed."), structured, trace)
-
-    def _schedule_soft_deadline(self, *, worker: Worker, attempt: Attempt | None) -> threading.Timer | None:
-        if attempt is None:
-            return None
-        seconds = int((worker.budgets or {}).get("soft_timeout_seconds", 0) or 0)
-        if seconds <= 0:
-            return None
-
-        def mark() -> None:
-            try:
-                with Session(engine) as deadline_session:
-                    live_attempt = deadline_session.get(Attempt, attempt.id)
-                    live_worker = deadline_session.get(Worker, worker.id)
-                    if live_attempt is None or live_worker is None or live_attempt.status != "RUNNING" or live_worker.status != "RUNNING":
-                        return
-                    deadline_session.add(WorkerEvent(
-                        project_id=worker.project_id,
-                        worker_id=worker.id,
-                        intent_id=worker.intent_id,
-                        attempt_id=attempt.id,
-                        event_type="attempt.soft_deadline",
-                        payload_json={"soft_timeout_seconds": seconds, "action": "stop_exploration_and_finalize"},
-                    ))
-                    deadline_session.add(WorkerEvent(
-                        project_id=worker.project_id,
-                        worker_id=worker.id,
-                        intent_id=worker.intent_id,
-                        attempt_id=attempt.id,
-                        event_type="attempt.finalization_started",
-                        payload_json={"mode": "runtime_checkpoint_fallback", "grace_seconds": int((worker.budgets or {}).get("finalize_grace_seconds", 60) or 60)},
-                    ))
-                    deadline_session.commit()
-            except Exception:
-                return
-
-        timer = threading.Timer(seconds, mark)
-        timer.daemon = True
-        timer.start()
-        return timer
 
     def _prepare_attempt(self, session: Session, *, worker: Worker, attempt: Attempt | None, control_token: str, workspace: Path | None = None) -> str | None:
         if attempt is None:
@@ -441,36 +419,144 @@ class CodexHarnessRuntime:
         attempt.last_event_at = now_utc()
         if resume_thread_id:
             if workspace is not None:
-                source_home = self.settings.codex_workspace_dir / parent.project_id / parent.worker_id / "runtime" / "codex-home"
-                target_home = workspace / "runtime" / "codex-home"
-                if source_home.is_dir():
-                    skipped = self._copy_resume_home(source_home, target_home)
-                    if skipped:
-                        session.add(
-                            WorkerEvent(
-                                project_id=worker.project_id,
-                                worker_id=worker.id,
-                                intent_id=worker.intent_id,
-                                attempt_id=attempt.id,
-                                event_type="codex.resume_files_skipped",
-                                payload_json={"paths": skipped[:100], "count": len(skipped)},
-                            )
-                        )
-            attempt.codex_thread_id = resume_thread_id
-            attempt.resume_count = parent.resume_count + 1
-            session.add(
-                WorkerEvent(
-                    project_id=worker.project_id,
-                    worker_id=worker.id,
-                    intent_id=worker.intent_id,
-                    attempt_id=attempt.id,
-                    event_type="codex.resume_scheduled",
-                    payload_json={"thread_id": resume_thread_id, "resume_count": attempt.resume_count, "parent_attempt_id": parent.id},
+                valid, diagnostic = self._restore_resume_manifest(
+                    session,
+                    parent=parent,
+                    workspace=workspace,
                 )
-            )
+                if not valid:
+                    resume_thread_id = None
+                    session.add(
+                        WorkerEvent(
+                            project_id=worker.project_id,
+                            worker_id=worker.id,
+                            intent_id=worker.intent_id,
+                            attempt_id=attempt.id,
+                            event_type="codex.resume_rejected",
+                            payload_json=diagnostic,
+                        )
+                    )
+            attempt.codex_thread_id = resume_thread_id
+            if resume_thread_id:
+                attempt.resume_count = parent.resume_count + 1
+                session.add(
+                    WorkerEvent(
+                        project_id=worker.project_id,
+                        worker_id=worker.id,
+                        intent_id=worker.intent_id,
+                        attempt_id=attempt.id,
+                        event_type="codex.resume_scheduled",
+                        payload_json={"thread_id": resume_thread_id, "resume_count": attempt.resume_count, "parent_attempt_id": parent.id},
+                    )
+                )
         session.add(attempt)
         session.commit()
         return resume_thread_id
+
+    def _restore_resume_manifest(
+        self,
+        session: Session,
+        *,
+        parent: Attempt,
+        workspace: Path,
+    ) -> tuple[bool, dict[str, Any]]:
+        workspace.mkdir(parents=True, exist_ok=True)
+        manifest_artifact = session.get(Artifact, parent.resume_manifest_artifact_id) if parent.resume_manifest_artifact_id else None
+        if manifest_artifact is None or manifest_artifact.project_id != parent.project_id:
+            return False, {"reason": "resume_manifest_missing", "parent_attempt_id": parent.id}
+        try:
+            raw = Path(manifest_artifact.path).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != manifest_artifact.sha256:
+                raise ValueError("manifest artifact hash mismatch")
+            manifest = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return False, {"reason": "resume_manifest_invalid", "detail": str(exc)[:500], "parent_attempt_id": parent.id}
+        if manifest.get("project_id") != parent.project_id or manifest.get("attempt_id") != parent.id:
+            return False, {"reason": "resume_manifest_scope_mismatch", "parent_attempt_id": parent.id}
+
+        errors: list[dict[str, str]] = []
+        if not manifest.get("inputs_complete"):
+            errors.append({"path": "inputs/manifest.json", "reason": "input_manifest_incomplete"})
+        if not manifest.get("work_state_complete"):
+            errors.append({"path": "work", "reason": "work_state_incomplete"})
+        for item in manifest.get("inputs", []):
+            if not isinstance(item, dict):
+                continue
+            relative = Path(str(item.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "inputs":
+                errors.append({"path": str(relative), "reason": "unsafe_input_path"})
+                continue
+            target = workspace / relative
+            if not target.is_file():
+                errors.append({"path": str(item.get("path") or ""), "reason": "missing_input"})
+                continue
+            if self._sha256_file(target) != item.get("sha256"):
+                errors.append({"path": str(item.get("path") or ""), "reason": "input_hash_mismatch"})
+
+        work_dir = workspace / "work"
+        work_dir.mkdir(exist_ok=True)
+        for item in manifest.get("work_files", []):
+            if not isinstance(item, dict):
+                continue
+            relative = Path(str(item.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                errors.append({"path": str(relative), "reason": "unsafe_work_path"})
+                continue
+            artifact = session.get(Artifact, item.get("artifact_id"))
+            if artifact is None or artifact.project_id != parent.project_id or artifact.sha256 != item.get("sha256"):
+                errors.append({"path": str(relative), "reason": "work_artifact_invalid"})
+                continue
+            source = Path(artifact.path)
+            if not source.is_file() or self._sha256_file(source) != artifact.sha256:
+                errors.append({"path": str(relative), "reason": "work_artifact_hash_mismatch"})
+                continue
+            target = work_dir / relative
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            except OSError as exc:
+                errors.append({"path": str(relative), "reason": f"work_restore_failed:{exc}"})
+
+        source_home = self.settings.codex_workspace_dir / parent.project_id / parent.worker_id / "runtime" / "codex-home"
+        target_home = workspace / "runtime" / "codex-home"
+        if not manifest.get("codex_state_complete") or not source_home.is_dir():
+            errors.append({"path": "runtime/codex-home", "reason": "codex_state_incomplete"})
+        else:
+            skipped = self._copy_resume_home(source_home, target_home)
+            errors.extend({"path": path, "reason": "unreadable_codex_state"} for path in skipped)
+            expected_state_paths = {
+                str(item.get("path") or "")
+                for item in manifest.get("codex_state", [])
+                if isinstance(item, dict)
+            }
+            for item in manifest.get("codex_state", []):
+                relative = Path(str(item.get("path") or ""))
+                if relative.is_absolute() or ".." in relative.parts:
+                    errors.append({"path": str(relative), "reason": "unsafe_codex_state_path"})
+                    continue
+                target = target_home / relative
+                if not target.is_file() or self._sha256_file(target) != item.get("sha256"):
+                    errors.append({"path": str(item.get("path") or ""), "reason": "codex_state_hash_mismatch"})
+            actual_state_paths = {
+                str(path.relative_to(target_home))
+                for path in target_home.rglob("*")
+                if path.is_file()
+            }
+            for extra in sorted(actual_state_paths - expected_state_paths):
+                errors.append({"path": extra, "reason": "unexpected_codex_state_file"})
+        if errors:
+            shutil.rmtree(target_home, ignore_errors=True)
+            return False, {
+                "reason": "resume_integrity_failed",
+                "parent_attempt_id": parent.id,
+                "manifest_artifact_id": manifest_artifact.id,
+                "errors": errors[:100],
+            }
+        return True, {
+            "reason": "resume_integrity_verified",
+            "parent_attempt_id": parent.id,
+            "manifest_artifact_id": manifest_artifact.id,
+        }
 
     @staticmethod
     def _copy_resume_home(source_home: Path, target_home: Path) -> list[str]:
@@ -496,15 +582,20 @@ class CodexHarnessRuntime:
         return skipped
 
     @staticmethod
-    def _record_codex_event(session: Session, *, worker: Worker, attempt: Attempt | None, stream: str, line: str) -> None:
-        if attempt is None or stream != "stdout" or not line.startswith("{"):
+    def _record_codex_event(session: Session, *, worker: Worker, attempt: Attempt | None, stream: str, line: str) -> str | None:
+        if attempt is None:
+            return None
+        if stream == "control":
+            CodexHarnessRuntime._begin_finalization(session, worker=worker, attempt=attempt, reason=line)
+            return None
+        if stream != "stdout" or not line.startswith("{"):
             return
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            return
+            return None
         if not isinstance(event, dict):
-            return
+            return None
         event_type = str(event.get("type") or "unknown")[:100]
         thread_id = event.get("thread_id") or event.get("session_id")
         turn_id = event.get("turn_id")
@@ -516,6 +607,7 @@ class CodexHarnessRuntime:
         attempt.last_event_at = now_utc()
         session.add(attempt)
         item_type = str(item.get("type") or "")[:100]
+        finalization_reason: str | None = None
         if item_type == "command_execution" and str(item.get("status") or event.get("status") or "") in {"completed", "failed", "done", ""}:
             command = CodexHarnessRuntime._redact_command(item.get("command") or event.get("command"))
             exit_code = item.get("exit_code", event.get("exit_code"))
@@ -571,6 +663,41 @@ class CodexHarnessRuntime:
                         payload_json={"max_agent_actions": max_actions, "observed": len(action_count)},
                     )
                 )
+                finalization_reason = "action_budget_exhausted"
+            if exit_code not in (None, 0):
+                fingerprint = route_fingerprint(trace.request_json)
+                failed_repeats = sum(
+                    1
+                    for candidate in session.exec(
+                        select(ToolTrace).where(
+                            ToolTrace.project_id == worker.project_id,
+                            ToolTrace.tool_name == "codex.shell",
+                        )
+                    ).all()
+                    if candidate.exit_code not in (None, 0)
+                    and route_fingerprint(candidate.request_json) == fingerprint
+                )
+                max_repeats = int((worker.budgets or {}).get("max_route_repeats", 0) or 0)
+                if max_repeats and failed_repeats >= max_repeats:
+                    finalization_reason = finalization_reason or "route_repeat_exhausted"
+
+            max_no_progress = int((worker.budgets or {}).get("max_no_progress_actions", 0) or 0)
+            if max_no_progress:
+                latest_progress = session.exec(
+                    select(WorkerEvent)
+                    .where(
+                        WorkerEvent.attempt_id == attempt.id,
+                        WorkerEvent.event_type.in_(["checkpoint.saved", "blackboard.fact_appended"]),
+                    )
+                    .order_by(WorkerEvent.created_at.desc())
+                ).first()
+                actions_without_progress = sum(
+                    1
+                    for candidate in action_count
+                    if latest_progress is None or _utc_datetime(candidate.created_at) > _utc_datetime(latest_progress.created_at)
+                )
+                if actions_without_progress >= max_no_progress:
+                    finalization_reason = finalization_reason or "no_progress_exhausted"
         session.add(
             WorkerEvent(
                 project_id=worker.project_id,
@@ -585,6 +712,79 @@ class CodexHarnessRuntime:
                     "item_type": item_type,
                     "item_status": str(item.get("status") or event.get("status") or "")[:100],
                 },
+            )
+        )
+        session.commit()
+        if finalization_reason:
+            CodexHarnessRuntime._begin_finalization(
+                session,
+                worker=worker,
+                attempt=attempt,
+                reason=finalization_reason,
+            )
+        return finalization_reason
+
+    @staticmethod
+    def _begin_finalization(session: Session, *, worker: Worker, attempt: Attempt, reason: str) -> None:
+        session.refresh(attempt)
+        if attempt.status == "FINALIZING":
+            return
+        if attempt.status != "RUNNING":
+            return
+        attempt.status = "FINALIZING"
+        attempt.finalization_reason = reason[:100]
+        attempt.last_event_at = now_utc()
+        traces = session.exec(
+            select(ToolTrace)
+            .where(ToolTrace.attempt_id == attempt.id, ToolTrace.tool_name == "codex.shell")
+            .order_by(ToolTrace.created_at.desc())
+            .limit(10)
+        ).all()
+        failed_routes = [
+            route_fingerprint(trace.request_json)
+            for trace in traces
+            if trace.exit_code not in (None, 0)
+        ][:5]
+        grace = int((worker.budgets or {}).get("finalize_grace_seconds", 60) or 60)
+        event_type = "attempt.soft_deadline" if reason == "soft_timeout" else "attempt.budget_enforced"
+        session.add(attempt)
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type=event_type,
+                payload_json={"reason": reason, "action": "interrupt_and_finalize", "grace_seconds": grace},
+            )
+        )
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type="checkpoint.saved",
+                payload_json={
+                    "summary": f"Runtime requested finalization: {reason}",
+                    "completed_steps": [f"Recorded {len(traces)} recent Codex shell action(s)."],
+                    "failed_routes": failed_routes,
+                    "next_step": "Resume from the latest evidence without repeating failed routes.",
+                    "artifact_refs": list(attempt.artifact_refs),
+                    "source": "runtime_enforced",
+                    "blackboard_version": attempt.blackboard_version + 1,
+                },
+            )
+        )
+        attempt.blackboard_version += 1
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type="attempt.finalization_started",
+                payload_json={"reason": reason, "mode": "runtime_enforced", "grace_seconds": grace},
             )
         )
         session.commit()
@@ -603,6 +803,7 @@ class CodexHarnessRuntime:
         prompt = PromptRenderer().render_codex_task(worker=worker, snapshot=snapshot)
         prompt_file.write_text(prompt, encoding="utf-8")
         schema_file.write_text(json.dumps(self._json_schema(), ensure_ascii=False, indent=2), encoding="utf-8")
+        (workspace / "work").mkdir(exist_ok=True)
         (workspace / "subagent-context.json").write_text(
             json.dumps(
                 {
@@ -696,16 +897,164 @@ class CodexHarnessRuntime:
         input_dir.mkdir(exist_ok=True)
         manifest: list[dict[str, str]] = []
         artifacts = session.exec(
-            select(Artifact).where(Artifact.project_id == snapshot.project_id, Artifact.type != "codex-transcript")
+            select(Artifact).where(
+                Artifact.project_id == snapshot.project_id,
+                Artifact.type.not_in(["codex-transcript", "resume-manifest", "resume-work-file"]),
+            )
         ).all()
         for artifact in artifacts:
             source = Path(artifact.path)
             if not source.is_file():
                 continue
+            if CodexHarnessRuntime._sha256_file(source) != artifact.sha256:
+                continue
             target = input_dir / f"{artifact.id}_{source.name}"
             shutil.copy2(source, target)
-            manifest.append({"artifact_id": artifact.id, "path": f"inputs/{target.name}"})
+            manifest.append({"artifact_id": artifact.id, "path": f"inputs/{target.name}", "sha256": artifact.sha256})
         (input_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _persist_resume_manifest(self, session: Session, *, attempt: Attempt, workspace: Path) -> Artifact:
+        input_manifest = workspace / "inputs" / "manifest.json"
+        inputs_complete = True
+        try:
+            inputs = json.loads(input_manifest.read_text(encoding="utf-8"))
+            if not isinstance(inputs, list):
+                inputs = []
+                inputs_complete = False
+        except (OSError, json.JSONDecodeError):
+            inputs = []
+            inputs_complete = False
+        for item in inputs:
+            if not isinstance(item, dict):
+                inputs_complete = False
+                continue
+            relative = Path(str(item.get("path") or ""))
+            target = workspace / relative
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not target.is_file()
+                or self._sha256_file(target) != item.get("sha256")
+            ):
+                inputs_complete = False
+
+        work_files: list[dict[str, Any]] = []
+        work_dir = workspace / "work"
+        total_bytes = 0
+        candidates = sorted(path for path in work_dir.rglob("*") if path.is_file()) if work_dir.is_dir() else []
+        work_state_complete = len(candidates) <= self.settings.resume_max_files
+        for path in candidates[: self.settings.resume_max_files]:
+            if path.is_symlink():
+                work_state_complete = False
+                continue
+            size = path.stat().st_size
+            if total_bytes + size > self.settings.resume_max_bytes:
+                work_state_complete = False
+                break
+            relative = path.relative_to(work_dir)
+            artifact = self.artifact_store.write_file(
+                session,
+                project_id=attempt.project_id,
+                source_attempt_id=attempt.id,
+                source=path,
+                summary=f"Resumable worker file: {relative}",
+                artifact_type="resume-work-file",
+                sensitivity="restricted",
+                origin_kind="runtime_state",
+            )
+            work_files.append({
+                "path": str(relative),
+                "artifact_id": artifact.id,
+                "sha256": artifact.sha256,
+                "size": artifact.size,
+            })
+            total_bytes += size
+
+        codex_state, codex_complete = self._codex_state_manifest(workspace / "runtime" / "codex-home")
+        payload = {
+            "version": 1,
+            "project_id": attempt.project_id,
+            "attempt_id": attempt.id,
+            "parent_attempt_id": attempt.parent_attempt_id,
+            "codex_thread_id": attempt.codex_thread_id,
+            "inputs": inputs if isinstance(inputs, list) else [],
+            "inputs_complete": inputs_complete,
+            "work_files": work_files,
+            "work_files_total_bytes": total_bytes,
+            "work_state_complete": work_state_complete,
+            "codex_state": codex_state,
+            "codex_state_complete": codex_complete,
+        }
+        manifest = self.artifact_store.write_text(
+            session,
+            project_id=attempt.project_id,
+            source_attempt_id=attempt.id,
+            content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            summary="Validated attempt resume manifest",
+            artifact_type="resume-manifest",
+            sensitivity="restricted",
+            origin_kind="runtime_state",
+        )
+        attempt.resume_manifest_artifact_id = manifest.id
+        session.add(attempt)
+        session.add(
+            WorkerEvent(
+                project_id=attempt.project_id,
+                worker_id=attempt.worker_id,
+                intent_id=attempt.intent_id,
+                attempt_id=attempt.id,
+                event_type="attempt.resume_manifest_saved",
+                payload_json={
+                    "manifest_artifact_id": manifest.id,
+                    "input_count": len(payload["inputs"]),
+                    "work_file_count": len(work_files),
+                    "inputs_complete": inputs_complete,
+                    "work_state_complete": work_state_complete,
+                    "codex_state_complete": codex_complete,
+                },
+            )
+        )
+        session.commit()
+        return manifest
+
+    def _codex_state_manifest(self, home: Path) -> tuple[list[dict[str, Any]], bool]:
+        if not home.is_dir():
+            return [], False
+        entries: list[dict[str, Any]] = []
+        walk_errors: list[OSError] = []
+        complete = True
+        for root, directories, filenames in os.walk(home, onerror=walk_errors.append):
+            directories.sort()
+            filenames.sort()
+            for filename in filenames:
+                path = Path(root) / filename
+                if len(entries) >= self.settings.resume_max_files:
+                    complete = False
+                    break
+                try:
+                    if path.is_symlink():
+                        complete = False
+                        continue
+                    entries.append({
+                        "path": str(path.relative_to(home)),
+                        "sha256": self._sha256_file(path),
+                        "size": path.stat().st_size,
+                    })
+                except OSError:
+                    complete = False
+            if len(entries) >= self.settings.resume_max_files:
+                break
+        if walk_errors:
+            complete = False
+        return entries, complete and bool(entries)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _json_schema(self) -> dict[str, Any]:
         array = {"type": "array", "items": {"type": "object"}}
@@ -777,7 +1126,17 @@ class CodexHarnessRuntime:
             base_url = f"{base_url}/v1"
         return base_url
 
-    def _run_command(self, command: str, cwd: Path, *, timeout_seconds: object = None, runner: CommandRunner | None = None, on_output=None) -> CommandResult:
+    def _run_command(
+        self,
+        command: str,
+        cwd: Path,
+        *,
+        timeout_seconds: object = None,
+        soft_timeout_seconds: object = None,
+        finalize_grace_seconds: object = None,
+        runner: CommandRunner | None = None,
+        on_output=None,
+    ) -> CommandResult:
         configured = self.settings.codex_timeout_seconds if self.settings.codex_timeout_seconds > 0 else None
         budget_timeout = int(timeout_seconds) if timeout_seconds else None
         timeout = min(value for value in (configured, budget_timeout) if value is not None) if configured or budget_timeout else None
@@ -785,7 +1144,14 @@ class CodexHarnessRuntime:
         if selected_runner is None:
             selected_runner = AutoCommandRunner(prefer_kali=True, allow_local_fallback=False)
         if on_output is not None and hasattr(selected_runner, "run_streaming"):
-            return selected_runner.run_streaming(command=command, cwd=cwd, timeout=timeout, on_output=on_output)
+            return selected_runner.run_streaming(
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+                on_output=on_output,
+                soft_timeout=int(soft_timeout_seconds) if soft_timeout_seconds else None,
+                finalize_grace=int(finalize_grace_seconds) if finalize_grace_seconds else 10,
+            )
         return selected_runner.run(command=command, cwd=cwd, timeout=timeout)
 
     def _transcript(self, command: str, completed: CommandResult) -> str:
@@ -870,6 +1236,8 @@ class CodexHarnessRuntime:
     @staticmethod
     def _provider_failure_kind(stderr: str) -> str | None:
         lowered = stderr.lower()
+        if "aurora cc switch proxy is unavailable" in lowered or "could not resolve host: aurora-cc-switch" in lowered:
+            return "provider_unavailable"
         if "maximum context length" in lowered or "context_length_exceeded" in lowered:
             return "context_length_exceeded"
         if '"type":"invalid_request_error"' in lowered or "invalid_request_error" in lowered:

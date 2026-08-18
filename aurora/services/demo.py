@@ -40,6 +40,7 @@ def _execution_budget(intent: object) -> dict:
         "max_repeat_failures": int(raw.get("max_repeat_failures", settings.default_max_repeat_failures)),
         "max_agent_actions": int(raw.get("max_agent_actions", phase_defaults.get("max_agent_actions", settings.default_max_agent_actions))),
         "max_route_repeats": int(raw.get("max_route_repeats", phase_defaults.get("max_route_repeats", settings.default_max_route_repeats))),
+        "max_no_progress_actions": int(raw.get("max_no_progress_actions", settings.default_max_no_progress_actions)),
         "finalize_grace_seconds": int(raw.get("finalize_grace_seconds", settings.default_finalize_grace_seconds)),
     }
     if budget["hard_timeout_seconds"] <= budget["soft_timeout_seconds"]:
@@ -196,6 +197,7 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         intent_id=intent.id,
         worker_id=worker.id,
         parent_attempt_id=parent_attempt.id if parent_attempt else None,
+        lease_generation=worker.lease_generation,
     )
     session.add(attempt)
     session.commit()
@@ -490,8 +492,31 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         session.commit()
     final_status = "FAILED" if structured.get("status") == "failed" else "COMPLETED"
     scheduler.complete(session, intent=intent, worker=worker, status=final_status)
+    failed_attempts = structured.get("failed_attempts", [])
+    if not isinstance(failed_attempts, list):
+        failed_attempts = []
+    failure_reasons = {
+        str(item.get("reason") or "")
+        for item in failed_attempts
+        if isinstance(item, dict)
+    }
+    runtime_unavailable = "provider_unavailable" in failure_reasons
+    if runtime_unavailable:
+        message = "CC Switch proxy is unavailable; restore its health before starting another Worker."
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                event_type="runtime.preflight_failed",
+                payload_json={"reason": "provider_unavailable", "message": message},
+            )
+        )
+        session.commit()
     return {
-        "status": final_status.lower(),
+        "status": "runtime_preflight_failed" if runtime_unavailable else final_status.lower(),
+        "message": message if runtime_unavailable else None,
         "project_id": project_id,
         "intent_id": intent.id,
         "worker_id": worker.id,

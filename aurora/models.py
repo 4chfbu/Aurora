@@ -3,7 +3,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import Column, UniqueConstraint
-from sqlalchemy.types import JSON
+from sqlalchemy.types import JSON, LargeBinary
 from sqlmodel import Field, SQLModel
 
 
@@ -20,6 +20,22 @@ class NetworkProxySetting(SQLModel, table=True):
     mode: str = "system"
     proxy_url: str | None = None
     no_proxy: str = "127.0.0.1,localhost,aurora-cc-switch"
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class OpenVPNSetting(SQLModel, table=True):
+    id: str = Field(default="global", primary_key=True)
+    encrypted_payload: bytes = Field(sa_column=Column(LargeBinary))
+    salt: bytes = Field(sa_column=Column(LargeBinary))
+    nonce: bytes = Field(sa_column=Column(LargeBinary))
+    routes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    credentials_configured: bool = False
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
+class SchemaVersion(SQLModel, table=True):
+    id: str = Field(default="aurora", primary_key=True)
+    version: int = 1
     updated_at: datetime = Field(default_factory=now_utc)
 
 
@@ -107,6 +123,7 @@ class Intent(SQLModel, table=True):
     status: str = Field(default="PENDING", index=True)
     lease_owner: str | None = Field(default=None, index=True)
     lease_expires_at: datetime | None = Field(default=None, index=True)
+    lease_generation: int = 0
     retry_count: int = 0
     max_retries: int = 1
     budget: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -126,7 +143,10 @@ class Attempt(SQLModel, table=True):
     last_event_at: datetime | None = None
     resume_count: int = 0
     blackboard_version: int = 0
+    lease_generation: int = 0
     status: str = "RUNNING"
+    finalization_reason: str | None = None
+    resume_manifest_artifact_id: str | None = Field(default=None, index=True)
     result_summary: str | None = None
     failure_reason: str | None = None
     artifact_refs: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -168,6 +188,7 @@ class Worker(SQLModel, table=True):
     sandbox_id: str | None = None
     capability_set: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     status: str = Field(default="STARTING", index=True)
+    lease_generation: int = 0
     lease: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     heartbeat: datetime = Field(default_factory=now_utc)
     budgets: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))

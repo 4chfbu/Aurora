@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from sqlmodel import Session, select
@@ -23,6 +23,7 @@ from aurora.models import Artifact, ChallengeGroup, ChallengeGroupItem, Fact, Im
 from aurora.services.demo import create_project_with_bootstrap
 from aurora.services.prompt_renderer import PromptRenderer
 from aurora.services.network_proxy import network_proxy_registry
+from aurora.services.tsecbench import TSecBenchClient, TSecBenchNeedsSession, TSecBenchError
 
 
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
@@ -123,6 +124,7 @@ class HandsFreeService:
         cataloger: Cataloger | None = None,
         authenticated_fetcher_factory: AuthenticatedFetcherFactory | None = None,
         ctfplus_attachment_collector: AttachmentCollector | None = None,
+        tsecbench_client: TSecBenchClient | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.fetch_text = fetch_text or self._fetch_text
@@ -134,6 +136,19 @@ class HandsFreeService:
         # Kept as a constructor alias for compatibility with existing callers;
         # the collector is now used for every platform, not only CTF+.
         self.attachment_collector = ctfplus_attachment_collector or self._collect_browser_attachments
+        if tsecbench_client is not None:
+            self.tsecbench_client = tsecbench_client
+        elif fetch_json is not None:
+            # Preserve the service's established injectable fetch_json seam for
+            # deterministic tests and embedders. The production client still
+            # uses its own HTTP implementation so it can set BENCHMARK_TOKEN.
+            def _injected_tsecbench_request(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None, token: str | None = None) -> Any:
+                if method == "GET" and payload is None:
+                    return self.fetch_json(url, token)
+                return self.post_json(url, payload or {}, token)
+            self.tsecbench_client = TSecBenchClient(self.settings, request_json=_injected_tsecbench_request)
+        else:
+            self.tsecbench_client = TSecBenchClient(self.settings)
 
     def create_batch(self, session: Session, source_url: str, *, cookie: str | None = None, username: str | None = None, password: str | None = None) -> ImportBatch:
         source_url = self._safe_url(source_url)
@@ -192,30 +207,37 @@ class HandsFreeService:
                 authenticated_json = getattr(fetcher, "fetch_json", None)
                 if callable(authenticated_json):
                     fetch_json = authenticated_json
-            html, final_url = fetch_text(batch.source_url)
-            final_url = self._safe_url(final_url)
-            if self._looks_like_login_page(html, final_url):
-                raise NeedsSessionError("Login is required. Provide a valid Cookie to continue.", urlparse(final_url).hostname)
-            inventory = self._inventory(html, final_url)
             self._progress(progress, "DETECTING", "正在识别题目平台和数据来源。")
-            if self._is_ctfplus_problem_bank(final_url):
+            tsecbench_url = self._is_tsecbench_url(batch.source_url)
+            if tsecbench_url:
+                final_url = self._safe_url(batch.source_url)
+                inventory = {"page_url": final_url, "title": "TSecBench", "text": "", "links": [], "collected_links": []}
+                self._progress(progress, "CATALOGING", "检测到 TSecBench，正在读取题目 API。")
+                collection = self._tsecbench_collection(final_url, inventory)
+            else:
+                html, final_url = fetch_text(batch.source_url)
+                final_url = self._safe_url(final_url)
+                if self._looks_like_login_page(html, final_url):
+                    raise NeedsSessionError("Login is required. Provide a valid Cookie to continue.", urlparse(final_url).hostname)
+                inventory = self._inventory(html, final_url)
+            if not tsecbench_url and self._is_ctfplus_problem_bank(final_url):
                 self._progress(progress, "CATALOGING", "正在通过 CTF+ 题库 API 识别当前页题目。")
                 inventory, candidates, model_result = self._ctfplus_problem_bank(final_url, cookie=cookie, inventory=inventory)
                 collection = CollectionResult(inventory, candidates, str(model_result.get("summary", "")), "ctfplus", "platform_api", int(model_result.get("pages_scanned", 1)))
-            elif self._is_ctfd_page(html, inventory):
+            elif not tsecbench_url and self._is_ctfd_page(html, inventory):
                 self._progress(progress, "CATALOGING", "检测到 CTFd，正在读取题目 API 和详情。")
                 collection = self._ctfd_collection(final_url, inventory, fetch_json)
-            else:
+            elif not tsecbench_url:
                 self._progress(progress, "CATALOGING", "正在归集静态页面和浏览器响应。")
                 collection = self._generic_collection(final_url, inventory, cookie=cookie, fetcher=fetcher, progress=progress)
             inventory = collection.inventory
             self._progress(progress, "VALIDATING", "正在验证题目身份、来源并去重。")
             candidates = self._deduplicate_candidates(collection.candidates)
             model_result = {"summary": collection.summary}
-            if candidates:
+            if candidates and collection.platform != "tsecbench":
                 self._progress(progress, "DETAILS", f"正在检查 {len(candidates)} 个题目详情页中的附件。")
                 self._enrich_candidate_attachments(candidates, fetch_text)
-            if candidates:
+            if candidates and collection.platform != "tsecbench":
                 self._progress(progress, "DETAILS", f"正在从 {len(candidates)} 个题目详情页补全浏览器下载附件。")
                 collect_in_session = getattr(fetcher, "collect_attachments", None) if fetcher is not None else None
                 if callable(collect_in_session):
@@ -296,6 +318,14 @@ class HandsFreeService:
             import_batch_id=batch_id,
             name=(batch.title or f"Imported batch {batch_id[-8:]}")[:240],
             limits={"max_iterations": 20, "max_minutes": 0, "no_progress_limit": 4, "stop_on_observer_escalate": True},
+            # TSecBench targets are allocated lazily when an item is
+            # dispatched.  The platform permits a small bounded pool rather
+            # than requiring every imported challenge to own a target.
+            max_concurrent=(
+                max(1, int(self.settings.tsecbench_max_concurrent or 1))
+                if batch.platform == "tsecbench"
+                else 1
+            ),
         )
         session.add(group)
         session.commit()
@@ -349,6 +379,49 @@ class HandsFreeService:
     def _is_ctfplus_problem_bank(url: str) -> bool:
         parsed = urlparse(url)
         return (parsed.hostname or "").lower().rstrip(".") in {"ctfplus.cn", "www.ctfplus.cn"} and parsed.path.rstrip("/") == "/learning/problem/problem-bank"
+
+    def _is_tsecbench_url(self, url: str) -> bool:
+        parsed = urlparse(url)
+        configured = urlparse(self.settings.tsecbench_base_url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        configured_host = (configured.hostname or "").lower().rstrip(".")
+        return parsed.path.rstrip("/").endswith("/openapi/v1/challenges") or bool(host and configured_host and host == configured_host)
+
+    def _tsecbench_collection(self, source_url: str, inventory: dict[str, Any]) -> CollectionResult:
+        try:
+            challenges = self.tsecbench_client.list_challenges()
+        except TSecBenchNeedsSession as exc:
+            raise NeedsSessionError(str(exc), urlparse(source_url).hostname) from exc
+        except TSecBenchError as exc:
+            raise ValueError(str(exc)) from exc
+        candidates: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
+        for challenge in challenges[: self.settings.cataloger_max_candidates]:
+            metadata = {
+                "platform": "tsecbench",
+                "unique_code": challenge.unique_code,
+                "difficulty": challenge.difficulty,
+                "level": challenge.level,
+                "points": challenge.points,
+                "flag_count": challenge.flag_count,
+                "correct_flag_count": challenge.correct_flag_count,
+                "is_completed": challenge.is_completed,
+                "container_status": challenge.container_status,
+                "container_addr": challenge.container_addr,
+                "provenance": "platform_api",
+            }
+            candidates.append({
+                "title": challenge.title[:500],
+                "description": challenge.description[:5000],
+                "challenge_url": f"{self.settings.tsecbench_base_url.rstrip('/')}/openapi/v1/challenges?unique_code={quote(challenge.unique_code, safe='')}",
+                "challenge_type": self._challenge_type(f"{challenge.challenge_type} {challenge.unique_code}", []),
+                "confidence": 1.0,
+                "attachment_urls": [],
+                "source_metadata": metadata,
+            })
+        inventory["title"] = "TSecBench"
+        inventory["text"] = f"TSecBench challenge list ({len(candidates)})"
+        return CollectionResult(inventory, candidates, f"TSecBench API identified {len(candidates)} challenge(s).", "tsecbench", "platform_api", 1, diagnostics)
 
     @staticmethod
     def _is_ctfd_page(html: str, inventory: dict[str, Any]) -> bool:
@@ -707,7 +780,7 @@ class HandsFreeService:
         result: list[dict[str, Any]] = []
         for candidate in candidates:
             metadata = candidate.get("source_metadata") if isinstance(candidate.get("source_metadata"), dict) else {}
-            identity = (str(metadata.get("platform") or "url"), str(metadata.get("challenge_id") or candidate.get("challenge_url") or ""))
+            identity = (str(metadata.get("platform") or "url"), str(metadata.get("unique_code") or metadata.get("challenge_id") or candidate.get("challenge_url") or ""))
             if not identity[1] or identity in seen:
                 continue
             seen.add(identity)

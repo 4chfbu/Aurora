@@ -16,7 +16,7 @@ from aurora.db import engine
 from aurora.config import get_settings
 from aurora.models import Attempt, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
 from aurora.services.autorunner import AutoRunLimits
-from aurora.services.competition_adapter import CompetitionAdapter, LocalCompetitionAdapter
+from aurora.services.competition_adapter import CompetitionAdapter, CompetitionSubmissionResult, LocalCompetitionAdapter, TSecBenchCompetitionAdapter
 from aurora.services.container_control import stop_project_containers
 from aurora.services.harvester_runner import AutoRunnerHarvester, HarvesterRunner
 from aurora.services.project_repair import reopen_project_after_invalid_flag
@@ -37,6 +37,16 @@ class ChallengeGroupRunner:
     def __init__(self, *, harvester: HarvesterRunner | None = None, competition: CompetitionAdapter | None = None) -> None:
         self.harvester = harvester or AutoRunnerHarvester()
         self.competition = competition or LocalCompetitionAdapter()
+        self._tsecbench_competition: TSecBenchCompetitionAdapter | None = None
+
+    def _competition_for(self, item: ChallengeGroupItem | None) -> CompetitionAdapter:
+        if item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench" and isinstance(self.competition, LocalCompetitionAdapter):
+            if not get_settings().tsecbench_configured:
+                return self.competition
+            if self._tsecbench_competition is None:
+                self._tsecbench_competition = TSecBenchCompetitionAdapter()
+            return self._tsecbench_competition
+        return self.competition
 
     def run(self, session: Session, *, group_id: str, should_stop: callable | None = None, on_project: callable | None = None) -> None:
         group = session.get(ChallengeGroup, group_id)
@@ -49,12 +59,16 @@ class ChallengeGroupRunner:
         session.commit()
         self._reactivate_waiting_inputs(session, group_id=group_id)
 
-        if min(int(group.max_concurrent or 1), max(1, get_settings().max_challenge_group_concurrent)) > 1:
+        # Targets are allocated lazily by the competition adapter.  TSecBench
+        # allows a bounded pool of live instances, so dispatch up to that
+        # configured limit instead of requiring targets during import.
+        if self._max_workers(session, group) > 1:
             self._run_concurrent(session, group_id=group_id, should_stop=should_stop, on_project=on_project)
             return
 
         while True:
             if should_stop and should_stop():
+                self._close_running_environments(session, group_id=group_id)
                 group.status = "STOPPED"
                 group.updated_at = now_utc()
                 session.add(group)
@@ -161,7 +175,7 @@ class ChallengeGroupRunner:
                 # whose statement explicitly says that no flag is required.
                 # They are terminal analysis tasks, not failed flag recovery.
                 outcome, reason = "NO_FLAG_COMPLETED", "statement_explicitly_requires_no_flag"
-            elif self._requires_target(project):
+            elif self._requires_target(project, item):
                 item.fused_status = "WAITING_INPUT"
                 item.status = "WAITING_INPUT"
                 item.stop_reason = "target_required_before_web_actions"
@@ -189,7 +203,7 @@ class ChallengeGroupRunner:
                 self._apply_phase_attempt_budget(session, project_id=project.id, phase=item.phase)
                 environment_warning: str | None = None
                 try:
-                    health = self.competition.ensure_environment(session, project_id=project.id)
+                    health = self._competition_for(item).ensure_environment(session, project_id=project.id)
                     if not health.available:
                         environment_warning = health.reason or "environment_unavailable"
                 except Exception as exc:
@@ -200,8 +214,22 @@ class ChallengeGroupRunner:
                         group_id,
                         item.id,
                         "group.item.environment_unavailable",
-                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": True},
+                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": not self._is_tsecbench_item(item)},
                     )
+                if environment_warning and self._is_tsecbench_item(item):
+                    item.fused_status = "WAITING_INPUT"
+                    item.status = "WAITING_INPUT"
+                    item.stop_reason = "tsecbench_environment_unavailable"
+                    project.status = "WAITING_INPUT"
+                    project.updated_at = now_utc()
+                    group.current_item_id = None
+                    group.updated_at = now_utc()
+                    session.add(project)
+                    session.add(item)
+                    session.add(group)
+                    self._event(session, group_id, item.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "tsecbench_environment", "reason": environment_warning})
+                    session.commit()
+                    continue
                 self._maybe_fetch_hint(session, item=item, project=project)
                 task = self._task_payload(session, item=item, project=project)
                 self._event(session, group_id, item.id, "group.item.dispatched", {"project_id": project.id, "phase": item.phase, "hint_taken": item.hint_taken, "environment_warning": environment_warning})
@@ -222,11 +250,15 @@ class ChallengeGroupRunner:
 
     def _run_concurrent(self, session: Session, *, group_id: str, should_stop: callable | None, on_project: callable | None) -> None:
         """Run independent projects in bounded waves while preserving phase order."""
-        max_workers = min(max(1, int(session.get(ChallengeGroup, group_id).max_concurrent or 1)), max(1, get_settings().max_challenge_group_concurrent))
+        group = session.get(ChallengeGroup, group_id)
+        if group is None:
+            raise ValueError("challenge group not found")
+        max_workers = self._max_workers(session, group)
         while True:
             if should_stop and should_stop():
                 group = session.get(ChallengeGroup, group_id)
                 if group:
+                    self._close_running_environments(session, group_id=group_id)
                     group.status = "STOPPED"
                     group.current_item_id = None
                     group.updated_at = now_utc()
@@ -296,7 +328,7 @@ class ChallengeGroupRunner:
                         outcome, reason = "CRASHED", "project_missing"
                     elif self._is_explicit_no_flag_challenge(project):
                         outcome, reason = "NO_FLAG_COMPLETED", "statement_explicitly_requires_no_flag"
-                    elif self._requires_target(project):
+                    elif self._requires_target(project, current):
                         current.fused_status = "WAITING_INPUT"
                         current.status = "WAITING_INPUT"
                         current.stop_reason = "target_required_before_web_actions"
@@ -313,11 +345,22 @@ class ChallengeGroupRunner:
                         self._apply_phase_attempt_budget(worker_session, project_id=project.id, phase=current.phase)
                         warning = None
                         try:
-                            health = self.competition.ensure_environment(worker_session, project_id=project.id)
+                            health = self._competition_for(current).ensure_environment(worker_session, project_id=project.id)
                             if not health.available:
                                 warning = health.reason or "environment_unavailable"
                         except Exception as exc:
                             warning = str(exc)[:1000]
+                        if warning and self._is_tsecbench_item(current):
+                            current.fused_status = "WAITING_INPUT"
+                            current.status = "WAITING_INPUT"
+                            current.stop_reason = "tsecbench_environment_unavailable"
+                            project.status = "WAITING_INPUT"
+                            project.updated_at = now_utc()
+                            worker_session.add(project)
+                            worker_session.add(current)
+                            self._event(worker_session, group_id, current.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "tsecbench_environment", "reason": warning})
+                            worker_session.commit()
+                            return item_id, "WAITING_INPUT", "tsecbench_environment_unavailable"
                         self._maybe_fetch_hint(worker_session, item=current, project=project)
                         task = self._task_payload(worker_session, item=current, project=project)
                         self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
@@ -366,8 +409,72 @@ class ChallengeGroupRunner:
         ))
 
     @staticmethod
-    def _requires_target(project: Project) -> bool:
+    def _requires_target(project: Project, item: ChallengeGroupItem | None = None) -> bool:
+        if item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench":
+            return False
         return (project.challenge_type or "").strip().lower() in {"web", "webapp", "web_app"} and not bool(project.target_url)
+
+    @staticmethod
+    def _is_tsecbench_item(item: ChallengeGroupItem | None) -> bool:
+        return item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench"
+
+    @classmethod
+    def _is_tsecbench_group(cls, session: Session, group_id: str) -> bool:
+        items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id)).all()
+        return any(cls._is_tsecbench_item(item) for item in items)
+
+    @classmethod
+    def _max_workers(cls, session: Session, group: ChallengeGroup) -> int:
+        settings = get_settings()
+        if cls._is_tsecbench_group(session, group.id):
+            return min(
+                max(1, int(group.max_concurrent or 1)),
+                max(1, int(settings.tsecbench_max_concurrent or 1)),
+            )
+        return min(
+            max(1, int(group.max_concurrent or 1)),
+            max(1, int(settings.max_challenge_group_concurrent or 1)),
+        )
+
+    @staticmethod
+    def _close_environment(adapter: CompetitionAdapter, session: Session, *, project_id: str) -> None:
+        close_environment = getattr(adapter, "close_environment", None)
+        if not callable(close_environment):
+            return
+        try:
+            close_environment(project_id=project_id, session=session)
+        except TypeError as exc:
+            # Keep third-party adapters implementing the older protocol
+            # operational while they migrate to session-aware cleanup.
+            if "session" not in str(exc):
+                raise
+            close_environment(project_id=project_id)
+
+    def _close_running_environments(self, session: Session, *, group_id: str) -> None:
+        items = session.exec(
+            select(ChallengeGroupItem).where(
+                ChallengeGroupItem.group_id == group_id,
+                ChallengeGroupItem.fused_status == "RUNNING",
+            )
+        ).all()
+        for item in items:
+            try:
+                self._close_environment(self._competition_for(item), session, project_id=item.project_id)
+                self._event(
+                    session,
+                    group_id,
+                    item.id,
+                    "group.item.environment_closed",
+                    {"project_id": item.project_id, "reason": "group_stopped"},
+                )
+            except Exception as exc:
+                self._event(
+                    session,
+                    group_id,
+                    item.id,
+                    "group.item.environment_cleanup_failed",
+                    {"project_id": item.project_id, "error": str(exc)[:1000]},
+                )
 
     @classmethod
     def _reactivate_waiting_inputs(cls, session: Session, *, group_id: str) -> None:
@@ -375,7 +482,7 @@ class ChallengeGroupRunner:
         changed = False
         for item in items:
             project = session.get(Project, item.project_id)
-            if project is not None and not cls._requires_target(project):
+            if project is not None and not cls._requires_target(project, item):
                 item.status = "PENDING"
                 item.fused_status = "PENDING"
                 item.stop_reason = "external_input_satisfied"
@@ -432,11 +539,16 @@ class ChallengeGroupRunner:
         retrying = bool(item.failure_history)
         should_fetch = item.phase == 3 or (item.phase == 2 and (solved == 0 or retrying))
         if should_fetch and not item.hint_taken:
-            hint = self.competition.fetch_hint(session, project_id=project.id)
-            if hint:
+            adapter = self._competition_for(item)
+            try:
+                hint = adapter.fetch_hint(session, project_id=project.id)
                 item.hint_content = hint
                 item.hint_taken = True
                 session.add(item)
+            except Exception as exc:
+                item.hint_taken = True
+                session.add(item)
+                self._event(session, item.group_id, item.id, "group.item.hint_unavailable", {"project_id": project.id, "reason": str(exc)[:500]})
 
     @staticmethod
     def _task_payload(session: Session, *, item: ChallengeGroupItem, project: Project) -> dict[str, Any]:
@@ -449,6 +561,7 @@ class ChallengeGroupRunner:
             "phase": item.phase,
             "attachments": list((item.competition_meta or {}).get("attachments", [])),
             "target": project.target_url,
+            "targets": list((item.competition_meta or {}).get("container_addr", [])) if isinstance((item.competition_meta or {}).get("container_addr"), list) else ([project.target_url] if project.target_url else []),
             "hint": item.hint_content,
             "previous_attempts": list(item.failure_history),
         }
@@ -469,7 +582,9 @@ class ChallengeGroupRunner:
             # A COMPLETED project has already passed platform/manual validation.
             # FLAG_READY/CANDIDATE_READY is the only state that may submit.
                 submission = True if outcome == "COMPLETED" and project is not None and project.status == "COMPLETED" else self._submit_pending_flag(session, item=item)
-            if outcome != "NO_FLAG_COMPLETED" and submission is False:
+            submission_correct = submission.correct if isinstance(submission, CompetitionSubmissionResult) else submission
+            submission_completed = submission.completed if isinstance(submission, CompetitionSubmissionResult) else submission is True
+            if outcome != "NO_FLAG_COMPLETED" and submission_correct is False:
                 terminal = False
                 outcome = "FLAG_REJECTED"
                 reason = "competition platform rejected the candidate flag"
@@ -492,6 +607,13 @@ class ChallengeGroupRunner:
                 reason = "no locally verified flag candidate is available"
                 item.fused_status = "PENDING"
                 item.status = "PENDING"
+            elif outcome != "NO_FLAG_COMPLETED" and submission_correct is True and not submission_completed:
+                terminal = False
+                outcome = "FLAG_PARTIAL"
+                reason = "competition platform accepted one flag; additional flags remain"
+                item.fused_status = "PENDING"
+                item.status = "PENDING"
+                item.phase = 1
             elif outcome != "NO_FLAG_COMPLETED":
                 item.fused_status = "COMPLETED"
                 item.status = "COMPLETED"
@@ -522,13 +644,14 @@ class ChallengeGroupRunner:
         session.add(item)
         session.add(group)
         if item.fused_status in {"COMPLETED", "FAILED"}:
-            close_environment = getattr(self.competition, "close_environment", None)
-            if callable(close_environment):
-                close_environment(project_id=item.project_id)
+            try:
+                self._close_environment(self._competition_for(item), session, project_id=item.project_id)
+            except Exception as exc:
+                self._event(session, group.id, item.id, "group.item.environment_cleanup_failed", {"project_id": item.project_id, "error": str(exc)[:1000]})
         self._event(session, group.id, item.id, "group.item.phase_finished", {"project_id": item.project_id, "outcome": outcome, "reason": reason, "phase": executed_phase, "next_phase": None if item.fused_status in {"COMPLETED", "FAILED"} else item.phase, "fused_status": item.fused_status})
         session.commit()
 
-    def _submit_pending_flag(self, session: Session, *, item: ChallengeGroupItem) -> bool | None:
+    def _submit_pending_flag(self, session: Session, *, item: ChallengeGroupItem) -> bool | None | CompetitionSubmissionResult:
         candidates = session.exec(
             select(FlagCandidate).where(
                 FlagCandidate.project_id == item.project_id,
@@ -551,7 +674,7 @@ class ChallengeGroupRunner:
         candidate.updated_at = now_utc()
         session.add(candidate)
         try:
-            accepted = self.competition.submit_flag(session, project_id=item.project_id, value=value)
+            accepted = self._competition_for(item).submit_flag(session, project_id=item.project_id, value=value)
         except Exception as exc:
             # Platform integrations are an optional verification boundary.  A
             # broken/expired endpoint must not turn an unverified model answer
@@ -581,11 +704,31 @@ class ChallengeGroupRunner:
                 {"project_id": item.project_id, "value": value, "reason": "adapter returned no validation result"},
             )
             return None
-        if accepted:
-            item.submission_status = "SUBMITTED"
+        accepted_flag = accepted.correct if isinstance(accepted, CompetitionSubmissionResult) else accepted
+        completed = accepted.completed if isinstance(accepted, CompetitionSubmissionResult) else bool(accepted)
+        if accepted_flag:
+            item.submission_status = "SUBMITTED" if completed else "PARTIAL"
             candidate.status = "ACCEPTED"
             candidate.updated_at = now_utc()
             project = session.get(Project, item.project_id)
+            if not completed:
+                if project is not None:
+                    project.status = "WORKING"
+                    project.updated_at = now_utc()
+                    session.add(project)
+                pending = session.exec(select(Intent).where(Intent.project_id == item.project_id, Intent.status == "PENDING")).first()
+                if pending is None:
+                    detail = accepted.detail if isinstance(accepted, CompetitionSubmissionResult) else {}
+                    session.add(Intent(
+                        project_id=item.project_id,
+                        objective=f"Continue solving the remaining TSecBench flags after {detail.get('correct_flag_count', 0)}/{detail.get('total_flag_count', '?')} were accepted.",
+                        capability_tags=["sandbox.exec", "blackboard.query"],
+                        priority=2.0,
+                        risk_level="low",
+                        budget={"model_role": "solver"},
+                    ))
+                self._event(session, item.group_id, item.id, "group.item.flag_progress", {"project_id": item.project_id, "candidate_id": candidate.id, **(accepted.detail if isinstance(accepted, CompetitionSubmissionResult) else {})})
+                return accepted
             if project is not None:
                 project.status = "COMPLETED"
                 project.updated_at = now_utc()
@@ -607,7 +750,7 @@ class ChallengeGroupRunner:
                     },
                 )
             )
-            return True
+            return accepted
         item.submission_status = "REJECTED"
         candidate.status = "REJECTED"
         candidate.rejection_reason = "competition platform rejected the candidate flag"
@@ -747,21 +890,20 @@ class ChallengeGroupRunner:
         session.commit()
         session.refresh(item)
         if accepted:
-            close_environment = getattr(self.competition, "close_environment", None)
-            if callable(close_environment):
-                try:
-                    close_environment(project_id=item.project_id)
-                except Exception as exc:
-                    # The validation decision is already durable. Environment
-                    # cleanup is best-effort and must not turn it into an HTTP 500.
-                    self._event(
-                        session,
-                        group_id,
-                        item.id,
-                        "group.item.environment_cleanup_failed",
-                        {"project_id": item.project_id, "error": str(exc)[:1000]},
-                    )
-                    session.commit()
+            try:
+                self._close_environment(self._competition_for(item), session, project_id=item.project_id)
+                session.commit()
+            except Exception as exc:
+                # The validation decision is already durable. Environment
+                # cleanup is best-effort and must not turn it into an HTTP 500.
+                self._event(
+                    session,
+                    group_id,
+                    item.id,
+                    "group.item.environment_cleanup_failed",
+                    {"project_id": item.project_id, "error": str(exc)[:1000]},
+                )
+                session.commit()
             if group.status == "COMPLETED":
                 try:
                     self._write_done_marker(group_id)

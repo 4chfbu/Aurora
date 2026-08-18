@@ -49,6 +49,43 @@ class ArtifactStore:
         session.refresh(artifact)
         return artifact
 
+    def write_file(
+        self,
+        session: Session,
+        *,
+        project_id: str,
+        source: Path,
+        summary: str,
+        source_attempt_id: str | None = None,
+        artifact_type: str = "file",
+        sensitivity: str = "normal",
+        origin_kind: str = "unclassified",
+    ) -> Artifact:
+        data = source.read_bytes()
+        artifact_id = new_id("artifact")
+        project_dir = self.base_dir / project_id
+        project_dir.mkdir(parents=True, exist_ok=True)
+        suffix = source.suffix[:20] if source.suffix else ".bin"
+        path = project_dir / f"{artifact_id}{suffix}"
+        path.write_bytes(data)
+        artifact = Artifact(
+            id=artifact_id,
+            project_id=project_id,
+            source_attempt_id=source_attempt_id,
+            type=artifact_type,
+            path=str(path),
+            sha256=hashlib.sha256(data).hexdigest(),
+            mime_type="application/octet-stream",
+            size=len(data),
+            summary=summary,
+            sensitivity=sensitivity,
+            origin_kind=origin_kind,
+        )
+        session.add(artifact)
+        session.commit()
+        session.refresh(artifact)
+        return artifact
+
     def read_text(self, artifact: Artifact, max_bytes: int = 64_000) -> str:
         data = Path(artifact.path).read_bytes()[:max_bytes]
         return data.decode("utf-8", errors="replace")

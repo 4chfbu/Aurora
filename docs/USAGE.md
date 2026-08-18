@@ -37,7 +37,32 @@ AURORA_CODEX_PROXY_BASE_URL=http://aurora-cc-switch:15723/v1
 
 配置规则：环境变量优先于 `.env`；配置在进程第一次读取时缓存，因此修改 `.env` 后必须重启 API。不要把 `.env`、Cookie 或 API Key 提交到仓库。完整变量说明见 [`CONFIGURATION.md`](CONFIGURATION.md)。
 
+使用 TSecBench 题目时，额外设置 `AURORA_TSECBENCH_BASE_URL` 和 `AURORA_TSECBENCH_TOKEN`。从 TSecBench 根地址或
+`/openapi/v1/challenges` 创建导入批次即可读取题目；确认题目后，Runner 会按平台生命周期启动容器、提交 Flag
+并关闭环境。`container_addr` 仅作为 TSecBench 授权靶机写入该项目的目标和授权范围。
+
+也可以在 Web 左侧打开 `TSecBench`，填写 Base URL 和 Benchmark Token，保存后点击“测试连接”。如果列表中存在
+状态为 `available` 的容器，界面会同时检测其 SSLVPN 地址是否可达。网页 Token 仅在当前 API 进程内有效；长期配置仍应写入 `.env`。
+
+如不希望 SSLVPN 修改宿主机网络，可在 Web 左侧打开独立的 `OpenVPN` 设置：上传包含内联证书的 `.ovpn`，
+设置至少 10 字符的加密主密码，逐行填写需要转发的 IPv4/CIDR，并按“保存配置 → 连接”操作。
+只有列出的网段会进入隧道；未连接时保持原有网络。API 重启后配置仍在，但必须重新输入主密码解锁并手动连接。
+连接、断开或修改配置前应停止所有 Solver Worker，VPN 掉线时 Aurora 会阻止新 Worker 而不会回退直连。
+
 ## 2. 启动服务
+
+### 一体化启动
+
+配置好 `.env` 后，只需运行：
+
+```bash
+./start.sh
+```
+
+脚本会自动同步 Python 依赖、按需安装前端依赖、构建 Web，并检查 Worker、OpenVPN 与 CC Switch 镜像。
+镜像存在且 Worker 工具清单标签匹配时直接复用，缺失或过期时才构建；随后启动私有运行时并以前台方式启动 API。
+可用 `AURORA_API_HOST`、`AURORA_API_PORT` 调整监听地址和端口，或用 `./start.sh --rebuild` 强制重建所有镜像。
+按 `Ctrl+C` 停止 API；运行 `./scripts/runtime-down.sh` 停止运行时容器。
 
 ### 推荐：Codex + Kali Worker
 
