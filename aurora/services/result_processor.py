@@ -152,6 +152,11 @@ class ResultProcessor:
                 evidence_refs=evidence_refs,
                 verification_artifact_ref=artifact_ref if provenance_kind == "DERIVED_REPLAY" else None,
             )
+            # A platform decision is authoritative. The verified replay
+            # artifact is scanned after gateway tools run, so it must not
+            # resurrect a candidate rejected by flag.submit in the same batch.
+            if flag_candidate.status != "LOCAL_VERIFIED":
+                continue
             existing = session.exec(
                 select(Finding).where(Finding.project_id == attempt.project_id, Finding.title == f"Candidate flag: {value}")
             ).first()
@@ -190,7 +195,7 @@ class ResultProcessor:
 
         if verified_flags:
             project = session.get(Project, attempt.project_id)
-            if project is not None:
+            if project is not None and project.status != "COMPLETED":
                 project.status = "FLAG_READY"
                 project.updated_at = now_utc()
                 session.add(project)
@@ -247,7 +252,8 @@ class ResultProcessor:
         if candidate is None:
             candidate = FlagCandidate(project_id=attempt.project_id, value=normalized, value_hash=value_hash)
         # Trusted evidence may rehabilitate a previously unverified proposal.
-        if candidate.status != "ACCEPTED" and (status == "LOCAL_VERIFIED" or candidate.status != "LOCAL_VERIFIED"):
+        platform_decided = candidate.submission_count > 0 and candidate.status in {"ACCEPTED", "REJECTED", "AWAITING_MANUAL_VALIDATION"}
+        if not platform_decided and candidate.status != "ACCEPTED" and (status == "LOCAL_VERIFIED" or candidate.status != "LOCAL_VERIFIED"):
             candidate.status = status
             candidate.provenance_kind = provenance_kind
             candidate.artifact_refs = list(dict.fromkeys(evidence_refs))

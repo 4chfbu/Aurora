@@ -27,6 +27,8 @@ from aurora.models import (
     ChallengeGroupEvent,
     ChallengeGroupItem,
     DiscoveredTarget,
+    EvaluationRun,
+    EvaluationSuite,
     Fact,
     Finding,
     FlagCandidate,
@@ -57,9 +59,11 @@ from aurora.services.container_control import get_project_container_logs, stop_p
 from aurora.services.hands_free import HandsFreeService
 from aurora.services.project_rethink import rethink_project
 from aurora.services.project_rethink_registry import project_rethink_registry
+from aurora.services.project_run_control import project_run_control
 from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_active_runtime_warnings
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry, recover_legacy_target_blocked_groups
+from aurora.services.concurrency import configure_concurrency, public_concurrency_config
 from aurora.services.project_deletion import ProjectDeletionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.target_verification import TargetVerificationService
@@ -67,6 +71,10 @@ from aurora.services.target_management import TargetManagementService
 from aurora.services.network_proxy import load_network_proxy, network_proxy_registry, save_network_proxy
 from aurora.services.worker_control import WorkerControlService
 from aurora.services.reliability import ReliabilityService
+from aurora.services.evaluation import EvaluationService
+from aurora.services.slab_match import SlabMatchError, SlabMatchNeedsSession, configure_slab_match, public_slab_match_config, test_slab_match_connection
+from aurora.services.slab_match_import import SlabMatchDirectImporter
+from aurora.services.slab_match_notices import SlabMatchNoticePoller
 from aurora.services.tsecbench import TSecBenchError, TSecBenchNeedsSession, configure_tsecbench, public_tsecbench_config, test_tsecbench_connection
 from aurora.services.openvpn_gateway import OpenVPNConflict, OpenVPNError, OpenVPNLocked, OpenVPNRuntimeError, openvpn_gateway_registry
 
@@ -205,6 +213,30 @@ class TSecBenchConfigRequest(BaseModel):
     max_concurrent: int = Field(default=3, ge=1, le=3)
 
 
+class SlabMatchConfigRequest(BaseModel):
+    base_url: str = Field(min_length=1, max_length=2_048)
+    access_key: str | None = Field(default=None, max_length=4_096)
+    clear_access_key: bool = False
+    timeout_seconds: int = Field(default=20, ge=1, le=300)
+    max_concurrent: int = Field(default=1, ge=1, le=10)
+
+
+class ConcurrencyConfigRequest(BaseModel):
+    max_agents: int = Field(default=2, ge=1, le=8)
+
+
+class CreateEvaluationSuiteRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=240)
+    challenge_codes: list[str] = Field(default_factory=list, max_length=500)
+    include_completed: bool = False
+
+
+class CreateEvaluationRunRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=240)
+    variant: str = Field(default="candidate", pattern="^(baseline|candidate)$")
+    start: bool = False
+
+
 class WorkerFactRequest(BaseModel):
     statement: str = Field(min_length=1, max_length=4_000)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
@@ -282,11 +314,28 @@ def create_app() -> FastAPI:
 
             reaper_thread = Thread(target=reap_worker_leases, name="aurora-worker-reaper", daemon=True)
             reaper_thread.start()
+            stop_notice_poller = Event()
+
+            def poll_slab_match_notices() -> None:
+                interval = max(1, settings.slab_match_notice_poll_seconds)
+                while not stop_notice_poller.is_set():
+                    if settings.slab_match_configured:
+                        try:
+                            with Session(engine) as session:
+                                SlabMatchNoticePoller(settings).poll_once(session)
+                        except Exception as exc:
+                            logger.warning(json.dumps({"event": "slab_match.notice_poll_failed", "error": str(exc)[:500]}))
+                    stop_notice_poller.wait(interval)
+
+            notice_thread = Thread(target=poll_slab_match_notices, name="aurora-slab-match-notices", daemon=True)
+            notice_thread.start()
             try:
                 yield
             finally:
                 stop_reaper.set()
+                stop_notice_poller.set()
                 reaper_thread.join(timeout=max(1, settings.worker_reap_interval_seconds) + 1)
+                notice_thread.join(timeout=max(1, settings.slab_match_timeout_seconds) + 1)
                 openvpn_gateway_registry.initialize()
 
     app = FastAPI(title="Aurora API", version="0.1.0", lifespan=lifespan)
@@ -422,6 +471,132 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         except TSecBenchError as exc:
             raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+
+    @app.get("/api/settings/slab-match")
+    def get_slab_match_config() -> dict[str, Any]:
+        return public_slab_match_config()
+
+    @app.put("/api/settings/slab-match")
+    def update_slab_match_config(payload: SlabMatchConfigRequest) -> dict[str, Any]:
+        try:
+            return configure_slab_match(
+                base_url=payload.base_url,
+                access_key=payload.access_key,
+                clear_access_key=payload.clear_access_key,
+                timeout_seconds=payload.timeout_seconds,
+                max_concurrent=payload.max_concurrent,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/settings/slab-match/test")
+    def test_slab_match_config() -> dict[str, Any]:
+        try:
+            return test_slab_match_connection()
+        except SlabMatchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except SlabMatchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+
+    @app.get("/api/settings/concurrency")
+    def get_concurrency_config() -> dict[str, Any]:
+        return public_concurrency_config()
+
+    @app.put("/api/settings/concurrency")
+    def update_concurrency_config(payload: ConcurrencyConfigRequest) -> dict[str, Any]:
+        try:
+            return configure_concurrency(max_agents=payload.max_agents)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/slab-match/import")
+    def import_slab_match_directly(session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            result = SlabMatchDirectImporter().import_all(session)
+        except SlabMatchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except SlabMatchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
+    @app.post("/api/slab-match/groups/{group_id}/attachments/repair")
+    def repair_slab_match_attachments(group_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return SlabMatchDirectImporter().repair_group_attachments(session, group_id)
+        except SlabMatchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except SlabMatchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/evaluations/suites")
+    def create_evaluation_suite(payload: CreateEvaluationSuiteRequest, session: Session = Depends(get_session)) -> EvaluationSuite:
+        try:
+            return EvaluationService().create_suite(
+                session,
+                name=payload.name,
+                challenge_codes=payload.challenge_codes,
+                include_completed=payload.include_completed,
+            )
+        except TSecBenchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except TSecBenchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/suites")
+    def list_evaluation_suites(session: Session = Depends(get_session)) -> list[EvaluationSuite]:
+        return session.exec(select(EvaluationSuite).order_by(EvaluationSuite.created_at.desc())).all()
+
+    @app.post("/api/evaluations/suites/{suite_id}/runs")
+    def create_evaluation_run(suite_id: str, payload: CreateEvaluationRunRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            run = EvaluationService().create_run(
+                session,
+                suite_id=suite_id,
+                label=payload.label,
+                variant=payload.variant,
+            )
+        except TSecBenchNeedsSession as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except TSecBenchError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404 if "not found" in str(exc) else 400, detail=str(exc)) from exc
+        background = challenge_group_registry.start(run.group_id) if payload.start and run.group_id else None
+        if background is not None:
+            run.status = "RUNNING"
+            run.started_at = now_utc()
+            session.add(run)
+            session.commit()
+        return {"run": run, "background": background.__dict__ if background else None}
+
+    @app.get("/api/evaluations/runs")
+    def list_evaluation_runs(session: Session = Depends(get_session)) -> list[EvaluationRun]:
+        return session.exec(select(EvaluationRun).order_by(EvaluationRun.created_at.desc())).all()
+
+    @app.get("/api/evaluations/runs/{run_id}")
+    def get_evaluation_run(run_id: str, refresh: bool = True, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            service = EvaluationService()
+            return service.refresh(session, run_id=run_id) if refresh else service.report(session, run_id=run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/evaluations/comparisons")
+    def compare_evaluation_runs(baseline_run_id: str, candidate_run_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return EvaluationService().compare(
+                session,
+                baseline_run_id=baseline_run_id,
+                candidate_run_id=candidate_run_id,
+            ).__dict__
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects")
     def create_project(payload: CreateProjectRequest, session: Session = Depends(get_session)) -> Project:
@@ -808,7 +983,10 @@ def create_app() -> FastAPI:
         _require_project(session, project_id)
         running_workers = session.exec(select(Worker).where(Worker.project_id == project_id, Worker.status == "RUNNING")).all()
         background_autorun = autorun_registry.status(project_id)
-        autorun_active = bool(background_autorun and background_autorun.get("status") in {"running", "stopping"})
+        autorun_active = bool(
+            (background_autorun and background_autorun.get("status") in {"running", "stopping"})
+            or project_run_control.status(project_id)
+        )
         if autorun_active or running_workers:
             try:
                 state = project_rethink_registry.start(project_id=project_id)
@@ -830,12 +1008,18 @@ def create_app() -> FastAPI:
     @app.post("/api/projects/{project_id}/run-demo")
     def run_demo(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        return run_one_demo_step(session, project_id=project_id)
+        result = run_one_demo_step(session, project_id=project_id)
+        if result.get("status") == "busy":
+            raise HTTPException(status_code=409, detail="project already has an active run")
+        return result
 
     @app.post("/api/projects/{project_id}/scheduler/run-next")
     def run_next_intent(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        return run_one_demo_step(session, project_id=project_id)
+        result = run_one_demo_step(session, project_id=project_id)
+        if result.get("status") == "busy":
+            raise HTTPException(status_code=409, detail="project already has an active run")
+        return result
 
     @app.post("/api/projects/{project_id}/scheduler/reap-expired")
     def reap_expired(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
@@ -859,14 +1043,21 @@ def create_app() -> FastAPI:
         _require_project(session, project_id)
         if payload.background:
             state = autorun_registry.start(project_id=project_id, limits=_autorun_limits(payload))
+            if state.status == "busy":
+                raise HTTPException(status_code=409, detail="project already has an active run")
             return {"autorun": state.__dict__, "summary": get_project_summary(project_id, session)}
         result = AutoRunnerService().run_until_stop(session, project_id=project_id, limits=_autorun_limits(payload))
+        if result.status == "busy":
+            raise HTTPException(status_code=409, detail="project already has an active run")
         return {"autorun": result.__dict__, "summary": get_project_summary(project_id, session)}
 
     @app.post("/api/projects/{project_id}/autorun/step")
     def autorun_step(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        return AutoRunnerService().step(session, project_id=project_id)
+        result = AutoRunnerService().step(session, project_id=project_id)
+        if result.get("status") == "busy":
+            raise HTTPException(status_code=409, detail="project already has an active run")
+        return result
 
     @app.post("/api/projects/{project_id}/autorun/stop")
     def autorun_stop(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
@@ -887,6 +1078,8 @@ def create_app() -> FastAPI:
         _require_project(session, project_id)
         status = AutoRunnerService().status(session, project_id=project_id)
         status["background"] = autorun_registry.status(project_id)
+        active_run = project_run_control.status(project_id)
+        status["active_run"] = active_run.__dict__ if active_run else None
         status["rethink"] = project_rethink_registry.status(project_id)
         return status
 

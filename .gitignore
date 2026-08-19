@@ -36,6 +36,7 @@ apps/web/coverage/
 .runtime-cache/
 artifacts/
 codex-workspaces/
+runtime/home/.config/ffuf/
 backups/
 challenge/
 tmp/

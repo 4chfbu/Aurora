@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, Attempt, AttemptCheckpoint, ContextSnapshot, DiscoveredTarget, Fact, Finding, FlagCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.models import Artifact, Attempt, AttemptCheckpoint, ChallengeGroup, ChallengeGroupItem, ContextSnapshot, DiscoveredTarget, Fact, Finding, FlagCandidate, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_active_runtime_warnings
@@ -34,6 +34,36 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         for item in session.exec(select(model).where(model.project_id == project_id)).all():
             session.delete(item)
 
+    reset_group_item_ids: list[str] = []
+    group_ids: set[str] = set()
+    for group_item in session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project_id)).all():
+        if group_item.fused_status == "COMPLETED" or group_item.submission_status in {"SUBMITTED", "MANUALLY_ACCEPTED"}:
+            continue
+        group_item.status = "PENDING"
+        group_item.fused_status = "PENDING"
+        group_item.phase = 1
+        group_item.phase_attempts = {}
+        group_item.failure_history = []
+        group_item.submission_status = "NOT_SUBMITTED"
+        group_item.stop_reason = None
+        group_item.started_at = None
+        group_item.finished_at = None
+        group_item.updated_at = now_utc()
+        session.add(group_item)
+        reset_group_item_ids.append(group_item.id)
+        group_ids.add(group_item.group_id)
+    for group_id in group_ids:
+        group = session.get(ChallengeGroup, group_id)
+        if group is None:
+            continue
+        if group.status in {"COMPLETED", "FAILED", "STOPPED", "WAITING_INPUT", "AWAITING_MANUAL_VALIDATION"}:
+            group.status = "READY"
+            group.finished_at = None
+        if group.current_item_id in reset_group_item_ids:
+            group.current_item_id = None
+        group.updated_at = now_utc()
+        session.add(group)
+
     workspace = get_settings().codex_workspace_dir / project_id
     shutil.rmtree(workspace, ignore_errors=True)
     Path(workspace).mkdir(parents=True, exist_ok=True)
@@ -46,7 +76,7 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         WorkerEvent(
             project_id=project_id,
             event_type="project.rethought",
-            payload_json={"cleared": ["facts", "intents", "workers", "attempts", "attempt_checkpoints", "findings", "flag_candidates", "context_snapshots", "llm_traces", "tool_traces"], "preserved": ["artifacts", "hints", "events"], "acknowledged_warning_ids": warning_ids},
+            payload_json={"cleared": ["facts", "intents", "workers", "attempts", "attempt_checkpoints", "findings", "flag_candidates", "context_snapshots", "llm_traces", "tool_traces"], "preserved": ["artifacts", "hints", "events"], "acknowledged_warning_ids": warning_ids, "reset_group_item_ids": reset_group_item_ids},
         )
     )
     session.commit()

@@ -41,7 +41,7 @@ class ManagerService:
                     capability_tags=["http.request"],
                     priority=2.5,
                     risk_level="low",
-                    budget={"model_role": "planner", "max_tool_calls": 3, "tool_request": {"url": url, "timeout_seconds": 5}},
+                    budget={"model_role": "triage", "phase": 1, "max_tool_calls": 3, "tool_request": {"url": url, "timeout_seconds": 5}},
                 )
                 hint.consumed = True
                 session.add(hint)
@@ -62,7 +62,7 @@ class ManagerService:
                     capability_tags=capabilities,
                     priority=1.8,
                     risk_level="low",
-                    budget={"model_role": "solver", "max_tool_calls": 3, **({"tool_request": tool_request} if tool_request else {})},
+                    budget={"model_role": "triage", "phase": 1, "max_tool_calls": 3, **({"tool_request": tool_request} if tool_request else {})},
                 )
                 hint.consumed = True
                 session.add(hint)
@@ -81,6 +81,32 @@ class ManagerService:
                 .where(AttemptCheckpoint.project_id == project_id)
                 .order_by(AttemptCheckpoint.created_at.desc())
             ).first()
+            if checkpoint is not None and (
+                checkpoint.generated_intent_ids or checkpoint.status not in {"PARTIAL", "FAILED", "TIMEOUT"}
+            ):
+                status = "NOOP"
+                reason = "The latest checkpoint already authored follow-up work; do not create a second planning loop."
+                session.add(
+                    WorkerEvent(
+                        project_id=project_id,
+                        event_type="manager.decision",
+                        payload_json={"status": status, "reason": reason, "proposed_intents": []},
+                    )
+                )
+                session.commit()
+                return ManagerDecision(status=status, reason=reason, proposed_intents=[])
+            if checkpoint is not None and not any(str(step).strip() for step in checkpoint.next_steps):
+                status = "NOOP"
+                reason = "The latest checkpoint has no evidence-backed next step."
+                session.add(
+                    WorkerEvent(
+                        project_id=project_id,
+                        event_type="manager.decision",
+                        payload_json={"status": status, "reason": reason, "proposed_intents": [], "checkpoint_id": checkpoint.id},
+                    )
+                )
+                session.commit()
+                return ManagerDecision(status=status, reason=reason, proposed_intents=[])
             next_step = next(
                 (str(step).strip() for step in (checkpoint.next_steps if checkpoint else []) if str(step).strip()),
                 "Inspect current project evidence and produce the next evidence-backed result.",
@@ -93,12 +119,18 @@ class ManagerService:
             result = repository.upsert_intent(
                 session,
                 project_id=project_id,
-                objective=f"Continue from the latest checkpoint with exactly one evidence-backed next step: {next_step[:500]}.{route_hint}",
+                objective=(
+                    f"Continue checkpoint {checkpoint.id if checkpoint else 'bootstrap'} with exactly one evidence-backed experiment: "
+                    f"{next_step[:500]}. Record the expected discriminating observation and checkpoint the result.{route_hint}"
+                ),
                 capability_tags=self._continuation_capabilities(checkpoint),
+                parent_intent_id=checkpoint.intent_id if checkpoint else None,
                 priority=0.8,
                 risk_level="low",
                 budget={
-                    "model_role": "solver",
+                    "model_role": "reviewer" if min(4, int((checkpoint.budget_json if checkpoint else {}).get("phase", 1) or 1) + 1) == 4 else "solver",
+                    "phase": min(4, int((checkpoint.budget_json if checkpoint else {}).get("phase", 1) or 1) + 1),
+                    "source_checkpoint_id": checkpoint.id if checkpoint else None,
                     "max_tool_calls": 3,
                     **({"failed_route_fingerprint": hashlib.sha256(failed_route.encode()).hexdigest()[:16]} if failed_route else {}),
                 },
@@ -140,6 +172,8 @@ class ManagerService:
     @staticmethod
     def _continuation_capabilities(checkpoint: AttemptCheckpoint | None) -> list[str]:
         text = " ".join((checkpoint.next_steps if checkpoint else []) or []).lower()
+        if any(token in text for token in ("artifact", "transcript", "证据文件", "工件")):
+            return ["blackboard.query", "sandbox.exec"]
         if any(token in text for token in ("binary", "逆向", "elf", "disassemble")):
             return ["binary.inspect", "sandbox.exec"]
         if any(token in text for token in ("http", "web", "request", "靶机")):

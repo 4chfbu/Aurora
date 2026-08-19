@@ -33,9 +33,29 @@ BASE_TOOLS = (
             "required": ["source_artifact_refs", "verification_script"],
             "properties": {
                 "source_artifact_refs": {"type": "array", "items": {"type": "string"}},
-                "verification_script": {"type": "string"},
-                "timeout_seconds": {"type": "integer"},
+                "verification_script": {
+                    "type": "string",
+                    "description": "Python script path in the Worker workspace (preferred), or inline Python source for compatibility.",
+                },
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
             },
+        },
+    ),
+    MCPToolDefinition(
+        "flag.submit",
+        "submission",
+        "aurora",
+        "Submit a locally verified candidate to the current competition platform. Never accepts a raw flag value.",
+        {
+            "type": "object",
+            "required": ["candidate_id"],
+            "properties": {
+                "candidate_id": {
+                    "type": "string",
+                    "description": "A visible LOCAL_VERIFIED candidate id, or latest_verified immediately after flag.verify in the same request batch.",
+                },
+            },
+            "additionalProperties": False,
         },
     ),
     MCPToolDefinition("blackboard.query", "read", "aurora", "Read scoped blackboard state.", {"type": "object"}),
@@ -59,10 +79,24 @@ SUBAGENT_TOOL = MCPToolDefinition(
 )
 
 
-def visible_mcp_tools(settings: Settings, *, allow_subagents: bool = False) -> list[dict[str, Any]]:
+def visible_mcp_tools(
+    settings: Settings,
+    *,
+    allow_subagents: bool = False,
+    contract: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    from aurora.services.tool_contract import tools_for_runtime
+
+    allowed = tools_for_runtime(settings) if contract is None else contract
     tools = list(BASE_TOOLS)
     if settings.fofa_configured:
         tools.append(FOFA_TOOL)
     if allow_subagents:
         tools.append(SUBAGENT_TOOL)
+    if allowed is not None:
+        tools = [
+            tool
+            for tool in tools
+            if tool.name in allowed or (allow_subagents and tool.name == SUBAGENT_TOOL.name)
+        ]
     return [tool.__dict__ for tool in tools]

@@ -1,3 +1,7 @@
+[[skills.config]]
+path = "/opt/aurora-skills"
+enabled = true
+
 [mcp_servers.aurora_reverse]
 command = "/opt/aurora-venv/bin/python"
 args = ["/opt/aurora-mcp/reverse_server.py"]

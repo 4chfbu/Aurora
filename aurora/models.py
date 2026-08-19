@@ -62,7 +62,7 @@ class ProjectRuntimePolicy(SQLModel, table=True):
     id: str = Field(default_factory=lambda: new_id("runtime"), primary_key=True)
     project_id: str = Field(index=True, unique=True)
     subagents_enabled: bool = False
-    max_subagents_per_worker: int = 4
+    max_subagents_per_worker: int = 2
     max_subagents_concurrent: int = 2
     created_at: datetime = Field(default_factory=now_utc)
 
@@ -301,6 +301,45 @@ class ChallengeGroupEvent(SQLModel, table=True):
     event_type: str
     payload_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class EvaluationSuite(SQLModel, table=True):
+    """Immutable challenge inventory used for comparable solver evaluations."""
+    id: str = Field(default_factory=lambda: new_id("eval_suite"), primary_key=True)
+    name: str
+    platform: str = Field(default="tsecbench", index=True)
+    items_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    content_hash: str = Field(index=True)
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class EvaluationRun(SQLModel, table=True):
+    id: str = Field(default_factory=lambda: new_id("eval_run"), primary_key=True)
+    suite_id: str = Field(index=True)
+    label: str
+    variant: str = Field(default="candidate", index=True)
+    status: str = Field(default="READY", index=True)
+    group_id: str | None = Field(default=None, index=True)
+    config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime = Field(default_factory=now_utc)
+
+
+class EvaluationItemResult(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("run_id", "challenge_key", name="uq_evaluationitem_run_challenge"),)
+    id: str = Field(default_factory=lambda: new_id("eval_item"), primary_key=True)
+    run_id: str = Field(index=True)
+    challenge_key: str = Field(index=True)
+    project_id: str | None = Field(default=None, index=True)
+    status: str = Field(default="PENDING", index=True)
+    platform_correct: bool | None = None
+    platform_completed: bool = False
+    environment_error: bool = False
+    elapsed_seconds: float | None = None
+    metrics_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
 
 
 class Finding(SQLModel, table=True):

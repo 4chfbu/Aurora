@@ -16,9 +16,18 @@ from aurora.db import engine
 from aurora.config import get_settings
 from aurora.models import Attempt, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
 from aurora.services.autorunner import AutoRunLimits
-from aurora.services.competition_adapter import CompetitionAdapter, CompetitionSubmissionResult, LocalCompetitionAdapter, TSecBenchCompetitionAdapter
+from aurora.services.competition_adapter import (
+    CompetitionAdapter,
+    CompetitionSubmissionResult,
+    LocalCompetitionAdapter,
+    SlabMatchCompetitionAdapter,
+    TSecBenchCompetitionAdapter,
+    competition_platform,
+    is_managed_competition_platform,
+)
 from aurora.services.container_control import stop_project_containers
 from aurora.services.harvester_runner import AutoRunnerHarvester, HarvesterRunner
+from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 
 
@@ -38,14 +47,22 @@ class ChallengeGroupRunner:
         self.harvester = harvester or AutoRunnerHarvester()
         self.competition = competition or LocalCompetitionAdapter()
         self._tsecbench_competition: TSecBenchCompetitionAdapter | None = None
+        self._slab_match_competition: SlabMatchCompetitionAdapter | None = None
 
     def _competition_for(self, item: ChallengeGroupItem | None) -> CompetitionAdapter:
-        if item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench" and isinstance(self.competition, LocalCompetitionAdapter):
+        platform = competition_platform(item)
+        if platform == "tsecbench" and isinstance(self.competition, LocalCompetitionAdapter):
             if not get_settings().tsecbench_configured:
                 return self.competition
             if self._tsecbench_competition is None:
                 self._tsecbench_competition = TSecBenchCompetitionAdapter()
             return self._tsecbench_competition
+        if platform == "slab_match" and isinstance(self.competition, LocalCompetitionAdapter):
+            if not get_settings().slab_match_configured:
+                return self.competition
+            if self._slab_match_competition is None:
+                self._slab_match_competition = SlabMatchCompetitionAdapter()
+            return self._slab_match_competition
         return self.competition
 
     def run(self, session: Session, *, group_id: str, should_stop: callable | None = None, on_project: callable | None = None) -> None:
@@ -194,12 +211,7 @@ class ChallengeGroupRunner:
                 outcome, reason = "COMPLETED", "project_terminal"
             else:
                 # Phase budgets belong to the scheduler, not the solver.
-                limits = AutoRunLimits(
-                    max_iterations=0,
-                    max_minutes=30 if item.phase == 1 else 60,
-                    no_progress_limit=0,
-                    stop_on_observer_escalate=True,
-                )
+                limits = self._autorun_limits(item)
                 self._apply_phase_attempt_budget(session, project_id=project.id, phase=item.phase)
                 environment_warning: str | None = None
                 try:
@@ -208,18 +220,20 @@ class ChallengeGroupRunner:
                         environment_warning = health.reason or "environment_unavailable"
                 except Exception as exc:
                     environment_warning = str(exc)[:1000] or type(exc).__name__
+                    self._release_slab_environment_after_turn(session, item=item)
                 if environment_warning:
                     self._event(
                         session,
                         group_id,
                         item.id,
                         "group.item.environment_unavailable",
-                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": not self._is_tsecbench_item(item)},
+                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": not self._is_managed_platform_item(item)},
                     )
-                if environment_warning and self._is_tsecbench_item(item):
+                if environment_warning and self._is_managed_platform_item(item):
+                    platform = competition_platform(item)
                     item.fused_status = "WAITING_INPUT"
                     item.status = "WAITING_INPUT"
-                    item.stop_reason = "tsecbench_environment_unavailable"
+                    item.stop_reason = f"{platform or 'platform'}_environment_unavailable"
                     project.status = "WAITING_INPUT"
                     project.updated_at = now_utc()
                     group.current_item_id = None
@@ -227,14 +241,17 @@ class ChallengeGroupRunner:
                     session.add(project)
                     session.add(item)
                     session.add(group)
-                    self._event(session, group_id, item.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "tsecbench_environment", "reason": environment_warning})
+                    self._event(session, group_id, item.id, "group.item.waiting_input", {"project_id": project.id, "blocker": f"{platform or 'platform'}_environment", "reason": environment_warning})
                     session.commit()
                     continue
                 self._maybe_fetch_hint(session, item=item, project=project)
                 task = self._task_payload(session, item=item, project=project)
                 self._event(session, group_id, item.id, "group.item.dispatched", {"project_id": project.id, "phase": item.phase, "hint_taken": item.hint_taken, "environment_warning": environment_warning})
                 session.commit()
-                result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
+                try:
+                    result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
+                finally:
+                    self._release_slab_environment_after_turn(session, item=item)
                 project = session.get(Project, project.id)
                 if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
                     outcome, reason = ("COMPLETED" if project.status == "COMPLETED" else "CANDIDATE_READY"), result.reason
@@ -293,7 +310,10 @@ class ChallengeGroupRunner:
                     return
                 return
             active_phase = min(item.phase for item in pending)
-            candidates = [item for item in pending if item.phase == active_phase][:max_workers]
+            candidates = sorted(
+                (item for item in pending if item.phase == active_phase),
+                key=self._priority_key,
+            )[:max_workers]
             if not candidates:
                 if any(item.fused_status == "RUNNING" for item in unresolved):
                     return
@@ -350,22 +370,27 @@ class ChallengeGroupRunner:
                                 warning = health.reason or "environment_unavailable"
                         except Exception as exc:
                             warning = str(exc)[:1000]
-                        if warning and self._is_tsecbench_item(current):
+                            self._release_slab_environment_after_turn(worker_session, item=current)
+                        if warning and self._is_managed_platform_item(current):
+                            platform = competition_platform(current)
                             current.fused_status = "WAITING_INPUT"
                             current.status = "WAITING_INPUT"
-                            current.stop_reason = "tsecbench_environment_unavailable"
+                            current.stop_reason = f"{platform or 'platform'}_environment_unavailable"
                             project.status = "WAITING_INPUT"
                             project.updated_at = now_utc()
                             worker_session.add(project)
                             worker_session.add(current)
-                            self._event(worker_session, group_id, current.id, "group.item.waiting_input", {"project_id": project.id, "blocker": "tsecbench_environment", "reason": warning})
+                            self._event(worker_session, group_id, current.id, "group.item.waiting_input", {"project_id": project.id, "blocker": f"{platform or 'platform'}_environment", "reason": warning})
                             worker_session.commit()
-                            return item_id, "WAITING_INPUT", "tsecbench_environment_unavailable"
+                            return item_id, "WAITING_INPUT", f"{platform or 'platform'}_environment_unavailable"
                         self._maybe_fetch_hint(worker_session, item=current, project=project)
                         task = self._task_payload(worker_session, item=current, project=project)
                         self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
                         worker_session.commit()
-                        result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=AutoRunLimits(max_iterations=0, max_minutes=30 if current.phase == 1 else 60, no_progress_limit=0, stop_on_observer_escalate=True), should_stop=should_stop)
+                        try:
+                            result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=self._autorun_limits(current), should_stop=should_stop)
+                        finally:
+                            self._release_slab_environment_after_turn(worker_session, item=current)
                         project = worker_session.get(Project, project.id)
                         outcome, reason = (("COMPLETED" if project and project.status == "COMPLETED" else "CANDIDATE_READY", result.reason) if project and project.status in {"COMPLETED", "FLAG_READY"} else (self._failure_outcome(result.status), result.reason))
                     current_group = worker_session.get(ChallengeGroup, group_id)
@@ -380,11 +405,30 @@ class ChallengeGroupRunner:
             session.expire_all()
 
     @staticmethod
-    def _priority_key(item: ChallengeGroupItem) -> tuple[int, float, int, int]:
+    def _autorun_limits(item: ChallengeGroupItem) -> AutoRunLimits:
+        evaluation = str((item.competition_meta or {}).get("provenance") or "") == "evaluation_snapshot"
+        evaluation_minutes = {1: 5, 2: 20, 3: 25}
+        return AutoRunLimits(
+            # One full Solver turn per competition phase. The group scheduler
+            # owns retries; nesting another 8-12 turn planning loop here made
+            # Observer/Manager state compete with the model's own solve loop.
+            max_iterations=1,
+            # The Worker hard timeout is clamped to the same phase envelope in
+            # _apply_phase_attempt_budget, so this outer deadline is effective
+            # even while a model turn is still running.
+            max_minutes=evaluation_minutes.get(item.phase, 25) if evaluation else (30 if item.phase == 1 else 60),
+            no_progress_limit=0,
+            stop_on_observer_escalate=True,
+        )
+
+    @staticmethod
+    def _priority_key(item: ChallengeGroupItem) -> tuple[int, int, float, int]:
         meta = item.competition_meta or {}
         solved = int(meta.get("solved_by_count", 0) or 0)
         points = float(meta.get("points", meta.get("score", 0)) or 0)
-        return (-solved, points, 0 if item.hint_taken else 1, item.position)
+        no_environment = competition_platform(item) == "slab_match" and meta.get("requires_environment") is False
+        attachment_first = no_environment and bool(meta.get("attachments"))
+        return (0 if attachment_first else 1 if no_environment else 2, -solved, points, item.position)
 
     @staticmethod
     def _deadline_fraction(group: ChallengeGroup) -> float | None:
@@ -410,13 +454,17 @@ class ChallengeGroupRunner:
 
     @staticmethod
     def _requires_target(project: Project, item: ChallengeGroupItem | None = None) -> bool:
-        if item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench":
+        if item is not None and is_managed_competition_platform(competition_platform(item)):
             return False
         return (project.challenge_type or "").strip().lower() in {"web", "webapp", "web_app"} and not bool(project.target_url)
 
     @staticmethod
     def _is_tsecbench_item(item: ChallengeGroupItem | None) -> bool:
-        return item is not None and str((item.competition_meta or {}).get("platform") or "").lower() == "tsecbench"
+        return competition_platform(item) == "tsecbench"
+
+    @staticmethod
+    def _is_managed_platform_item(item: ChallengeGroupItem | None) -> bool:
+        return is_managed_competition_platform(competition_platform(item))
 
     @classmethod
     def _is_tsecbench_group(cls, session: Session, group_id: str) -> bool:
@@ -476,6 +524,29 @@ class ChallengeGroupRunner:
                     {"project_id": item.project_id, "error": str(exc)[:1000]},
                 )
 
+    def _release_slab_environment_after_turn(self, session: Session, *, item: ChallengeGroupItem) -> None:
+        if competition_platform(item) != "slab_match":
+            return
+        try:
+            self._close_environment(self._competition_for(item), session, project_id=item.project_id)
+            self._event(
+                session,
+                item.group_id,
+                item.id,
+                "group.item.environment_closed",
+                {"project_id": item.project_id, "reason": "solver_turn_finished"},
+            )
+            session.commit()
+        except Exception as exc:
+            self._event(
+                session,
+                item.group_id,
+                item.id,
+                "group.item.environment_cleanup_failed",
+                {"project_id": item.project_id, "reason": "solver_turn_finished", "error": str(exc)[:1000]},
+            )
+            session.commit()
+
     @classmethod
     def _reactivate_waiting_inputs(cls, session: Session, *, group_id: str) -> None:
         items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id, ChallengeGroupItem.fused_status == "WAITING_INPUT")).all()
@@ -498,10 +569,28 @@ class ChallengeGroupRunner:
 
     @staticmethod
     def _apply_phase_attempt_budget(session: Session, *, project_id: str, phase: int) -> None:
-        # A P1 phase has a 30 minute wall-clock budget.  Without a per-worker
-        # cap, one Codex Harness request may consume the whole phase and leave
-        # no opportunity to recover from a provider/context failure.
-        cap_seconds = 600 if phase == 1 else 1_800
+        group_item = session.exec(
+            select(ChallengeGroupItem)
+            .where(ChallengeGroupItem.project_id == project_id)
+            .order_by(ChallengeGroupItem.updated_at.desc())
+        ).first()
+        evaluation = bool(
+            group_item
+            and str((group_item.competition_meta or {}).get("provenance") or "") == "evaluation_snapshot"
+        )
+        if evaluation:
+            phase_defaults = {
+                1: (240, 300, 0, 3),
+                2: (1_140, 1_200, 0, 3),
+                3: (1_440, 1_500, 0, 4),
+            }.get(phase, (1_440, 1_500, 0, 4))
+        else:
+            phase_defaults = {
+                1: (1_500, 1_800, 0, 3),
+                2: (3_300, 3_600, 0, 3),
+                3: (3_300, 3_600, 0, 4),
+            }.get(phase, (3_300, 3_600, 0, 3))
+        cap_seconds = phase_defaults[1]
         intents = session.exec(
             select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
         ).all()
@@ -512,16 +601,23 @@ class ChallengeGroupRunner:
                 configured_seconds = int(configured) if configured is not None else cap_seconds
             except (TypeError, ValueError):
                 configured_seconds = cap_seconds
+            hard_timeout = max(2, min(configured_seconds, phase_defaults[1], cap_seconds))
+            configured_soft = budget.get("soft_timeout_seconds")
+            try:
+                configured_soft_seconds = int(configured_soft) if configured_soft is not None else phase_defaults[0]
+            except (TypeError, ValueError):
+                configured_soft_seconds = phase_defaults[0]
             budget["phase"] = phase
-            phase_defaults = {
-                1: (300, 420, 12, 2),
-                2: (480, 600, 20, 2),
-                3: (720, 900, 30, 3),
-            }.get(phase, (300, 420, 12, 2))
-            budget.setdefault("soft_timeout_seconds", phase_defaults[0])
-            budget["hard_timeout_seconds"] = min(configured_seconds, phase_defaults[1], cap_seconds)
-            budget.setdefault("max_agent_actions", phase_defaults[2])
+            budget["soft_timeout_seconds"] = max(1, min(configured_soft_seconds, phase_defaults[0], hard_timeout - 1))
+            budget["hard_timeout_seconds"] = hard_timeout
+            # The per-attempt shell-action budget is disabled by default: a
+            # fixed command count cuts off legitimate multi-step analysis
+            # (extract + explore + solve) before the wall-clock timeout does.
+            # soft/hard timeout + max_route_repeats still bound stuck agents.
+            budget.setdefault("max_agent_actions", 0)
             budget.setdefault("max_route_repeats", phase_defaults[3])
+            budget["max_no_progress_actions"] = 0
+            budget["model_role"] = "solver"
             budget.setdefault("finalize_grace_seconds", 60)
             intent.budget = budget
             intent.updated_at = now_utc()
@@ -560,8 +656,10 @@ class ChallengeGroupRunner:
             "challenge_type": project.challenge_type,
             "phase": item.phase,
             "attachments": list((item.competition_meta or {}).get("attachments", [])),
+            "notices": list((item.competition_meta or {}).get("notices", [])),
             "target": project.target_url,
             "targets": list((item.competition_meta or {}).get("container_addr", [])) if isinstance((item.competition_meta or {}).get("container_addr"), list) else ([project.target_url] if project.target_url else []),
+            "environment_notes": (item.competition_meta or {}).get("environment_notes"),
             "hint": item.hint_content,
             "previous_attempts": list(item.failure_history),
         }
@@ -668,104 +766,21 @@ class ChallengeGroupRunner:
             candidate.updated_at = now_utc()
             session.add(candidate)
             return None
-        value = candidate.value
-        candidate.submission_count += 1
-        candidate.status = "SUBMITTED"
-        candidate.updated_at = now_utc()
-        session.add(candidate)
-        try:
-            accepted = self._competition_for(item).submit_flag(session, project_id=item.project_id, value=value)
-        except Exception as exc:
-            # Platform integrations are an optional verification boundary.  A
-            # broken/expired endpoint must not turn an unverified model answer
-            # into either a success or a rejection.
-            item.submission_status = "AWAITING_MANUAL_VALIDATION"
-            candidate.status = "AWAITING_MANUAL_VALIDATION"
-            candidate.updated_at = now_utc()
-            session.add(candidate)
-            self._event(
-                session,
-                item.group_id,
-                item.id,
-                "group.item.flag_submission_unavailable",
-                {"project_id": item.project_id, "value": value, "reason": str(exc)[:500]},
-            )
-            return None
-        if accepted is None:
-            item.submission_status = "AWAITING_MANUAL_VALIDATION"
-            candidate.status = "AWAITING_MANUAL_VALIDATION"
-            candidate.updated_at = now_utc()
-            session.add(candidate)
-            self._event(
-                session,
-                item.group_id,
-                item.id,
-                "group.item.flag_submission_unavailable",
-                {"project_id": item.project_id, "value": value, "reason": "adapter returned no validation result"},
-            )
-            return None
-        accepted_flag = accepted.correct if isinstance(accepted, CompetitionSubmissionResult) else accepted
-        completed = accepted.completed if isinstance(accepted, CompetitionSubmissionResult) else bool(accepted)
-        if accepted_flag:
-            item.submission_status = "SUBMITTED" if completed else "PARTIAL"
-            candidate.status = "ACCEPTED"
-            candidate.updated_at = now_utc()
-            project = session.get(Project, item.project_id)
-            if not completed:
-                if project is not None:
-                    project.status = "WORKING"
-                    project.updated_at = now_utc()
-                    session.add(project)
-                pending = session.exec(select(Intent).where(Intent.project_id == item.project_id, Intent.status == "PENDING")).first()
-                if pending is None:
-                    detail = accepted.detail if isinstance(accepted, CompetitionSubmissionResult) else {}
-                    session.add(Intent(
-                        project_id=item.project_id,
-                        objective=f"Continue solving the remaining TSecBench flags after {detail.get('correct_flag_count', 0)}/{detail.get('total_flag_count', '?')} were accepted.",
-                        capability_tags=["sandbox.exec", "blackboard.query"],
-                        priority=2.0,
-                        risk_level="low",
-                        budget={"model_role": "solver"},
-                    ))
-                self._event(session, item.group_id, item.id, "group.item.flag_progress", {"project_id": item.project_id, "candidate_id": candidate.id, **(accepted.detail if isinstance(accepted, CompetitionSubmissionResult) else {})})
-                return accepted
-            if project is not None:
-                project.status = "COMPLETED"
-                project.updated_at = now_utc()
-                session.add(project)
-            pending_intents = session.exec(select(Intent).where(Intent.project_id == item.project_id, Intent.status == "PENDING")).all()
-            for intent in pending_intents:
-                intent.status = "CANCELLED"
-                intent.updated_at = now_utc()
-                session.add(intent)
-            session.add(
-                WorkerEvent(
-                    project_id=item.project_id,
-                    event_type="project.completed",
-                    payload_json={
-                        "reason": "competition platform accepted flag",
-                        "candidate_id": candidate.id,
-                        "value": value,
-                        "cancelled_intent_ids": [intent.id for intent in pending_intents],
-                    },
-                )
-            )
-            return accepted
-        item.submission_status = "REJECTED"
-        candidate.status = "REJECTED"
-        candidate.rejection_reason = "competition platform rejected the candidate flag"
-        candidate.updated_at = now_utc()
-        session.add(candidate)
-        finding = session.exec(select(Finding).where(Finding.project_id == item.project_id, Finding.title == f"Candidate flag: {value}")).first()
-        if finding is None:
-            raise RuntimeError("candidate finding not found")
-        reopen_project_after_invalid_flag(
+        outcome = FlagSubmissionService().submit(
             session,
             project_id=item.project_id,
-            finding_id=finding.id,
-            reason="competition platform rejected the candidate flag",
+            candidate_id=candidate.id,
+            adapter=self._competition_for(item),
         )
-        return False
+        if outcome.accepted is None:
+            return None
+        if isinstance(outcome.detail, dict) and outcome.detail:
+            return CompetitionSubmissionResult(
+                correct=bool(outcome.accepted),
+                completed=outcome.completed,
+                detail=outcome.detail,
+            )
+        return bool(outcome.accepted)
 
     def validate_flag_manually(
         self,

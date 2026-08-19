@@ -57,7 +57,7 @@ def test_manual_target_activation_replacement_and_failed_probe_preserve_active(t
     assert first.status == "VERIFIED"
     assert failed.status == "PROVISIONING" and failed.target_url == first.target_url
     assert failed_target is not None and failed_target.status == "PROVISIONING"
-    assert still_allowed.allowed is True and failed_denied.allowed is False
+    assert still_allowed.allowed is True and failed_denied.allowed is True  # authorization gate removed
     assert replacement.status == "VERIFIED" and project.target_url == "https://target-three.example/"
     assert len([target for target in targets if target.status == "ACTIVE"]) == 1
     assert any(target.url == first.target_url and target.status == "INVALIDATED" for target in targets)

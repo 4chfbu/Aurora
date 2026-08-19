@@ -37,6 +37,22 @@ PROFILES: dict[str, AgentProfile] = {
         codex_template="solver.codex.md",
         max_tool_requests=1,
     ),
+    "triage.general": AgentProfile(
+        id="triage.general",
+        role="solver",
+        system_template="solver.system.md",
+        developer_template="solver.developer.md",
+        codex_template="solver.codex.md",
+        max_tool_requests=2,
+    ),
+    "reviewer.general": AgentProfile(
+        id="reviewer.general",
+        role="solver",
+        system_template="solver.system.md",
+        developer_template="solver.developer.md",
+        codex_template="solver.codex.md",
+        max_tool_requests=1,
+    ),
     "manager.planner": AgentProfile("manager.planner", "manager", "manager.system.md"),
     "observer.reviewer": AgentProfile("observer.reviewer", "observer", "observer.system.md"),
 }

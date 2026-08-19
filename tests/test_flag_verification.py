@@ -4,7 +4,7 @@ import hashlib
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, AuthorizationScope, Project, ToolTrace
+from aurora.models import Artifact, AuthorizationScope, FlagCandidate, Project, ToolTrace
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.command_runner import LocalCommandRunner
@@ -181,3 +181,42 @@ def test_flag_verify_reports_missing_inputs_separately(monkeypatch, tmp_path) ->
 
     assert "non-empty source_artifact_refs" in missing_refs.summary
     assert "requires verification_script" in missing_script.summary
+
+
+def test_flag_verify_accepts_inline_script_and_clamps_timeout(monkeypatch, tmp_path) -> None:
+    gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
+    inline_script = (
+        "import codecs, json, pathlib, sys\n"
+        "manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        "raw = pathlib.Path(manifest[0]['path']).read_text().strip()\n"
+        "print(codecs.decode(raw, 'rot_13'))\n"
+    )
+    with Session(engine) as session:
+        session.add_all([Project(id=project_id, name="verify", goal="derive"), AuthorizationScope(project_id=project_id)])
+        session.commit()
+        source = ArtifactStore(tmp_path / "artifacts").write_text(
+            session,
+            project_id=project_id,
+            content="synt{vayvar}",
+            summary="encoded challenge input",
+            artifact_type="imported_attachment",
+            origin_kind="challenge_input",
+        )
+
+        result = gateway.execute(
+            session,
+            project_id=project_id,
+            worker_id=worker_id,
+            tool_name="flag.verify",
+            request={
+                "source_artifact_refs": [source.id],
+                "verification_script": inline_script,
+                "timeout_seconds": 120,
+            },
+        )
+
+        assert result.success is True
+        assert result.metrics["effective_timeout_seconds"] == 60
+        assert result.metrics["inline_script"] is True
+        candidate = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id)).one()
+        assert candidate.value == "flag{inline}"

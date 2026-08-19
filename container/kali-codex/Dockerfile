@@ -21,6 +21,7 @@ RUN rm -f /etc/apt/sources.list.d/* \
       build-essential \
       ca-certificates \
       checksec \
+      cmake \
       curl \
       default-jre-headless \
       dirb \
@@ -38,6 +39,7 @@ RUN rm -f /etc/apt/sources.list.d/* \
       john \
       jq \
       libfsapfs-utils \
+      libffi-dev \
       libimage-exiftool-perl \
       ltrace \
       netcat-openbsd \
@@ -47,9 +49,11 @@ RUN rm -f /etc/apt/sources.list.d/* \
       npm \
       openssl \
       patchelf \
+      pkg-config \
       pngcheck \
       poppler-utils \
       python3 \
+      python3-dev \
       python3-capstone \
       python3-pip \
       python3-pwntools \
@@ -100,10 +104,13 @@ RUN npm config set registry https://registry.npmmirror.com \
 COPY container/kali-codex/mcp /opt/aurora-mcp
 COPY --chmod=0755 container/kali-codex/python-wrapper.sh /usr/local/bin/python
 COPY container/kali-codex/codex-config.toml /root/.codex/config.toml
+COPY container/kali-codex/skills /opt/aurora-skills
 COPY aurora/tool_profiles.json /opt/aurora/tool_profiles.json
 
 LABEL io.aurora.worker.profile="core" \
       io.aurora.tool-manifest-sha256="${AURORA_TOOL_MANIFEST_SHA}"
+
+ENV DEBUGINFOD_URLS="https://debuginfod.debian.net https://debuginfod.ubuntu.com"
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/tini", "--"]
@@ -128,7 +135,8 @@ RUN apt-get -o Acquire::Retries=20 -o Acquire::http::Pipeline-Depth=0 update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY container/kali-codex/requirements-heavy.txt /tmp/requirements-heavy.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-heavy.txt \
+COPY container/kali-codex/vendor/glibc-all-in-one /opt/glibc-all-in-one
+RUN pip install --no-cache-dir -r /tmp/requirements-heavy.txt lief /opt/glibc-all-in-one \
     && rm /tmp/requirements-heavy.txt
 COPY --chmod=0755 container/kali-codex/analyze-headless-wrapper.sh /usr/local/bin/analyzeHeadless
 COPY --chmod=0755 container/kali-codex/ghidra-wrapper.sh /usr/local/bin/ghidra

@@ -362,6 +362,11 @@ class KaliContainerRunner(CommandRunner):
             self.engine,
             "run",
             "--rm",
+            # nmap carries file capabilities (cap_net_raw/cap_net_admin); a
+            # non-root exec only succeeds when those caps are in the
+            # container bounding set. Grant them so network.scan works.
+            "--cap-add=NET_RAW",
+            "--cap-add=NET_ADMIN",
             *network_args,
             "--cpus",
             str(self.settings.worker_container_cpus),

@@ -14,6 +14,7 @@ from aurora.services.autorun_registry import autorun_registry
 from aurora.services.autorunner import AutoRunLimits
 from aurora.services.container_control import stop_project_containers
 from aurora.services.project_rethink import rethink_project
+from aurora.services.project_run_control import project_run_control
 
 
 @dataclass
@@ -93,7 +94,8 @@ class ProjectRethinkRegistry:
             containers["errors"].extend(stopped.get("errors", []))
             self._update(state, containers=containers)
             autorun = autorun_registry.status(project_id)
-            if autorun is None or autorun.get("status") not in {"running", "stopping"}:
+            active_run = project_run_control.status(project_id)
+            if (autorun is None or autorun.get("status") not in {"running", "stopping"}) and active_run is None:
                 return containers
             time.sleep(0.25)
         raise RuntimeError("active autorun did not stop within 45 seconds")

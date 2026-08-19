@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from sqlmodel import Session, select
+
+from aurora.db import engine
+import pytest
+
+from aurora.models import ChallengeGroup, ChallengeGroupItem, EvaluationItemResult, FlagCandidate, Intent, Project, now_utc
+from aurora.services.challenge_group_runner import ChallengeGroupRunner
+from aurora.services.evaluation import EvaluationService
+from aurora.services.tsecbench import TSecBenchChallenge
+
+
+class FakeClient:
+    def list_challenges(self) -> list[TSecBenchChallenge]:
+        return [
+            TSecBenchChallenge(
+                unique_code="fresh-web",
+                title="Fresh Web",
+                description="Find the flag.",
+                challenge_type="web",
+                difficulty="easy",
+                level=1,
+                points=100,
+                flag_count=1,
+                container_status=None,
+                container_addr=[],
+                raw={},
+                correct_flag_count=0,
+                is_completed=False,
+            ),
+            TSecBenchChallenge(
+                unique_code="already-solved",
+                title="Solved",
+                description="Historical result.",
+                challenge_type="reverse",
+                difficulty="easy",
+                level=1,
+                points=50,
+                flag_count=1,
+                container_status=None,
+                container_addr=[],
+                raw={},
+                correct_flag_count=1,
+                is_completed=True,
+            ),
+        ]
+
+
+def test_evaluation_suite_is_frozen_and_excludes_completed_challenges() -> None:
+    with Session(engine) as session:
+        suite = EvaluationService().create_suite(session, name="internet", client=FakeClient())
+
+        assert [item["unique_code"] for item in suite.items_json] == ["fresh-web"]
+        assert suite.items_json[0]["version_hash"]
+        assert suite.content_hash
+
+
+def test_evaluation_run_uses_platform_completion_and_compares_same_suite() -> None:
+    service = EvaluationService()
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="internet", client=FakeClient())
+        baseline = service.create_run(session, suite_id=suite.id, label="before", variant="baseline", client=FakeClient())
+        baseline_group = session.get(ChallengeGroup, baseline.group_id)
+        assert baseline_group is not None
+        baseline_group.status = "COMPLETED"
+        baseline_group.finished_at = now_utc()
+        session.add(baseline_group)
+        session.commit()
+        candidate = service.create_run(session, suite_id=suite.id, label="after", variant="candidate", client=FakeClient())
+
+        candidate_result = session.exec(select(EvaluationItemResult).where(EvaluationItemResult.run_id == candidate.id)).one()
+        project = session.get(Project, candidate_result.project_id)
+        ChallengeGroupRunner._apply_phase_attempt_budget(session, project_id=project.id, phase=1)
+        intent = session.exec(select(Intent).where(Intent.project_id == project.id, Intent.status == "PENDING")).one()
+        assert intent.budget["soft_timeout_seconds"] == 240
+        assert intent.budget["hard_timeout_seconds"] == 300
+        project.status = "COMPLETED"
+        item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project.id)).one()
+        item.submission_status = "ACCEPTED"
+        item.fused_status = "COMPLETED"
+        group = session.get(ChallengeGroup, candidate.group_id)
+        group.status = "COMPLETED"
+        group.finished_at = now_utc()
+        session.add_all([
+            project,
+            item,
+            group,
+            FlagCandidate(
+                project_id=project.id,
+                value="flag{verified}",
+                value_hash="evaluation-verified-hash",
+                status="ACCEPTED",
+                provenance_kind="DERIVED_REPLAY",
+                verification_artifact_ref="artifact_verify",
+            ),
+        ])
+        session.commit()
+
+        baseline_report = service.refresh(session, run_id=baseline.id)
+        candidate_report = service.refresh(session, run_id=candidate.id)
+        comparison = service.compare(session, baseline_run_id=baseline.id, candidate_run_id=candidate.id)
+
+        assert baseline_report["metrics"]["success_rate"] == 0.0
+        assert candidate_report["metrics"]["success_rate"] == 1.0
+        assert candidate_report["metrics"]["derived_verification_coverage"] == 1.0
+        assert comparison.improvement_points == 100.0
+        assert comparison.promotion_eligible is False
+        assert comparison.promoted is False
+
+
+def test_evaluation_rejects_overlapping_runs_dirty_platform_state_and_unmaterialized_attachments() -> None:
+    service = EvaluationService()
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="clean", client=FakeClient())
+        service.create_run(session, suite_id=suite.id, label="first", client=FakeClient())
+        with pytest.raises(ValueError, match="still active"):
+            service.create_run(session, suite_id=suite.id, label="overlap", client=FakeClient())
+
+    class DirtyClient(FakeClient):
+        def list_challenges(self) -> list[TSecBenchChallenge]:
+            challenge = super().list_challenges()[0]
+            return [TSecBenchChallenge(**{**challenge.__dict__, "correct_flag_count": 1, "is_completed": True})]
+
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="dirty", client=FakeClient())
+        with pytest.raises(ValueError, match="clean platform session"):
+            service.create_run(session, suite_id=suite.id, label="dirty", client=DirtyClient())
+
+    class AttachmentClient(FakeClient):
+        def list_challenges(self) -> list[TSecBenchChallenge]:
+            challenge = super().list_challenges()[0]
+            return [TSecBenchChallenge(**{**challenge.__dict__, "raw": {"attachments": [{"url": "https://files.example/a.zip"}]}})]
+
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="attachments", client=AttachmentClient())
+        with pytest.raises(ValueError, match="materialization is not implemented"):
+            service.create_run(session, suite_id=suite.id, label="attachments", client=AttachmentClient())

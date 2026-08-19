@@ -190,6 +190,34 @@ def test_codex_harness_prefers_last_message_file(monkeypatch, tmp_path) -> None:
     assert diagnostic["source"] == "last_message_file"
 
 
+def test_codex_harness_accepts_markdown_fenced_last_message(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    get_settings.cache_clear()
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    output_file = tmp_path / "aurora-last-message.json"
+    payload = {
+        "status": "success",
+        "summary": "flag recovered",
+        "decision_summary": {"selected_intent": "extract", "reason_summary": "done", "next_tool_plan": []},
+    }
+    output_file.write_text(f"```json\n{json.dumps(payload)}\n```", encoding="utf-8")
+    snapshot = SimpleNamespace(sections_json={"current_intent": {"objective": "extract"}})
+
+    output, diagnostic = runtime._parse_or_synthesize(
+        output_file=output_file,
+        stdout="",
+        stderr="",
+        exit_code=0,
+        failure_kind=None,
+        artifact_id="artifact_test",
+        snapshot=snapshot,
+    )
+
+    assert output["summary"] == "flag recovered"
+    assert diagnostic["source"] == "last_message_file"
+    assert diagnostic["tolerant_json"] is True
+
+
 def test_codex_harness_normalizes_parameters_tool_payload(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
     get_settings.cache_clear()
@@ -263,7 +291,7 @@ def test_codex_harness_normalizes_params_and_prioritizes_flag_verify(monkeypatch
     runtime = CodexHarnessRuntime(command_runner=NoopRunner())
     snapshot = SimpleNamespace(
         sections_json={"current_intent": {"objective": "verify"}},
-        visible_tools_json=[{"name": "sandbox.exec"}, {"name": "flag.verify"}],
+        visible_tools_json=[{"name": "sandbox.exec"}, {"name": "flag.verify"}, {"name": "flag.submit"}],
     )
 
     output = runtime._normalize(
@@ -275,6 +303,7 @@ def test_codex_harness_normalizes_params_and_prioritizes_flag_verify(monkeypatch
                 {"tool_name": "sandbox.exec", "request": {"command": "true"}},
                 {"tool_name": "sandbox.exec", "request": {"command": "pwd"}},
                 {"tool_name": "sandbox.exec", "request": {"command": "id"}},
+                {"tool_name": "flag.submit", "request": {"candidate_id": "latest_verified"}},
                 {
                     "tool_name": "flag.verify",
                     "params": {
@@ -294,6 +323,10 @@ def test_codex_harness_normalizes_params_and_prioritizes_flag_verify(monkeypatch
             "source_artifact_refs": ["artifact_input"],
             "verification_script": "/workspace/verify_flag.py",
         },
+    }
+    assert output["tool_requests"][1] == {
+        "tool_name": "flag.submit",
+        "request": {"candidate_id": "latest_verified"},
     }
     assert len(output["tool_requests"]) == 3
 
@@ -501,12 +534,24 @@ def test_codex_action_budget_enters_finalizing_state() -> None:
             }),
         )
         session.refresh(attempt)
+        CodexHarnessRuntime._record_codex_event(
+            session,
+            worker=worker,
+            attempt=attempt,
+            stream="stdout",
+            line=json.dumps({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "completed", "command": "false --again", "exit_code": 1},
+            }),
+        )
         events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
 
     assert reason == "action_budget_exhausted"
     assert attempt.status == "FINALIZING"
     assert attempt.finalization_reason == "action_budget_exhausted"
     assert {event.event_type for event in events} >= {"checkpoint.saved", "attempt.budget_enforced", "attempt.finalization_started"}
+    assert sum(event.event_type == "attempt.action_budget_exhausted" for event in events) == 1
+    assert sum(event.event_type == "attempt.finalization_started" for event in events) == 1
 
 
 def test_codex_resume_skips_legacy_unreadable_files(monkeypatch, tmp_path) -> None:

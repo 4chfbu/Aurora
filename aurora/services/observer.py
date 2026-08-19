@@ -6,7 +6,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.models import Artifact, Attempt, AttemptCheckpoint, Fact, ToolTrace, Worker, WorkerEvent
-from aurora.services.blackboard_repository import route_fingerprint
+from aurora.services.blackboard_repository import BlackboardRepository, route_fingerprint
 
 
 @dataclass
@@ -34,6 +34,10 @@ class ObserverService:
         )
         if decision is None:
             decision = ObserverDecision("CONTINUE", "No immediate repetition, authorization, or evidence issue detected.")
+        elif decision.decision == "REDIRECT":
+            redirect_id = self._author_redirect(session, project_id=project_id, decision=decision)
+            if redirect_id:
+                decision.references["redirect_intent_id"] = redirect_id
 
         session.add(
             WorkerEvent(
@@ -50,17 +54,60 @@ class ObserverService:
         session.commit()
         return decision
 
+    def _author_redirect(self, session: Session, *, project_id: str, decision: ObserverDecision) -> str | None:
+        fingerprint = str(decision.references.get("route_fingerprint") or "unknown")
+        checkpoint = session.exec(
+            select(AttemptCheckpoint)
+            .where(AttemptCheckpoint.project_id == project_id)
+            .order_by(AttemptCheckpoint.created_at.desc())
+        ).first()
+        next_step = next(
+            (str(step).strip() for step in (checkpoint.next_steps if checkpoint else []) if str(step).strip()),
+            "Re-read the strongest existing artifact and test a different hypothesis with a different tool or input.",
+        )
+        capabilities = ["blackboard.query", "sandbox.exec"]
+        result = BlackboardRepository().upsert_intent(
+            session,
+            project_id=project_id,
+            objective=(
+                f"Redirect away from failed route {fingerprint}: {next_step[:700]} "
+                "Use a materially different method or input, state the expected discriminating observation, and checkpoint the outcome."
+            ),
+            capability_tags=capabilities,
+            parent_intent_id=checkpoint.intent_id if checkpoint else None,
+            priority=2.0,
+            risk_level="low",
+            budget={
+                "model_role": "solver",
+                "phase": min(3, int((checkpoint.budget_json if checkpoint else {}).get("phase", 1) or 1) + 1),
+                "failed_route_fingerprint": fingerprint,
+                "max_route_repeats": 2,
+            },
+        )
+        return result.item.id
+
     def _find_route_budget(self, session: Session, project_id: str, tool_traces: list[ToolTrace]) -> ObserverDecision | None:
         codex = [trace for trace in tool_traces if trace.tool_name == "codex.shell"]
-        worker = session.exec(select(Worker).where(Worker.project_id == project_id).order_by(Worker.created_at.desc())).first()
+        attempt = session.exec(
+            select(Attempt).where(Attempt.project_id == project_id).order_by(Attempt.started_at.desc())
+        ).first()
+        worker = session.get(Worker, attempt.worker_id) if attempt else None
         budget = worker.budgets if worker else {}
         max_actions = int((budget or {}).get("max_agent_actions", 0) or 0)
-        if max_actions and len(codex) >= max_actions:
+        action_count = len(
+            session.exec(
+                select(ToolTrace).where(
+                    ToolTrace.attempt_id == attempt.id,
+                    ToolTrace.tool_name == "codex.shell",
+                )
+            ).all()
+        ) if attempt else 0
+        if max_actions and action_count >= max_actions:
             return ObserverDecision(
                 "STOP",
-                f"Codex internal action budget exhausted ({len(codex)}/{max_actions}); finalize from the latest evidence.",
+                f"Codex internal action budget exhausted ({action_count}/{max_actions}); finalize from the latest evidence.",
                 severity="high",
-                references={"action_count": len(codex), "max_agent_actions": max_actions},
+                references={"attempt_id": attempt.id, "action_count": action_count, "max_agent_actions": max_actions},
             )
         if len(codex) >= 2:
             fingerprints = [route_fingerprint(trace.request_json) for trace in codex]

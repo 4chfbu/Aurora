@@ -4,6 +4,11 @@ from pydantic import BaseModel, Field, model_validator
 import os
 
 
+def optional_env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    return int(value) if value else None
+
+
 def load_env_file(path: Path = Path(".env")) -> None:
     if not path.exists():
         return
@@ -26,6 +31,8 @@ class DebugConfig(BaseModel):
 
 class Settings(BaseModel):
     database_url: str = Field(default_factory=lambda: os.getenv("AURORA_DB_URL", "sqlite:///./aurora.db"))
+    db_journal_mode: str = Field(default_factory=lambda: os.getenv("AURORA_DB_JOURNAL_MODE", "wal"))
+    db_busy_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("AURORA_DB_BUSY_TIMEOUT_MS", "5000")))
     artifact_dir: Path = Field(default_factory=lambda: Path(os.getenv("AURORA_ARTIFACT_DIR", "./artifacts")))
     api_lock_dir: Path | None = Field(default_factory=lambda: Path(value) if (value := os.getenv("AURORA_API_LOCK_DIR")) else None)
     api_host: str = Field(default_factory=lambda: os.getenv("AURORA_API_HOST", "0.0.0.0"))
@@ -36,6 +43,8 @@ class Settings(BaseModel):
     worker_image_heavy: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_IMAGE_HEAVY", "aurora-kali-codex:heavy"))
     default_container_network: str = Field(default_factory=lambda: os.getenv("AURORA_CONTAINER_NETWORK", "aurora-runtime"))
     worker_runtime: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_RUNTIME", "codex"))
+    tool_contract: str = Field(default_factory=lambda: os.getenv("AURORA_TOOL_CONTRACT", "native_privileged"))
+    native_allow_blackboard_query: bool = Field(default_factory=lambda: os.getenv("AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY", "true").lower() in {"1", "true", "yes"})
     codex_command_template: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_COMMAND_TEMPLATE", "/workspace/runtime/codex-via-cc-switch.sh {prompt_filename} {output_schema_filename} {last_message_filename}"))
     codex_proxy_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_PROXY_BASE_URL", "http://aurora-cc-switch:15723/v1"))
     codex_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TIMEOUT_SECONDS", "1800")))
@@ -49,8 +58,16 @@ class Settings(BaseModel):
     llm_api_key: str | None = Field(default_factory=lambda: os.getenv("AURORA_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"))
     llm_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1")
     llm_model: str = Field(default_factory=lambda: os.getenv("AURORA_LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini")
+    triage_model: str | None = Field(default_factory=lambda: os.getenv("AURORA_TRIAGE_MODEL"))
     planner_model: str | None = Field(default_factory=lambda: os.getenv("AURORA_PLANNER_MODEL"))
     solver_model: str | None = Field(default_factory=lambda: os.getenv("AURORA_SOLVER_MODEL"))
+    reviewer_model: str | None = Field(default_factory=lambda: os.getenv("AURORA_REVIEWER_MODEL"))
+    triage_model_context_window: int | None = Field(default_factory=lambda: optional_env_int("AURORA_TRIAGE_MODEL_CONTEXT_WINDOW"))
+    triage_auto_compact_token_limit: int | None = Field(default_factory=lambda: optional_env_int("AURORA_TRIAGE_AUTO_COMPACT_TOKEN_LIMIT"))
+    solver_model_context_window: int | None = Field(default_factory=lambda: optional_env_int("AURORA_SOLVER_MODEL_CONTEXT_WINDOW"))
+    solver_auto_compact_token_limit: int | None = Field(default_factory=lambda: optional_env_int("AURORA_SOLVER_AUTO_COMPACT_TOKEN_LIMIT"))
+    reviewer_model_context_window: int | None = Field(default_factory=lambda: optional_env_int("AURORA_REVIEWER_MODEL_CONTEXT_WINDOW"))
+    reviewer_auto_compact_token_limit: int | None = Field(default_factory=lambda: optional_env_int("AURORA_REVIEWER_AUTO_COMPACT_TOKEN_LIMIT"))
     llm_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_LLM_TIMEOUT_SECONDS", "120")))
     default_soft_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_SOFT_TIMEOUT_SECONDS", "300")))
     default_hard_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_DEFAULT_HARD_TIMEOUT_SECONDS", "1800")))
@@ -84,12 +101,17 @@ class Settings(BaseModel):
     fofa_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_FOFA_TIMEOUT_SECONDS", "20")))
     subagents_enabled: bool = Field(default_factory=lambda: os.getenv("AURORA_SUBAGENTS_ENABLED", "false").lower() in {"1", "true", "yes"})
     subagents_max_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_CONCURRENT", "2")))
-    subagents_max_per_worker: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_PER_WORKER", "4")))
+    subagents_max_per_worker: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_PER_WORKER", "2")))
     max_challenge_group_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_MAX_CHALLENGE_GROUP_CONCURRENT", "2")))
     tsecbench_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_TSECBENCH_BASE_URL") or os.getenv("BENCHMARK_BASE_URL") or "https://tsecbench.zc.tencent.com")
     tsecbench_token: str | None = Field(default_factory=lambda: os.getenv("AURORA_TSECBENCH_TOKEN") or os.getenv("BENCHMARK_TOKEN") or None)
     tsecbench_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_TSECBENCH_TIMEOUT_SECONDS", "20")))
     tsecbench_max_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_TSECBENCH_MAX_CONCURRENT", "3")))
+    slab_match_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_SLAB_MATCH_BASE_URL") or os.getenv("SLAB_MATCH_BASE_URL") or "https://example.com/slab-match/api/v1/agent")
+    slab_match_access_key: str | None = Field(default_factory=lambda: os.getenv("AURORA_SLAB_MATCH_ACCESS_KEY") or os.getenv("SLAB_MATCH_ACCESS_KEY") or None)
+    slab_match_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_SLAB_MATCH_TIMEOUT_SECONDS", "20")))
+    slab_match_max_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_SLAB_MATCH_MAX_CONCURRENT", "1")))
+    slab_match_notice_poll_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_SLAB_MATCH_NOTICE_POLL_SECONDS", "15")))
     openvpn_image: str = Field(default_factory=lambda: os.getenv("AURORA_OPENVPN_IMAGE", "aurora-openvpn:latest"))
     openvpn_container_name: str = Field(default_factory=lambda: os.getenv("AURORA_OPENVPN_CONTAINER_NAME", "aurora-openvpn"))
     openvpn_connect_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_OPENVPN_CONNECT_TIMEOUT_SECONDS", "75")))
@@ -102,6 +124,13 @@ class Settings(BaseModel):
             raise ValueError("AURORA_CODEX_MODEL_CONTEXT_WINDOW must be positive")
         if self.codex_auto_compact_token_limit <= 0 or self.codex_auto_compact_token_limit >= self.codex_model_context_window:
             raise ValueError("AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT must be positive and smaller than the Codex context window")
+        for role in ("triage", "solver", "reviewer"):
+            window = getattr(self, f"{role}_model_context_window")
+            compact = getattr(self, f"{role}_auto_compact_token_limit")
+            if (window is None) != (compact is None):
+                raise ValueError(f"{role} model context window and auto compact limit must be configured together")
+            if window is not None and (window <= 0 or compact is None or compact <= 0 or compact >= window):
+                raise ValueError(f"{role} auto compact limit must be positive and smaller than its context window")
         if self.codex_require_explicit_model_metadata and (
             "AURORA_CODEX_MODEL_CONTEXT_WINDOW" not in os.environ
             or "AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT" not in os.environ
@@ -111,6 +140,8 @@ class Settings(BaseModel):
             raise ValueError("AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS cannot be negative")
         if self.resume_max_files <= 0 or self.resume_max_bytes <= 0:
             raise ValueError("resume manifest limits must be positive")
+        if self.slab_match_notice_poll_seconds <= 0:
+            raise ValueError("AURORA_SLAB_MATCH_NOTICE_POLL_SECONDS must be positive")
         return self
 
     @property
@@ -125,12 +156,28 @@ class Settings(BaseModel):
     def tsecbench_configured(self) -> bool:
         return bool(self.tsecbench_base_url and self.tsecbench_token)
 
+    @property
+    def slab_match_configured(self) -> bool:
+        return bool(self.slab_match_base_url and self.slab_match_access_key)
+
     def model_for_role(self, role: str) -> str:
+        if role == "triage" and self.triage_model:
+            return self.triage_model
         if role == "planner" and self.planner_model:
             return self.planner_model
         if role == "solver" and self.solver_model:
             return self.solver_model
+        if role == "reviewer" and self.reviewer_model:
+            return self.reviewer_model
         return self.llm_model
+
+    def codex_metadata_for_role(self, role: str) -> tuple[int, int]:
+        window = getattr(self, f"{role}_model_context_window", None)
+        compact = getattr(self, f"{role}_auto_compact_token_limit", None)
+        return (
+            int(window or self.codex_model_context_window),
+            int(compact or self.codex_auto_compact_token_limit),
+        )
 
 
 @lru_cache

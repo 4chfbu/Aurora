@@ -122,6 +122,10 @@
 .manual-flag-validation span { color: #aebdcd; font-size: .63rem; }
 .group-console li .manual-flag-validation button { display: inline-flex; justify-content: center; align-items: center; gap: 4px; border: 1px solid #277c94; border-radius: 4px; background: #123347; color: #dff8ff; padding: 5px; text-align: center; white-space: normal; }
 .group-console li .manual-flag-validation .danger-button { border-color: #713b45; background: #28151b; color: #f0a4a4; }
+.concurrency-control { display: flex; align-items: center; gap: 7px; }
+.concurrency-control > input { width: 56px; border: 1px solid #263446; border-radius: 4px; background: #0b121d; color: #dce7f2; padding: 5px 7px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .75rem; }
+.concurrency-control > input:disabled { opacity: .55; }
+.concurrency-control > small { color: #6f849b; font-size: .6rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 
 .progress-node.activity { border-left-color: #e6aa4e; background: #1c1810; }
 

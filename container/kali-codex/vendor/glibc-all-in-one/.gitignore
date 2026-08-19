@@ -1,0 +1,13 @@
+libs
+debs
+srcs
+list
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+.pytest_cache/
+# Claude-related
+.claude/
+CLAUDE.md
+docs/

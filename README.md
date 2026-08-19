@@ -9,7 +9,7 @@ The first milestone implements a minimal Fact-Intent blackboard loop with:
 - SQLite-backed project, fact, intent, attempt, worker, artifact, and debug trace models.
 - A local artifact store for raw evidence.
 - A lease-based scheduler skeleton.
-- A Kali-first capability gateway with a restricted `sandbox.exec` interface and semantic tool stubs.
+- A server-side capability gateway for isolated `flag.verify`, provenance-gated `flag.submit`, credential-bearing FOFA requests, controlled browser sessions, and audited network tools. Native Codex workers run local analysis directly inside the worker container; `sandbox.exec` remains available to the direct OpenAI runtime and the manual tool API.
 - A Kali-first command runner that uses `kalilinux/kali-rolling` through Docker/Podman when the image is already available locally, with local fallback for development.
 - A real Codex Harness runtime backed by a private CC Switch protocol-conversion service.
 - FastAPI endpoints and a simple React/Vite UI scaffold.
@@ -107,6 +107,10 @@ Useful endpoints:
 - `GET /api/projects/{project_id}/findings`
 - `GET /api/projects/{project_id}/summary`
 - `GET /api/projects/{project_id}/reliability`
+- `POST /api/evaluations/suites`
+- `POST /api/evaluations/suites/{suite_id}/runs`
+- `GET /api/evaluations/runs/{run_id}`
+- `GET /api/evaluations/comparisons`
 - `POST /api/projects/{project_id}/tools/{tool_name}/execute`
 - `POST /api/projects/{project_id}/observer/run`
 - `POST /api/projects/{project_id}/manager/run`
@@ -140,7 +144,7 @@ AURORA_FOFA_EMAIL=you@example.com
 AURORA_FOFA_KEY=your-fofa-key
 ```
 
-FOFA is deliberately restricted to a single `host="..."`, `domain="..."`, or `ip="..."` expression that matches the project's allowed host/domain scope. Its raw response is stored as an Artifact and its request is audited like every other tool call.
+FOFA is exposed only when both credentials are configured. Its raw response is stored as an Artifact and its request is audited like every other tool call. The current gateway does not constrain the query to the project's recorded hosts or domains; operators must enforce the permitted query scope.
 
 ## Same-Container Subagents
 
@@ -149,7 +153,7 @@ Subagents are disabled by default. Enable the global guard and then opt in per p
 ```bash
 AURORA_SUBAGENTS_ENABLED=true
 AURORA_SUBAGENTS_MAX_CONCURRENT=2
-AURORA_SUBAGENTS_MAX_PER_WORKER=4
+AURORA_SUBAGENTS_MAX_PER_WORKER=2
 ```
 
 An enabled Solver may start a non-recursive child through the local `subagent.spawn` capability. The child runs as a Codex subprocess in the same Worker container and shared `/workspace`, while receiving a separate minimal context. There is no independent subagent timeout: child processes end only when they complete or when their parent Worker, project, or container is stopped. Each child transcript and structured result is imported as its own Worker, Attempt, Trace, Event, and Artifact record.
@@ -170,7 +174,9 @@ If Docker/Podman or the image is unavailable, commands fall back to local execut
 
 Raw stdout/stderr is stored in Artifact files. The model-facing context and UI debug panel only receive summaries and artifact references unless an artifact is explicitly opened.
 
-Only trusted challenge/target artifacts and successful `flag.verify` replay artifacts are scanned for flag candidates. A locally verified candidate creates a `Finding`, emits `finding.flag_candidate`, and moves the project to `FLAG_READY`; only platform or manual acceptance marks it `COMPLETED`.
+Only trusted challenge/target artifacts and successful `flag.verify` replay artifacts are scanned for flag candidates. For a derived flag, the Solver supplies source Artifact references and a Python script from its workspace. Aurora packages the declared inputs, passes `inputs/manifest.json` to the script, runs it twice in an isolated networkless environment, and accepts only one reproducible computed value; hard-coded candidates are rejected. Inline Python remains a compatibility input, and verification timeouts are clamped to 1–60 seconds.
+
+A locally verified candidate creates a `Finding`, emits `finding.flag_candidate`, and moves the project to `FLAG_READY`; only platform or manual acceptance marks it `COMPLETED`. Managed competition workers submit by candidate ID, or pair `flag.verify` with `flag.submit(candidate_id="latest_verified")` in the same tool batch. The submission gate rejects raw flag values, cross-project or stale candidates, and repeat submissions. Platform rejection feedback is returned to the next Solver turn; an unavailable platform moves the item to manual validation. Slab Match also honors an explicit match rule that requests only the content inside braces, otherwise it submits the full flag.
 
 When a project is completed, remaining pending Intents are cancelled and `scheduler/run-next` returns a `project_completed` no-op response instead of claiming more work.
 
@@ -180,16 +186,15 @@ Container execution uses Docker/Podman `bridge` networking by default so authori
 AURORA_CONTAINER_NETWORK=none uv run uvicorn apps.api.main:app --reload
 ```
 
-An imported project does not require a live target to start solving. Workers continue with challenge text, attachments, and local analysis; a target can be discovered or manually supplied later, and every network request remains authorization-gated.
+An imported project does not require a live target to start solving. Workers continue with challenge text, attachments, and local analysis; a target can be discovered or manually supplied later.
 
-## Authorization Policy
+## Current Network Authorization Posture
 
-Semantic tools are checked against `AuthorizationScope` before command generation:
+Target authorization enforcement is currently disabled. `PolicyEngine` returns `allow` for every gateway request, so `AuthorizationScope.allowed_hosts`, `allowed_domains`, and metadata-denial fields are retained as project metadata and compatibility state, not as a security boundary. The native Codex shell is not target-scoped either.
 
-- `http.request` and `web.enumerate` validate URL hostnames.
-- `network.scan` validates the target host.
-- Metadata and management targets such as `169.254.169.254` are denied by default.
-- `sandbox.exec` is still available as a restricted escape hatch, with command-level deny rules and full audit logging.
+Run Aurora only for targets you are authorized to test, and enforce egress externally with the Worker container network, firewall/VPN policy, or an outbound proxy. `AURORA_CONTAINER_NETWORK=none` disables ordinary Worker networking when a task needs no network. Some individual import, attachment, browser, VPN, and command paths still contain input-specific SSRF or dangerous-command checks, but those checks are not a general network authorization policy.
+
+The native Codex runtime executes shell commands directly inside the Worker container with Codex approvals and its sandbox disabled. `sandbox.exec` remains for the direct OpenAI runtime and manual Web/API execution, with command-level deny rules, workspace restrictions, and audit logging.
 
 Manual tool execution is available in the Web UI and API. Example:
 
@@ -221,7 +226,7 @@ curl -X POST http://localhost:8000/api/projects/<project_id>/intents \
   }'
 ```
 
-Runtime output selects authorized tools from the context and routes requests through the same `CapabilityGateway`, `PolicyEngine`, `ToolTrace`, and `ArtifactStore` path as manual execution.
+Runtime output selects gateway tools from the context and routes requests through the same `CapabilityGateway`, `PolicyEngine`, `ToolTrace`, and `ArtifactStore` path as manual execution. In the current build, `PolicyEngine` records an allow decision but does not enforce target scope.
 
 ## Auto Run
 
@@ -242,7 +247,7 @@ The MVP includes a deterministic event-driven Observer. It does not call an LLM 
 
 Current decisions:
 
-- `ESCALATE` when a recent tool request was denied by policy.
+- `ESCALATE` when a recent tool request was denied by a tool-specific check or a future/custom policy implementation.
 - `REDIRECT` when the two most recent tool calls are identical.
 - `REQUEST_EVIDENCE` when a recent failed/partial Attempt has no artifact evidence.
 - `CONTINUE` when no immediate issue is detected.
@@ -303,4 +308,22 @@ Run the full local verification suite:
 
 ```bash
 ./scripts/check.sh
+cd apps/web
+node_modules/.bin/tsc --noEmit -p tsconfig.json
+npm audit --audit-level=moderate
 ```
+
+`check.sh` runs the Python tests and production Web build; the additional commands enforce strict TypeScript checking and dependency-audit status before a release.
+
+## Frozen Evaluation
+
+The TSecBench evaluation API freezes eligible clean challenges and runs `baseline` or `candidate` variants in 5/20/25-minute phases (50 minutes per challenge). A suite permits only one active run, rejects live platform state with accepted progress, and currently refuses remote-attachment items until attachment materialization is implemented. Baseline and candidate therefore require independent clean platform sessions, or an explicit platform reset between runs. Promotion requires at least 30 eligible items, a 15-point success-rate improvement, no worse wrong-submission rate, the repeated-request reduction gate, and complete derived-verification and terminal-checkpoint coverage.
+
+## Third-party licensing
+
+The optional heavy Worker image vendors `glibc-all-in-one` under a personal,
+educational, academic-research, and authorized security-research license that
+explicitly prohibits commercial use. See
+`container/kali-codex/vendor/glibc-all-in-one/LICENSE` before redistributing or
+using that image commercially. The bundled `glibc-heap-primitives` skill is MIT
+licensed and carries its own LICENSE and NOTICE files.

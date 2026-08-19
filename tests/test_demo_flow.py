@@ -225,7 +225,7 @@ def test_deleting_group_cascades_projects_and_removes_shared_group_items() -> No
             assert not session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == secondary_id)).all()
 
 
-def test_manual_tool_execution_enforces_authorization_scope() -> None:
+def test_manual_tool_execution_not_gated_by_authorization() -> None:
     client = TestClient(create_app())
     with client:
         created = client.post(
@@ -239,13 +239,16 @@ def test_manual_tool_execution_enforces_authorization_scope() -> None:
         assert created.status_code == 200
         project_id = created.json()["id"]
 
-        denied = client.post(
-            f"/api/projects/{project_id}/tools/http.request/execute",
-            json={"request": {"url": "http://169.254.169.254/latest/meta-data/"}},
-        )
-        assert denied.status_code == 200
-        assert denied.json()["success"] is False
-        assert "denied" in denied.json()["summary"]
+        # Authorization gating has been removed: an out-of-scope host is
+        # allowed by policy and only fails later if it is unreachable.
+        with Session(engine) as session:
+            decision = PolicyEngine().check_tool_request(
+                session,
+                project_id=project_id,
+                tool_name="http.request",
+                request={"url": "http://8.8.8.8:18080/"},
+            )
+            assert decision.allowed is True
 
         allowed = client.post(
             f"/api/projects/{project_id}/tools/http.request/execute",
@@ -257,11 +260,10 @@ def test_manual_tool_execution_enforces_authorization_scope() -> None:
         tool_traces = client.get(f"/api/projects/{project_id}/debug/tool-traces")
         assert tool_traces.status_code == 200
         decisions = [trace["policy_decision"] for trace in tool_traces.json()]
-        assert "deny" in decisions
-        assert any(decision.startswith("allow") for decision in decisions)
+        assert "deny" not in decisions
 
 
-def test_fofa_query_requires_a_single_authorized_scope_anchor() -> None:
+def test_fofa_query_not_gated_by_authorization() -> None:
     client = TestClient(create_app())
     with client:
         created = client.post(
@@ -270,20 +272,18 @@ def test_fofa_query_requires_a_single_authorized_scope_anchor() -> None:
         )
         project_id = created.json()["id"]
 
-        unanchored = client.post(
-            f"/api/projects/{project_id}/tools/fofa.search/execute",
-            json={"request": {"query": 'title="nginx"'}},
-        )
-        outside_scope = client.post(
-            f"/api/projects/{project_id}/tools/fofa.search/execute",
-            json={"request": {"query": 'host="example.com"'}},
-        )
-        assert unanchored.status_code == 200
-        assert unanchored.json()["success"] is False
-        assert "must be exactly" in unanchored.json()["summary"]
-        assert outside_scope.status_code == 200
-        assert outside_scope.json()["success"] is False
-        assert "outside authorization scope" in outside_scope.json()["summary"]
+        # Authorization scoping is removed; any FOFA query shape is allowed by
+        # policy. Execution still needs a configured FOFA credential, which is
+        # not present in tests, so only the policy decision is asserted here.
+        with Session(engine) as session:
+            for query in ('title="nginx"', 'host="example.com"'):
+                decision = PolicyEngine().check_tool_request(
+                    session,
+                    project_id=project_id,
+                    tool_name="fofa.search",
+                    request={"query": query},
+                )
+                assert decision.allowed is True
 
 
 def test_project_runtime_policy_requires_global_and_project_opt_in(monkeypatch) -> None:
@@ -663,9 +663,11 @@ def test_observer_escalates_policy_denial() -> None:
         assert created.status_code == 200
         project_id = created.json()["id"]
 
+        # capability.request is unsupported and still records a policy deny,
+        # which Observer must escalate on.
         denied = client.post(
-            f"/api/projects/{project_id}/tools/http.request/execute",
-            json={"request": {"url": "http://169.254.169.254/latest/meta-data/"}},
+            f"/api/projects/{project_id}/tools/capability.request/execute",
+            json={"request": {"capability": "target.url"}},
         )
         assert denied.status_code == 200
         assert denied.json()["success"] is False
@@ -886,6 +888,79 @@ def test_manager_generates_intent_from_url_hint_without_duplicates() -> None:
         events = client.get(f"/api/projects/{project_id}/events")
         assert events.status_code == 200
         assert "manager.decision" in {event["event_type"] for event in events.json()}
+
+
+def test_manager_does_not_create_a_second_planning_loop_after_checkpoint() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "manager-stop", "goal": "Stop without an explicit follow-up", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+
+        with Session(engine) as session:
+            intent = session.exec(select(Intent).where(Intent.project_id == project_id)).one()
+            intent.status = "COMPLETED"
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="COMPLETED")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id, status="COMPLETED")
+            session.add_all([intent, worker, attempt])
+            session.commit()
+            session.add(AttemptCheckpoint(
+                project_id=project_id,
+                intent_id=intent.id,
+                worker_id=worker.id,
+                attempt_id=attempt.id,
+                summary="No explicit follow-up was proposed.",
+                next_steps=["Do not synthesize another planner loop."],
+                generated_intent_ids=[],
+            ))
+            session.commit()
+
+        manager = client.post(f"/api/projects/{project_id}/manager/run")
+        intents = client.get(f"/api/projects/{project_id}/intents").json()
+
+    assert manager.status_code == 200
+    assert manager.json()["status"] == "NOOP"
+    assert not any(intent["status"] == "PENDING" for intent in intents)
+
+
+def test_manager_authors_continuation_from_partial_checkpoint() -> None:
+    client = TestClient(create_app())
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "manager-resume", "goal": "Continue evidence-backed work", "allowed_hosts": ["127.0.0.1"]},
+        )
+        project_id = created.json()["id"]
+        with Session(engine) as session:
+            intent = session.exec(select(Intent).where(Intent.project_id == project_id)).one()
+            intent.status = "COMPLETED"
+            worker = Worker(project_id=project_id, intent_id=intent.id, status="COMPLETED")
+            attempt = Attempt(project_id=project_id, intent_id=intent.id, worker_id=worker.id, status="PARTIAL")
+            session.add_all([intent, worker, attempt])
+            session.commit()
+            session.add(AttemptCheckpoint(
+                project_id=project_id,
+                intent_id=intent.id,
+                worker_id=worker.id,
+                attempt_id=attempt.id,
+                status="PARTIAL",
+                summary="A discriminating experiment remains.",
+                next_steps=["Inspect the imported artifact header with a bounded command"],
+                generated_intent_ids=[],
+                budget_json={"phase": 1},
+            ))
+            session.commit()
+
+        manager = client.post(f"/api/projects/{project_id}/manager/run")
+        intents = client.get(f"/api/projects/{project_id}/intents").json()
+
+    continuation = next(intent for intent in intents if intent["status"] == "PENDING")
+    assert manager.json()["status"] == "PROPOSED"
+    assert continuation["parent_intent_id"] is not None
+    assert continuation["budget"]["phase"] == 2
+    assert continuation["capability_tags"] == ["blackboard.query", "sandbox.exec"]
 
 
 def test_post_creation_hint_is_consumed_by_manager() -> None:
@@ -1527,7 +1602,7 @@ def test_discovered_target_is_filtered_and_temporarily_authorized() -> None:
         project_id = project["id"]
         with Session(engine) as session:
             denied = PolicyEngine().check_tool_request(session, project_id=project_id, tool_name="http.request", request={"url": "http://8.8.8.8:18080/"})
-            assert denied.allowed is False
+            assert denied.allowed is True  # authorization gate removed
             session.add(DiscoveredTarget(project_id=project_id, url="http://8.8.8.8:18080/", host="8.8.8.8"))
             session.commit()
             allowed = PolicyEngine().check_tool_request(session, project_id=project_id, tool_name="http.request", request={"url": "http://8.8.8.8:18080/"})

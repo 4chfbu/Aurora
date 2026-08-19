@@ -4,7 +4,8 @@ from datetime import datetime
 
 from sqlmodel import Session, select
 
-from aurora.models import Attempt, AttemptCheckpoint, Intent, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.models import Attempt, AttemptCheckpoint, FlagCandidate, Intent, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.services.blackboard_repository import route_fingerprint
 
 
 TERMINAL_ATTEMPT_STATUSES = {"SUCCESS", "PARTIAL", "FAILED", "TIMEOUT"}
@@ -19,6 +20,7 @@ class ReliabilityService:
         events = session.exec(select(WorkerEvent).where(WorkerEvent.project_id == project_id)).all()
         traces = session.exec(select(LLMTrace).where(LLMTrace.project_id == project_id)).all()
         tool_traces = session.exec(select(ToolTrace).where(ToolTrace.project_id == project_id)).all()
+        candidates = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id)).all()
 
         checkpoint_attempt_ids = {checkpoint.attempt_id for checkpoint in checkpoints}
         checkpoint_attempt_ids.update(
@@ -52,6 +54,31 @@ class ReliabilityService:
         )
         checkpointed_terminal = sum(attempt.id in checkpoint_attempt_ids for attempt in terminal)
         resume_total = resume_scheduled + resume_rejected
+        actions = [trace for trace in tool_traces if trace.tool_name == "codex.shell"]
+        progress_events = [
+            event for event in events
+            if event.event_type in {"checkpoint.saved", "blackboard.fact_appended", "artifact.read", "hypothesis.eliminated"}
+        ]
+        request_counts: dict[tuple[str, str], int] = {}
+        for trace in tool_traces:
+            key = (trace.tool_name, route_fingerprint(trace.request_json))
+            request_counts[key] = request_counts.get(key, 0) + 1
+        redundant_requests = sum(max(0, count - 1) for count in request_counts.values())
+        derived_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.provenance_kind.upper() in {"DERIVED_REPLAY", "VERIFIED_REPLAY"}
+        ]
+        verified_derived = [candidate for candidate in derived_candidates if candidate.verification_artifact_ref]
+        rejected_candidates = [candidate for candidate in candidates if candidate.status == "REJECTED"]
+        verify_calls = [trace for trace in tool_traces if trace.tool_name == "flag.verify"]
+        dropped_non_privileged = sum(event.event_type == "tool.skipped.non_privileged" for event in events)
+        mcp_server_events = [event for event in events if event.event_type == "mcp.server.observed"]
+        mcp_servers_observed = sorted({
+            server
+            for event in mcp_server_events
+            for server in (event.payload_json or {}).get("servers", [])
+        })
         return {
             "project_id": project_id,
             "attempts": {
@@ -72,16 +99,37 @@ class ReliabilityService:
                 "rejected": resume_rejected,
                 "verified_rate": resume_scheduled / resume_total if resume_total else None,
             },
+            "progress": {
+                "evidence_events": len(progress_events),
+                "codex_actions": len(actions),
+                "evidence_per_action": len(progress_events) / len(actions) if actions else None,
+            },
             "state": {"active_workers": len(active_workers), "stale_worker_ids": stale_workers},
             "model": {"metadata_fallbacks": model_fallbacks},
             "routes": {
-                "codex_actions": sum(trace.tool_name == "codex.shell" for trace in tool_traces),
+                "codex_actions": len(actions),
                 "failed_codex_actions": sum(trace.tool_name == "codex.shell" and trace.exit_code not in (None, 0) for trace in tool_traces),
+                "redundant_requests": redundant_requests,
+                "redundant_request_rate": redundant_requests / len(tool_traces) if tool_traces else 0.0,
+            },
+            "verification": {
+                "flag_verify_calls": len(verify_calls),
+                "derived_candidates": len(derived_candidates),
+                "verified_derived_candidates": len(verified_derived),
+                "derived_verification_coverage": len(verified_derived) / len(derived_candidates) if derived_candidates else 1.0,
+                "rejected_candidates": len(rejected_candidates),
+                "rejected_candidate_rate": len(rejected_candidates) / len(candidates) if candidates else 0.0,
+            },
+            "tool_contract": {
+                "dropped_non_privileged_requests": dropped_non_privileged,
+                "mcp_servers_observed": mcp_servers_observed,
+                "capability_request_escalations": sum(event.event_type == "operator.escalated" for event in events),
             },
             "gates": {
                 "all_terminal_attempts_checkpointed": checkpointed_terminal == len(terminal),
                 "no_stale_workers": not stale_workers,
                 "no_model_metadata_fallback": model_fallbacks == 0,
+                "all_derived_candidates_verified": len(verified_derived) == len(derived_candidates),
             },
         }
 

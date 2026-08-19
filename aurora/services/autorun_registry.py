@@ -11,11 +11,13 @@ from sqlmodel import Session
 from aurora.db import engine
 from aurora.models import now_utc
 from aurora.services.autorunner import AutoRunLimits, AutoRunResult, AutoRunnerService
+from aurora.services.project_run_control import project_run_control
 
 
 @dataclass
 class AutoRunTaskState:
     project_id: str
+    run_id: str | None = None
     status: str = "running"
     stop_requested: bool = False
     started_at: datetime = field(default_factory=now_utc)
@@ -32,16 +34,29 @@ class AutoRunRegistry:
     def start(self, *, project_id: str, limits: AutoRunLimits) -> AutoRunTaskState:
         with self._lock:
             existing = self._tasks.get(project_id)
-            if existing and existing.status == "running":
+            if existing and existing.status in {"running", "stopping"}:
                 return existing
-            state = AutoRunTaskState(project_id=project_id)
+            claim = project_run_control.acquire(project_id=project_id, owner="autorun.background")
+            if claim is None:
+                return AutoRunTaskState(
+                    project_id=project_id,
+                    status="busy",
+                    finished_at=now_utc(),
+                    error="project_run_active",
+                )
+            state = AutoRunTaskState(project_id=project_id, run_id=claim.run_id)
             self._tasks[project_id] = state
 
-        thread = threading.Thread(target=self._run, args=(project_id, limits, state), daemon=True)
-        thread.start()
+        try:
+            thread = threading.Thread(target=self._run, args=(project_id, limits, state), daemon=True)
+            thread.start()
+        except Exception:
+            project_run_control.release(project_id=project_id, run_id=state.run_id or "")
+            raise
         return state
 
     def stop(self, project_id: str) -> AutoRunTaskState | None:
+        project_run_control.request_stop(project_id)
         with self._lock:
             state = self._tasks.get(project_id)
             if state:
@@ -73,6 +88,7 @@ class AutoRunRegistry:
                     project_id=project_id,
                     limits=limits,
                     should_stop=lambda: state.stop_requested,
+                    run_id=state.run_id,
                 )
             with self._lock:
                 state.status = result.status

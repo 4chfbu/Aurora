@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -115,3 +117,52 @@ def test_trusted_observed_flag_becomes_ready_but_not_completed(tmp_path) -> None
         assert project.status == "FLAG_READY"
         assert candidate.status == "LOCAL_VERIFIED"
         assert candidate.provenance_kind == "OBSERVED"
+
+
+def test_platform_rejected_candidate_is_not_revived_by_post_tool_artifact_scan(tmp_path) -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="platform-rejected", goal="fix the submitted format")
+        session.add(project)
+        session.commit()
+        attempt, trace = _attempt(session, project)
+        artifact = ArtifactStore(tmp_path).write_text(
+            session,
+            project_id=project.id,
+            source_attempt_id=attempt.id,
+            content='{"status":"verified","value":"flag{wrong_wrapper}"}',
+            summary="verified derivation",
+            artifact_type="flag-verification",
+            origin_kind="verified_derivation",
+        )
+        candidate = FlagCandidate(
+            project_id=project.id,
+            value="flag{wrong_wrapper}",
+            value_hash=hashlib.sha256(b"flag{wrong_wrapper}").hexdigest(),
+            status="REJECTED",
+            provenance_kind="DERIVED_REPLAY",
+            artifact_refs=[artifact.id],
+            verification_artifact_ref=artifact.id,
+            submission_count=1,
+            rejection_reason="competition platform rejected the candidate flag",
+        )
+        session.add(candidate)
+        session.commit()
+
+        ResultProcessor().apply(
+            session,
+            attempt=attempt,
+            llm_trace=trace,
+            output={
+                "status": "success",
+                "artifact_refs": [artifact.id],
+                "candidate_flags": [{"value": candidate.value, "artifact_ref": artifact.id}],
+            },
+        )
+
+        session.refresh(candidate)
+        session.refresh(project)
+        assert candidate.status == "REJECTED"
+        assert project.status == "ACTIVE"
+        assert session.exec(select(Finding).where(Finding.project_id == project.id)).all() == []

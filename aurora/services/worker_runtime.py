@@ -8,8 +8,6 @@ import secrets
 import shlex
 import shutil
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +17,7 @@ from sqlmodel import Session, select
 
 from aurora.config import get_settings
 from aurora.models import Artifact, Attempt, ContextSnapshot, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.services.llm_http import LLMRequestError, chat_completion
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.blackboard_repository import route_fingerprint
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
@@ -48,6 +47,7 @@ EXECUTABLE_TOOLS = [
     "binary.inspect",
     "forensic.inspect",
     "flag.verify",
+    "flag.submit",
     "sandbox.exec",
 ]
 
@@ -71,7 +71,8 @@ class OpenAICompatibleRuntime:
             raise RuntimeError("AURORA_WORKER_RUNTIME=openai requires AURORA_LLM_API_KEY or OPENAI_API_KEY")
 
         prompt = self._build_prompt(worker, snapshot)
-        response = self._call_llm(prompt)
+        model = self.settings.model_for_role(str(worker.budgets.get("model_role", "solver")))
+        response = self._call_llm(prompt, model=model)
         structured = self._parse_structured_output(response["content"])
         structured = self._normalize_structured_output(structured, snapshot)
         output_json = json.dumps(structured, ensure_ascii=False, sort_keys=True)
@@ -84,7 +85,7 @@ class OpenAICompatibleRuntime:
             intent_id=worker.intent_id,
             context_snapshot_id=snapshot.id,
             prompt_hash=hashlib.sha256(prompt_json.encode("utf-8")).hexdigest(),
-            model=self.model,
+            model=model,
             input_chars=len(prompt_json),
             estimated_input_tokens=int(usage.get("prompt_tokens") or max(1, len(prompt_json) // 4)),
             output_chars=len(output_json),
@@ -101,31 +102,16 @@ class OpenAICompatibleRuntime:
     def _build_prompt(self, worker: Worker, snapshot: ContextSnapshot) -> list[dict[str, str]]:
         return PromptRenderer().render_messages(worker=worker, snapshot=snapshot)
 
-    def _call_llm(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        url = self.settings.llm_base_url.rstrip("/") + "/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        }
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.settings.llm_api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+    def _call_llm(self, messages: list[dict[str, str]], *, model: str | None = None) -> dict[str, Any]:
         try:
-            with urllib.request.urlopen(request, timeout=self.settings.llm_timeout_seconds) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM API request failed: HTTP {exc.code}: {detail[:1000]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"LLM API request failed: {exc}") from exc
+            body = chat_completion(
+                settings=self.settings,
+                model=model or self.model,
+                messages=messages,
+                timeout=self.settings.llm_timeout_seconds,
+            )
+        except LLMRequestError as exc:
+            raise RuntimeError(str(exc)) from exc
 
         choices = body.get("choices") or []
         if not choices:
@@ -160,7 +146,7 @@ class OpenAICompatibleRuntime:
         visible_tool_names = {tool.get("name") for tool in snapshot.visible_tools_json}
         filtered_tool_requests = []
         ordered_tool_requests = [request for request in tool_requests if isinstance(request, dict)]
-        ordered_tool_requests.sort(key=lambda request: request.get("tool_name") != "flag.verify")
+        ordered_tool_requests.sort(key=lambda request: {"flag.verify": 0, "flag.submit": 1}.get(request.get("tool_name"), 2))
         for request in ordered_tool_requests[:3]:
             tool_name = request.get("tool_name")
             if tool_name in visible_tool_names:
@@ -180,7 +166,7 @@ class OpenAICompatibleRuntime:
                 if not isinstance(payload, dict):
                     payload = {}
                 filtered_tool_requests.append({"tool_name": tool_name, "request": payload, **({"activity_label": activity_label} if activity_label else {})})
-        if not filtered_tool_requests:
+        if not filtered_tool_requests and status == "partial":
             fallback_tool = self._select_tool(intent, visible_tool_names)
             filtered_tool_requests = [{"tool_name": fallback_tool, "request": self._tool_request(intent, fallback_tool)}]
         decision_summary = structured.get("decision_summary")
@@ -285,7 +271,9 @@ class CodexHarnessRuntime:
 
     def execute(self, session: Session, *, worker: Worker, snapshot: ContextSnapshot) -> RuntimeOutput:
         prompt_file = self._write_prompt(session, worker, snapshot)
-        model = self.settings.model_for_role(str(worker.budgets.get("model_role", "solver")))
+        model_role = str(worker.budgets.get("model_role", "solver"))
+        model = self.settings.model_for_role(model_role)
+        model_context_window, auto_compact_token_limit = self.settings.codex_metadata_for_role(model_role)
         command = self._render_command(prompt_file, model=model)
         started = time.monotonic()
         attempt = session.exec(
@@ -308,8 +296,8 @@ class CodexHarnessRuntime:
             expected_profile=profile,
             environment_overrides={
                 "OPENAI_MODEL": model,
-                "AURORA_CODEX_MODEL_CONTEXT_WINDOW": str(self.settings.codex_model_context_window),
-                "AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT": str(self.settings.codex_auto_compact_token_limit),
+                "AURORA_CODEX_MODEL_CONTEXT_WINDOW": str(model_context_window),
+                "AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT": str(auto_compact_token_limit),
                 "AURORA_WORKER_CONTROL_BASE_URL": self.settings.worker_control_base_url,
                 "AURORA_WORKER_ID": worker.id,
                 "AURORA_WORKER_CONTROL_TOKEN": control_token,
@@ -362,6 +350,9 @@ class CodexHarnessRuntime:
             failure_kind=completed.failure_kind,
             artifact_id=artifact.id,
             snapshot=snapshot,
+            session=session,
+            worker=worker,
+            attempt=attempt,
         )
         structured.setdefault("artifact_refs", [])
         if artifact.id not in structured["artifact_refs"]:
@@ -388,16 +379,16 @@ class CodexHarnessRuntime:
                 "stdout_bytes": len(completed.stdout.encode("utf-8", errors="replace")),
                 "stderr_bytes": len(completed.stderr.encode("utf-8", errors="replace")),
                 "duration_ms": elapsed_ms,
-                "model_role": worker.budgets.get("model_role", "solver"),
+                "model_role": model_role,
                 "requested_model": model,
-                "model_context_window": self.settings.codex_model_context_window,
-                "auto_compact_token_limit": self.settings.codex_auto_compact_token_limit,
+                "model_context_window": model_context_window,
+                "auto_compact_token_limit": auto_compact_token_limit,
                 "hard_timeout_seconds": worker.budgets.get("hard_timeout_seconds"),
                 "soft_timeout_seconds": worker.budgets.get("soft_timeout_seconds"),
                 "finalize_grace_seconds": worker.budgets.get("finalize_grace_seconds"),
                 "finalization_reason": completed.finalization_reason,
                 "model_metadata_source": "explicit" if self.settings.codex_require_explicit_model_metadata else "configured_default",
-                "model_metadata_warning": "model metadata not found" in f"{completed.stdout}\n{completed.stderr}".lower(),
+                "model_metadata_warning": self._has_model_metadata_warning(f"{completed.stdout}\n{completed.stderr}"),
                 "output": output_diagnostic,
                 "mcp": mcp_import,
                 "resume_manifest_artifact_id": resume_manifest.id if resume_manifest else None,
@@ -568,12 +559,19 @@ class CodexHarnessRuntime:
             base = Path(directory)
             for name in names:
                 path = base / name
+                try:
+                    relative = path.relative_to(source_home)
+                except ValueError:
+                    relative = Path(name)
+                if not CodexHarnessRuntime._is_resumable_codex_state(relative):
+                    ignored.add(name)
+                    continue
                 readable = os.access(path, os.R_OK)
                 traversable = not path.is_dir() or os.access(path, os.X_OK)
                 if not readable or not traversable:
                     ignored.add(name)
                     try:
-                        skipped.append(str(path.relative_to(source_home)))
+                        skipped.append(str(relative))
                     except ValueError:
                         skipped.append(name)
             return ignored
@@ -616,6 +614,7 @@ class CodexHarnessRuntime:
             except (TypeError, ValueError):
                 exit_code = None
             cwd = str(item.get("cwd") or event.get("cwd") or "")[:300]
+            raw_output = str(item.get("aggregated_output") or item.get("output") or event.get("output") or "")
             trace = ToolTrace(
                 project_id=worker.project_id,
                 worker_id=worker.id,
@@ -626,7 +625,7 @@ class CodexHarnessRuntime:
                 command=command,
                 cwd=cwd or None,
                 exit_code=exit_code,
-                summary=str(item.get("aggregated_output") or item.get("output") or event.get("output") or "")[-1000:] or None,
+                summary=raw_output[-1000:] or None,
             )
             session.add(trace)
             session.flush()
@@ -653,17 +652,24 @@ class CodexHarnessRuntime:
             )
             max_actions = int((worker.budgets or {}).get("max_agent_actions", 0) or 0)
             if max_actions and len(action_count) >= max_actions:
-                session.add(
-                    WorkerEvent(
-                        project_id=worker.project_id,
-                        worker_id=worker.id,
-                        intent_id=worker.intent_id,
-                        attempt_id=attempt.id,
-                        event_type="attempt.action_budget_exhausted",
-                        payload_json={"max_agent_actions": max_actions, "observed": len(action_count)},
+                already_exhausted = session.exec(
+                    select(WorkerEvent).where(
+                        WorkerEvent.attempt_id == attempt.id,
+                        WorkerEvent.event_type == "attempt.action_budget_exhausted",
                     )
-                )
-                finalization_reason = "action_budget_exhausted"
+                ).first()
+                if already_exhausted is None:
+                    session.add(
+                        WorkerEvent(
+                            project_id=worker.project_id,
+                            worker_id=worker.id,
+                            intent_id=worker.intent_id,
+                            attempt_id=attempt.id,
+                            event_type="attempt.action_budget_exhausted",
+                            payload_json={"max_agent_actions": max_actions, "observed": len(action_count)},
+                        )
+                    )
+                finalization_reason = finalization_reason or "action_budget_exhausted"
             if exit_code not in (None, 0):
                 fingerprint = route_fingerprint(trace.request_json)
                 failed_repeats = sum(
@@ -687,7 +693,7 @@ class CodexHarnessRuntime:
                     select(WorkerEvent)
                     .where(
                         WorkerEvent.attempt_id == attempt.id,
-                        WorkerEvent.event_type.in_(["checkpoint.saved", "blackboard.fact_appended"]),
+                        WorkerEvent.event_type.in_(["checkpoint.saved", "blackboard.fact_appended", "artifact.read", "hypothesis.eliminated"]),
                     )
                     .order_by(WorkerEvent.created_at.desc())
                 ).first()
@@ -860,6 +866,7 @@ class CodexHarnessRuntime:
         )
         calls = 0
         invalid_lines = 0
+        servers_used: set[str] = set()
         for line in raw.splitlines():
             if not line.strip():
                 continue
@@ -871,6 +878,7 @@ class CodexHarnessRuntime:
             if not isinstance(event, dict) or not event.get("server") or not event.get("tool"):
                 invalid_lines += 1
                 continue
+            servers_used.add(str(event["server"]))
             success = bool(event.get("success"))
             request = event.get("request") if isinstance(event.get("request"), dict) else {}
             request = {**request, "duration_ms": event.get("duration_ms")}
@@ -887,8 +895,18 @@ class CodexHarnessRuntime:
             )
             session.add(trace)
             calls += 1
+        if servers_used:
+            session.add(
+                WorkerEvent(
+                    project_id=snapshot.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    event_type="mcp.server.observed",
+                    payload_json={"servers": sorted(servers_used), "calls": calls},
+                )
+            )
         session.commit()
-        return {"calls": calls, "invalid_lines": invalid_lines, "artifact_id": artifact.id}
+        return {"calls": calls, "invalid_lines": invalid_lines, "artifact_id": artifact.id, "servers_used": sorted(servers_used)}
 
     @staticmethod
     def _materialize_project_inputs(session: Session, snapshot: ContextSnapshot, workspace: Path) -> None:
@@ -1025,9 +1043,18 @@ class CodexHarnessRuntime:
         complete = True
         for root, directories, filenames in os.walk(home, onerror=walk_errors.append):
             directories.sort()
+            root_path = Path(root)
+            directories[:] = [
+                name
+                for name in directories
+                if self._is_resumable_codex_state((root_path / name).relative_to(home))
+            ]
             filenames.sort()
             for filename in filenames:
                 path = Path(root) / filename
+                relative = path.relative_to(home)
+                if not self._is_resumable_codex_state(relative):
+                    continue
                 if len(entries) >= self.settings.resume_max_files:
                     complete = False
                     break
@@ -1036,7 +1063,7 @@ class CodexHarnessRuntime:
                         complete = False
                         continue
                     entries.append({
-                        "path": str(path.relative_to(home)),
+                        "path": str(relative),
                         "sha256": self._sha256_file(path),
                         "size": path.stat().st_size,
                     })
@@ -1049,6 +1076,16 @@ class CodexHarnessRuntime:
         return entries, complete and bool(entries)
 
     @staticmethod
+    def _is_resumable_codex_state(relative: Path) -> bool:
+        """Exclude immutable bundled assets and volatile locks from resume state."""
+        return bool(relative.parts) and relative.parts[0] not in {"skills", ".tmp", "thread-writer-locks"}
+
+    @staticmethod
+    def _has_model_metadata_warning(text: str) -> bool:
+        lowered = text.lower()
+        return bool(re.search(r"model metadata(?:\s+for\s+[^\n]+?)?\s+not found", lowered))
+
+    @staticmethod
     def _sha256_file(path: Path) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as handle:
@@ -1058,18 +1095,33 @@ class CodexHarnessRuntime:
 
     def _json_schema(self) -> dict[str, Any]:
         array = {"type": "array", "items": {"type": "object"}}
-        return {
+        schema = {
             "type": "object",
-            "additionalProperties": True,
-            "required": ["status", "summary", "decision_summary"],
+            "additionalProperties": False,
             "properties": {
                 "status": {"type": "string", "enum": ["success", "partial", "failed"]},
                 "summary": {"type": "string"},
                 "fact_candidates": array,
-                "hypotheses": {"type": "array"},
+                "hypotheses": {"type": "array", "items": {}},
                 "artifact_refs": {"type": "array", "items": {"type": "string"}},
                 "failed_attempts": array,
-                "suggested_intents": array,
+                "suggested_intents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["objective", "expected_observation", "capabilities", "priority", "risk_level"],
+                        "properties": {
+                            "objective": {"type": "string"},
+                            "expected_observation": {"type": "string"},
+                            "capabilities": {"type": "array", "items": {"type": "string"}},
+                            "priority": {"type": "number"},
+                            "risk_level": {"type": "string"},
+                            "tool_request": {"type": "object", "additionalProperties": True},
+                            "budget": {"type": "object", "additionalProperties": True},
+                        },
+                    },
+                },
                 "fork_recommendations": array,
                 "subagent_reports": array,
                 "candidate_flags": {
@@ -1082,7 +1134,7 @@ class CodexHarnessRuntime:
                             "artifact_ref": {"type": "string"},
                             "provenance_kind": {"type": "string", "enum": ["observed", "derived_replay"]},
                         },
-                        "additionalProperties": True,
+                        "additionalProperties": False,
                     },
                 },
                 "decision_summary": {
@@ -1093,11 +1145,26 @@ class CodexHarnessRuntime:
                         "reason_summary": {"type": "string"},
                         "next_tool_plan": {"type": "array"},
                     },
-                    "additionalProperties": True,
+                    "additionalProperties": False,
                 },
-                "tool_requests": array,
+                "blockers": array,
+                "tool_requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["tool_name", "request"],
+                        "properties": {
+                            "tool_name": {"type": "string"},
+                            "request": {"type": "object", "additionalProperties": True},
+                            "activity_label": {"type": "string"},
+                        },
+                    },
+                },
             },
         }
+        schema["required"] = list(schema["properties"])
+        return schema
 
     def _render_command(self, prompt_file: Path, *, model: str | None = None) -> str:
         model = model or self.settings.llm_model
@@ -1194,15 +1261,26 @@ class CodexHarnessRuntime:
         failure_kind: str | None,
         artifact_id: str,
         snapshot: ContextSnapshot,
+        session: Session | None = None,
+        worker: Worker | None = None,
+        attempt: Attempt | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         diagnostic: dict[str, Any] = {"source": None, "output_file": str(output_file), "output_file_exists": output_file.exists()}
         if output_file.exists():
             try:
                 raw = output_file.read_text(encoding="utf-8")
                 diagnostic.update({"source": "last_message_file", "bytes": len(raw.encode("utf-8"))})
-                parsed = json.loads(raw)
+                try:
+                    parsed = json.loads(raw)
+                    diagnostic["tolerant_json"] = False
+                except json.JSONDecodeError:
+                    # Some providers ignore the plain-JSON requirement and
+                    # wrap a valid result in a Markdown fence. Recover the
+                    # complete object before declaring the solve lost.
+                    parsed = self._parse_json(raw)
+                    diagnostic["tolerant_json"] = True
                 self._validate_output(parsed)
-                return self._normalize(parsed, snapshot, artifact_id), diagnostic
+                return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
             except json.JSONDecodeError as exc:
                 diagnostic.update({"source": "last_message_file", "error": f"invalid JSON at line {exc.lineno}, column {exc.colno}"})
                 failure_kind = "output_invalid_json"
@@ -1215,7 +1293,7 @@ class CodexHarnessRuntime:
             parsed = self._parse_json(stdout)
             self._validate_output(parsed)
             diagnostic.update({"source": "stdout_fallback", "stdout_bytes": len(stdout.encode("utf-8", errors="replace"))})
-            return self._normalize(parsed, snapshot, artifact_id), diagnostic
+            return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
         except (json.JSONDecodeError, ValueError) as exc:
             diagnostic.setdefault("error", str(exc)[:300])
         # Some Codex/provider combinations emit the final assistant message to
@@ -1226,7 +1304,7 @@ class CodexHarnessRuntime:
             parsed = self._parse_json(stderr)
             self._validate_output(parsed)
             diagnostic.update({"source": "stderr_fallback", "stderr_bytes": len(stderr.encode("utf-8", errors="replace"))})
-            return self._normalize(parsed, snapshot, artifact_id), diagnostic
+            return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
         except (json.JSONDecodeError, ValueError) as exc:
             diagnostic.setdefault("stderr_error", str(exc)[:300])
         failure_kind = failure_kind or self._provider_failure_kind(stderr)
@@ -1247,13 +1325,49 @@ class CodexHarnessRuntime:
     def _validate_output(self, parsed: Any) -> None:
         if not isinstance(parsed, dict):
             raise ValueError("final output must be a JSON object")
-        missing = {"status", "summary", "decision_summary"} - set(parsed)
+        allowed = set(self._json_schema()["properties"])
+        unknown = set(parsed) - allowed
+        if unknown:
+            raise ValueError(f"final output has unknown fields: {', '.join(sorted(unknown))}")
+        # Upgrade pre-strict-contract final messages so an interrupted thread
+        # can still be resumed after deployment. New Codex invocations receive
+        # the strict output schema and therefore produce these fields directly.
+        for key in allowed - {"status", "summary", "decision_summary"}:
+            parsed.setdefault(key, [])
+        if parsed.get("status") == "partial" and not parsed["suggested_intents"] and not parsed["blockers"]:
+            parsed["blockers"] = [{
+                "kind": "legacy_partial",
+                "reason": "Recovered a partial result written before the strict continuation contract.",
+                "next_step": "Resume from the latest evidence and run one discriminating experiment.",
+            }]
+        missing = allowed - set(parsed)
         if missing:
             raise ValueError(f"final output missing required fields: {', '.join(sorted(missing))}")
         if parsed["status"] not in {"success", "partial", "failed"}:
             raise ValueError("final output has an invalid status")
         if not isinstance(parsed["summary"], str) or not isinstance(parsed["decision_summary"], dict):
             raise ValueError("final output has invalid summary or decision_summary")
+        for key in allowed - {"status", "summary", "decision_summary"}:
+            if not isinstance(parsed[key], list):
+                raise ValueError(f"final output field {key} must be an array")
+        decision = parsed["decision_summary"]
+        if set(decision) != {"selected_intent", "reason_summary", "next_tool_plan"}:
+            raise ValueError("decision_summary must contain only selected_intent, reason_summary, and next_tool_plan")
+        if not isinstance(decision["selected_intent"], str) or not isinstance(decision["reason_summary"], str) or not isinstance(decision["next_tool_plan"], list):
+            raise ValueError("decision_summary fields have invalid types")
+        if parsed["status"] == "partial":
+            has_follow_up = any(
+                isinstance(item, dict)
+                and str(item.get("objective") or "").strip()
+                and str(item.get("expected_observation") or "").strip()
+                for item in parsed["suggested_intents"]
+            )
+            has_blocker = any(
+                isinstance(item, dict) and str(item.get("next_step") or "").strip()
+                for item in parsed["blockers"]
+            )
+            if not has_follow_up and not has_blocker:
+                raise ValueError("partial output requires one follow-up intent with expected_observation or a blocker next_step")
 
     def _failure_output(self, failure_kind: str, stderr: str, artifact_id: str, snapshot: ContextSnapshot) -> dict[str, Any]:
         intent = snapshot.sections_json.get("current_intent", {})
@@ -1336,7 +1450,16 @@ class CodexHarnessRuntime:
             return None
         return label
 
-    def _normalize(self, structured: dict[str, Any], snapshot: ContextSnapshot, artifact_id: str) -> dict[str, Any]:
+    def _normalize(
+        self,
+        structured: dict[str, Any],
+        snapshot: ContextSnapshot,
+        artifact_id: str,
+        *,
+        session: Session | None = None,
+        worker: Worker | None = None,
+        attempt: Attempt | None = None,
+    ) -> dict[str, Any]:
         structured.setdefault("status", "partial")
         structured.setdefault("summary", "Codex harness returned structured output.")
         for key in [
@@ -1359,11 +1482,14 @@ class CodexHarnessRuntime:
             if isinstance(tool, dict) and isinstance(tool.get("name"), str)
         }
         normalized_requests = []
+        dropped_tool_names: list[str] = []
         ordered_tool_requests = [tool_request for tool_request in structured["tool_requests"] if isinstance(tool_request, dict)]
-        ordered_tool_requests.sort(key=lambda request: request.get("tool_name") != "flag.verify")
+        ordered_tool_requests.sort(key=lambda request: {"flag.verify": 0, "flag.submit": 1}.get(request.get("tool_name"), 2))
         for tool_request in ordered_tool_requests[:3]:
             tool_name = tool_request.get("tool_name")
             if not isinstance(tool_name, str) or tool_name not in visible_tool_names:
+                if isinstance(tool_name, str) and tool_name.strip():
+                    dropped_tool_names.append(tool_name)
                 continue
             payload = tool_request.get("request")
             if not isinstance(payload, dict):
@@ -1379,7 +1505,24 @@ class CodexHarnessRuntime:
                 normalized["activity_label"] = tool_request["activity_label"]
             normalized_requests.append(normalized)
         structured["tool_requests"] = normalized_requests
+        if dropped_tool_names and session is not None:
+            self._record_skipped_tool_requests(
+                session,
+                worker=worker,
+                attempt=attempt,
+                snapshot=snapshot,
+                dropped_tool_names=dropped_tool_names,
+            )
         structured["blockers"] = OpenAICompatibleRuntime._normalize_blockers(structured.get("blockers"))
+        if structured.get("status") == "success" and not (
+            structured.get("fact_candidates") or structured.get("candidate_flags") or structured.get("artifact_refs")
+        ):
+            structured["status"] = "partial"
+            structured["blockers"].append({
+                "kind": "missing_evidence",
+                "reason": "success was downgraded because no evidence-backed result was returned",
+                "next_step": "Run one discriminating experiment and save its evidence before claiming success",
+            })
         if structured.get("status") == "partial" and not structured.get("suggested_intents") and not structured["blockers"]:
             structured["blockers"] = [{"kind": "missing_evidence", "reason": "本轮没有形成可执行的续跑路线", "next_step": "查询最新 checkpoint 并提出唯一下一步"}]
         structured.setdefault(
@@ -1393,6 +1536,30 @@ class CodexHarnessRuntime:
         if artifact_id not in structured["artifact_refs"]:
             structured["artifact_refs"].append(artifact_id)
         return structured
+
+    @staticmethod
+    def _record_skipped_tool_requests(
+        session: Session,
+        *,
+        worker: Worker | None,
+        attempt: Attempt | None,
+        snapshot: ContextSnapshot,
+        dropped_tool_names: list[str],
+    ) -> None:
+        session.add(
+            WorkerEvent(
+                project_id=snapshot.project_id,
+                worker_id=worker.id if worker else None,
+                intent_id=worker.intent_id if worker else snapshot.intent_id,
+                attempt_id=attempt.id if attempt else None,
+                event_type="tool.skipped.non_privileged",
+                payload_json={
+                    "tool_names": sorted(set(dropped_tool_names)),
+                    "reason": "tool_requests were dropped because they fall outside the runtime's visible tool contract",
+                },
+            )
+        )
+        session.commit()
 
 
 def get_worker_runtime() -> WorkerRuntime:

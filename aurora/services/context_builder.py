@@ -7,8 +7,9 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, Intent, Project, ProjectRuntimePolicy, Worker, WorkerEvent
+from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, FlagCandidate, Intent, Project, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
 from aurora.services.mcp_registry import visible_mcp_tools
+from aurora.services.tool_contract import tools_for_runtime
 from aurora.services.tool_profiles import tool_environment
 
 
@@ -30,7 +31,13 @@ OUTPUT_SCHEMA: dict[str, Any] = {
     "hypotheses": [],
     "artifact_refs": [],
     "failed_attempts": [],
-    "suggested_intents": [],
+    "suggested_intents": [{
+        "objective": "one evidence-backed experiment",
+        "expected_observation": "the result that distinguishes the active hypothesis",
+        "capabilities": [],
+        "priority": 1.0,
+        "risk_level": "low",
+    }],
     "fork_recommendations": [],
     "subagent_reports": [],
     "candidate_flags": [{
@@ -44,6 +51,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "reason_summary": "observable non-chain-of-thought rationale",
         "next_tool_plan": [],
     },
+    "tool_requests": [{"tool_name": "visible capability name", "request": {}, "activity_label": "short safe label"}],
 }
 
 
@@ -76,13 +84,15 @@ class ContextBuilder:
             and policy.subagents_enabled
             and (worker is None or worker.execution_kind == "primary")
         )
-        facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").limit(25)).all()
+        facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at.desc()).limit(25)).all()
         artifacts = session.exec(select(Artifact).where(Artifact.project_id == project_id).order_by(Artifact.created_at.desc()).limit(10)).all()
         checkpoints = session.exec(
             select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at.desc()).limit(3)
         ).all()
         group_item = session.exec(
-            select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project_id, ChallengeGroupItem.fused_status == "RUNNING")
+            select(ChallengeGroupItem)
+            .where(ChallengeGroupItem.project_id == project_id, ChallengeGroupItem.fused_status != "COMPLETED")
+            .order_by(ChallengeGroupItem.updated_at.desc())
         ).first()
         harvester_task = session.exec(
             select(WorkerEvent)
@@ -94,6 +104,27 @@ class ContextBuilder:
             .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "checkpoint.saved")
             .order_by(WorkerEvent.created_at.desc())
         ).first()
+        rejected_candidates = session.exec(
+            select(FlagCandidate)
+            .where(FlagCandidate.project_id == project_id, FlagCandidate.status == "REJECTED")
+            .order_by(FlagCandidate.updated_at.desc())
+            .limit(10)
+        ).all()
+        verified_candidates = session.exec(
+            select(FlagCandidate)
+            .where(FlagCandidate.project_id == project_id, FlagCandidate.status == "LOCAL_VERIFIED")
+            .order_by(FlagCandidate.updated_at.desc())
+            .limit(10)
+        ).all()
+        failed_verifications = session.exec(
+            select(ToolTrace)
+            .where(ToolTrace.project_id == project_id, ToolTrace.tool_name == "flag.verify", ToolTrace.exit_code != 0)
+            .order_by(ToolTrace.created_at.desc())
+            .limit(5)
+        ).all()
+
+        visible_tools = visible_mcp_tools(settings, allow_subagents=allow_subagents, contract=tools_for_runtime(settings))
+        visible_tool_names = {tool["name"] for tool in visible_tools}
 
         sections: dict[str, Any] = {
             "project_goal": project.goal,
@@ -105,18 +136,32 @@ class ContextBuilder:
             },
             "tool_environment": tool_environment(settings, project.challenge_type),
             "competition_context": {
+                "platform": str((group_item.competition_meta or {}).get("platform") or ""),
                 "phase": group_item.phase,
                 "attachments": list((group_item.competition_meta or {}).get("attachments", [])),
+                "notices": list((group_item.competition_meta or {}).get("notices", [])),
                 "target": project.target_url,
                 "targets": list((group_item.competition_meta or {}).get("container_addr", [])) if isinstance((group_item.competition_meta or {}).get("container_addr"), list) else ([project.target_url] if project.target_url else []),
                 "hint": group_item.hint_content,
                 "previous_attempts": list(group_item.failure_history),
             } if group_item else None,
+            "flag_submission": {
+                "eligible_candidates": [
+                    {
+                        "candidate_id": candidate.id,
+                        "value": candidate.value,
+                        "provenance_kind": candidate.provenance_kind,
+                        "submission_count": candidate.submission_count,
+                    }
+                    for candidate in verified_candidates
+                ],
+                "same_batch_candidate_id": "latest_verified",
+            },
             "harvester_task": harvester_task.payload_json if harvester_task else None,
             "current_intent": {
                 "id": intent.id,
                 "objective": intent.objective,
-                "capability_tags": intent.capability_tags,
+                "capability_tags": [tag for tag in intent.capability_tags if tag in visible_tool_names],
                 "risk_level": intent.risk_level,
                 "tool_request": intent.budget.get("tool_request") if intent.budget else None,
                 # Worker budgets contain the effective defaults applied by the
@@ -156,10 +201,17 @@ class ContextBuilder:
                 for checkpoint in checkpoints
             ],
             "live_checkpoint": live_checkpoint.payload_json if live_checkpoint else None,
+            "flag_validation_feedback": {
+                "rejected_values": [candidate.value for candidate in rejected_candidates],
+                "verification_errors": [
+                    {"summary": trace.summary, "artifact_refs": trace.artifact_refs}
+                    for trace in failed_verifications
+                ],
+            } if rejected_candidates or failed_verifications else None,
             "operating_mode": {
                 "tooling": "Kali native tools first; MCP only when Kali lacks the capability.",
                 "context_policy": "intent-first; raw tool output stays in Artifact Store unless explicitly read by id.",
-                "target_policy": "A target is optional. If none is active, continue with imported artifacts and local analysis; never invent a target URL. Network requests remain authorization-gated.",
+                "target_policy": "A target is optional. If none is active, continue with imported artifacts and local analysis; never invent a target URL. Network requests are routed through the tool gateway and are no longer pre-authorized.",
                 "hidden_chain_of_thought": "not captured; only observable decision summaries are stored.",
                 "subagents": {
                     "enabled": allow_subagents,
@@ -191,7 +243,7 @@ class ContextBuilder:
             worker_id=worker_id,
             sections_json=sections,
             section_metrics_json=section_metrics,
-            visible_tools_json=visible_mcp_tools(settings, allow_subagents=allow_subagents),
+            visible_tools_json=visible_tools,
             output_schema_json=OUTPUT_SCHEMA,
             total_chars=len(serialized),
             estimated_tokens=estimate_tokens(serialized),

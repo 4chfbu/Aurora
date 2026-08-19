@@ -1,6 +1,6 @@
 # Aurora 使用指南
 
-本文档面向第一次运行 Aurora 的开发者和题目分析人员。Aurora 是一个以 Fact-Intent 黑板为中心的安全/CTF 任务执行平台：用户创建项目并声明授权范围，Manager 生成可执行意图，Scheduler 分配 Worker，Worker 通过 Kali 工具或 Codex 收集证据，结果再写回事实、Artifact 和 Finding。
+本文档面向第一次运行 Aurora 的开发者和题目分析人员。Aurora 是一个以 Fact-Intent 黑板为中心的安全/CTF 任务执行平台：用户创建项目并记录目标，Manager 生成可执行意图，Scheduler 分配 Worker，Worker 通过 Kali 工具或 Codex 收集证据，结果再写回事实、Artifact 和 Finding。
 
 ## 1. 开始前
 
@@ -39,10 +39,21 @@ AURORA_CODEX_PROXY_BASE_URL=http://aurora-cc-switch:15723/v1
 
 使用 TSecBench 题目时，额外设置 `AURORA_TSECBENCH_BASE_URL` 和 `AURORA_TSECBENCH_TOKEN`。从 TSecBench 根地址或
 `/openapi/v1/challenges` 创建导入批次即可读取题目；确认题目后，Runner 会按平台生命周期启动容器、提交 Flag
-并关闭环境。`container_addr` 仅作为 TSecBench 授权靶机写入该项目的目标和授权范围。
+并关闭环境。`container_addr` 会写入项目目标，并同步到兼容用的 `AuthorizationScope` 记录。
 
 也可以在 Web 左侧打开 `TSecBench`，填写 Base URL 和 Benchmark Token，保存后点击“测试连接”。如果列表中存在
 状态为 `available` 的容器，界面会同时检测其 SSLVPN 地址是否可达。网页 Token 仅在当前 API 进程内有效；长期配置仍应写入 `.env`。
+
+使用 `api_doc.md` 这类 Slab Match Agent API 题目时，设置 `AURORA_SLAB_MATCH_BASE_URL` 和
+`AURORA_SLAB_MATCH_ACCESS_KEY`，或在 Web 左侧打开 `Slab Match` 配置。填写动态靶机上限 N 和 Agent 并发数后，
+点击“保存并直接导入”即可创建题目组，不需要再进入“解放双手”。Runner 会按需启动环境、轮询 `endpoints`、
+提交 flag，并在每个 Solver turn 后立即回收环境；无靶机附件题会优先分析且不占用 N。活动题组还会轮询平台公告，
+新公告及其附件会进入项目 Blackboard，题目修正无需等待下一次导入。
+
+Slab Match 提交时会读取赛事 `match_info.rule`：只有规则明确要求“仅提交花括号内内容”时，才把
+`DASCTF{value}`/`flag{value}` 规范化为 `value`，其他情况提交完整 flag。控制面 API 的重定向必须保持同源，
+避免 `X-Agent-AccessKey` 泄漏；附件 URL 及每次重定向都必须是无凭据、无 fragment 的绝对 HTTP(S) URL，
+并拒绝 localhost、metadata 主机和字面量私网/回环/link-local/reserved IP。跨域附件不会携带 AccessKey。
 
 如不希望 SSLVPN 修改宿主机网络，可在 Web 左侧打开独立的 `OpenVPN` 设置：上传包含内联证书的 `.ovpn`，
 设置至少 10 字符的加密主密码，逐行填写需要转发的 IPv4/CIDR，并按“保存配置 → 连接”操作。
@@ -140,16 +151,16 @@ AURORA_DEV_API_URL=http://localhost:8000 npm run dev
 
 1. 在左侧项目区域填写目标并点击“新建项目”。
 2. 从项目下拉框选择项目；执行图会显示 Intent、Worker、Attempt、Artifact 和 Finding 的关系。
-3. 使用“运行规划器”消费线索并创建 Intent，使用“运行观察器”检查策略拒绝、重复调用或缺少证据等异常。
+3. 使用“运行规划器”消费线索并创建 Intent，使用“运行观察器”检查工具拒绝、重复调用或缺少证据等异常。
 4. 点击“开始自动解题”运行后台循环；需要立即终止时点击“停止自动解题”。
-5. 在“控制台”中可以更新题目站 Cookie、手动加入 Intent，或直接执行一个受策略检查的工具请求。
+5. 在“控制台”中可以更新题目站 Cookie、手动加入 Intent，或直接执行并审计一个工具请求。
 6. 在“证据/结论”面板逐条填写支撑观察，为每条观察关联原始 Artifact，再形成可追溯结论。
 
 界面中的“刷新”只重新读取数据库；实时动作通过项目事件流自动更新。项目进入 `FLAG_READY`、`AWAITING_MANUAL_VALIDATION`、`COMPLETED`、`FAILED` 或 `CANCELLED` 后，新增 Intent、Hint 和证据事实等黑板写入会被锁定。
 
 ## 4. API 基本流程
 
-以下示例假设 API 在 `http://localhost:8000`。先创建项目，并明确允许访问的主机：
+以下示例假设 API 在 `http://localhost:8000`。先创建项目，并记录预期访问的主机：
 
 ```bash
 curl -sS -X POST http://localhost:8000/api/projects \
@@ -198,7 +209,16 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/intents \
   }'
 ```
 
-`POST /scheduler/run-next` 每次只领取并运行一个 Intent。模型和工具产生的原始输出会存为 Artifact，但只有题目附件、可信目标响应或成功的 `flag.verify` 双重重放结果可以证明候选 flag。候选通过本地校验后形成 Finding 并进入 `FLAG_READY`；比赛平台或人工接受后才完成项目并取消剩余 Intent。模型文本、transcript、黑板摘要和普通 `sandbox.exec` 回显不能证明 flag。
+`POST /scheduler/run-next` 每次只领取并运行一个 Intent。模型和工具产生的原始输出会存为 Artifact，但只有题目附件、可信目标响应或成功的 `flag.verify` 双重重放结果可以证明候选 flag。模型文本、transcript、黑板摘要和普通 `sandbox.exec` 回显不能证明 flag。
+
+对解码、逆向或计算得到的 flag，Solver 应请求 `flag.verify`：
+
+- `source_artifact_refs` 必须引用当前项目的原始题目证据；
+- `verification_script` 优先填写 Worker 工作区中的 Python 文件路径。服务端把声明的 Artifact 打包到隔离目录，并将 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 路径；
+- 脚本必须只输出一个由输入计算出的 flag，不能硬编码候选值。系统在无网络隔离环境中重放两次，两个结果一致才形成 `LOCAL_VERIFIED` 候选；
+- `timeout_seconds` 有效范围为 1–60 秒。内联 Python 源码仅作为兼容形式保留。
+
+候选通过本地校验后形成 Finding 并进入 `FLAG_READY`。比赛题可用 `flag.submit` 自主提交：提交已有候选时传真实 `candidate_id`；同一批工具请求先验证、后提交时传 `candidate_id: "latest_verified"`。服务端拒绝原始 flag 字段、跨项目/跨 Attempt 回退和同一候选重复提交。平台拒绝的值与原因会进入下一轮上下文；平台不可用时进入 `AWAITING_MANUAL_VALIDATION`。平台接受后才完成项目并取消剩余 Intent；多 Flag 题只接受部分答案时保持运行，继续寻找其余答案。没有比赛适配器时，仍通过人工 validation API 接受或拒绝候选。
 
 每个主 Solver 轮次进入 `SUCCESS`、`PARTIAL`、`FAILED` 或 `TIMEOUT` 后，系统都会在 blackboard 中写入一条轮次反思（API 中沿用 `checkpoints` 字段）。反思会整理本轮总结、证据结论、假设、失败路线和下一步，并审核 Solver 的候选建议后创建最多 3 个后续 Intent。Solver 输出的 `suggested_intents` 本身不会绕过反思直接进入调度队列；反思模型不可用时，系统使用确定性 fallback 规则校验这些建议。项目已经完成时仍保留最终反思，但不会再创建 Intent。Subagent 报告由主轮汇总，不单独触发反思。
 
@@ -241,26 +261,32 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/autorun/stop
 - `max_iterations` 或 `max_minutes`：达到用户设置的上限；
 - `no_runnable_work`：没有可领取的 Intent；
 - `no_progress`：连续多轮没有新增事实、Artifact 或 Finding；
-- `observer_escalate`：策略拒绝或其他异常需要人工复核；
+- `observer_escalate`：工具拒绝或其他异常需要人工复核；
 - `runtime_error`：Worker Runtime 启动或执行失败。
 
-Observer 是确定性的，不调用 LLM。它会在最近工具请求被策略拒绝、连续重复调用或失败尝试没有证据时提出 `ESCALATE`/`REDIRECT`/`REQUEST_EVIDENCE`。
+Observer 是确定性的，不调用 LLM。它会在最近工具请求被工具专用检查（或未来/自定义策略）拒绝、连续重复调用或失败尝试没有证据时提出 `ESCALATE`/`REDIRECT`/`REQUEST_EVIDENCE`。
 
-## 6. 手工工具与授权范围
+## 6. 手工工具与当前授权边界
 
-所有语义工具先经过项目 `AuthorizationScope` 检查。当前公开的创建项目接口只接收 `allowed_hosts`；请在创建项目时列出每个获授权的主机或域名，再执行工具。底层策略也支持 `allowed_domains`，但尚无独立的公开编辑接口。元数据和管理网络（例如 `169.254.169.254`）默认禁止。
+当前版本没有执行项目级目标授权：`PolicyEngine` 对网关请求统一返回 `allow`。创建项目时填写的 `allowed_hosts`，以及数据库中的 `allowed_domains`、元数据地址拒绝项，目前只用于上下文、平台生命周期和兼容记录，不会阻止 `http.request`、`network.scan`、`web.enumerate`、FOFA 或 Worker 原生 shell 访问范围外目标。
+
+因此，项目配置不是安全边界。只应对已获授权的目标运行 Aurora，并在部署侧通过容器网络、出站防火墙、VPN 路由或代理白名单强制限制出口；纯附件题可把 `AURORA_CONTAINER_NETWORK` 设为 `none`。附件下载、浏览器、OpenVPN 配置及部分导入路径仍有各自的 SSRF/危险输入检查，但不能替代统一的出口控制。
+
+原生 Codex 运行时的 `tool_requests` 只暴露需要服务端隔离重放、平台凭据、浏览器会话或统一审计的能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`、`http.request`、`network.scan`、`web.enumerate`，外加 `blackboard.query` 退化回退。这里的“服务端门禁”指执行与凭据边界，不表示当前会校验目标授权。`sandbox.exec`、`binary.inspect`、`forensic.inspect` 不再出现在该契约中，本地分析由 Worker 容器内的 Codex shell/MCP 直接完成；这些行仍适用于 `openai_direct` 运行时和手动工具 API。
 
 | 工具 | 常用请求字段 | 说明 |
 | --- | --- | --- |
 | `http.request` | `url`, `method` | MVP 仅允许 GET、HEAD、OPTIONS。 |
 | `network.scan` | `target`, `ports` | 使用 Kali `nmap`，默认端口为 `80,443,8080`。 |
 | `web.enumerate` | `url`, `wordlist`, `extensions` | 优先 `ffuf`，没有时回退 `dirb`。 |
-| `binary.inspect` | `path` | 使用 `file`、`sha256sum`、`strings`。 |
-| `forensic.inspect` | `path` | 使用 `file`、`exiftool`、`binwalk`。 |
+| `binary.inspect` | `path` | 使用 `file`、`sha256sum`、`strings`（仅 `openai_direct`/手动 API；原生 Codex 走容器内 shell）。 |
+| `forensic.inspect` | `path` | 使用 `file`、`exiftool`、`binwalk`（仅 `openai_direct`/手动 API；原生 Codex 走容器内 shell）。 |
 | `browser.interact` | `url`, `locator`, `wait_seconds` | 必须先为项目设置题目站 Cookie。 |
-| `sandbox.exec` | `command`, `cwd`, `timeout_seconds` | 受命令拒绝规则和工作区路径限制。 |
-| `blackboard.query` | `limit` | 只读查询当前项目事实，并生成 Artifact。 |
-| `fofa.search` | `query`, `size` | 需配置 FOFA 凭据，查询必须是单个 host/domain/ip 等式。 |
+| `sandbox.exec` | `command`, `cwd`, `timeout_seconds` | 受命令拒绝规则和工作区路径限制（仅 `openai_direct`/手动 API；原生 Codex 在 Worker 容器内执行 shell）。 |
+| `blackboard.query` | `limit` | 只读查询当前项目事实，并生成 Artifact；仅在 `aurora_blackboard` MCP 不可用时作为原生 Codex 的回退。 |
+| `flag.verify` | `source_artifact_refs`, `verification_script`, `timeout_seconds` | 对派生候选做两次隔离重放；超时限制为 1–60 秒。 |
+| `flag.submit` | `candidate_id` | 只提交当前项目已本地验证的候选；不接受原始 flag。 |
+| `fofa.search` | `query`, `size` | 需配置 FOFA 凭据；当前实现不会按项目目标限制查询内容。 |
 
 直接执行工具的 API 形式：
 
@@ -270,7 +296,7 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/tools/http.reque
   -d '{"request":{"url":"http://127.0.0.1/","timeout_seconds":3}}'
 ```
 
-响应中的 `artifact_refs` 指向原始证据，`trace_id` 可用于追踪策略决定和后端执行结果。`sandbox.exec` 的 `cwd` 必须位于项目工作区根目录下，危险命令会被拒绝；不要把它当作不受限制的宿主机 Shell。
+响应中的 `artifact_refs` 指向原始证据，`trace_id` 可用于追踪网关决定和后端执行结果。当前目标策略的 trace 决定固定为 `allow`。`sandbox.exec` 的 `cwd` 必须位于项目工作区根目录下，危险命令会被拒绝；不要把它当作不受限制的宿主机 Shell。原生 Codex 模式下的本地命令由 Worker 容器内的 Codex 执行，同样受到该容器与 `/workspace` 挂载边界的限制。
 
 ### 浏览器会话
 
@@ -282,7 +308,7 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/browser/session 
   -d '{"source_url":"https://ctf.example/challenge/1","cookie":"session=..."}'
 ```
 
-浏览器交互只允许停留在已认证题目域名及其子域名。没有会话时，`browser.interact` 会返回 `browser session required`；从题目页发现的目标会写入 `DiscoveredTarget`，后续仍会经过项目策略检查。
+浏览器交互只允许停留在已认证题目域名及其子域名。没有会话时，`browser.interact` 会返回 `browser session required`；从题目页发现的目标会写入 `DiscoveredTarget` 并进入上下文，但后续网络工具和原生 shell 不会按该记录强制限域。
 
 ## 7. “解放双手”批量导入
 
@@ -295,7 +321,7 @@ Web 界面的“解放双手”用于从赛事、题库或题目列表 URL 归�
 5. 点击“批量创建项目”。系统会创建项目组并把项目加入题目组；靶机不是启动解题的前置条件。
 6. 在题目组面板点击“开始组解题”或“停止”。
 
-导入项目会先使用题目描述、已暂存附件和现有 Artifact 开始本地分析。没有靶机、自动识别缺少登录会话或平台环境暂不可用时，系统只记录告警并继续解题；需要网络交互时，可在项目的“靶机（可选）”面板自动识别或人工指定地址。具体网络请求仍必须通过项目授权策略。
+导入项目会先使用题目描述、已暂存附件和现有 Artifact 开始本地分析。没有靶机、自动识别缺少登录会话或平台环境暂不可用时，系统只记录告警并继续解题；需要网络交互时，可在项目的“靶机（可选）”面板自动识别或人工指定地址。该目标记录会进入 Solver 上下文，但当前不会形成强制网络白名单，出口范围必须由部署环境控制。
 
 对应 API：
 
@@ -357,7 +383,7 @@ AURORA_FOFA_EMAIL=you@example.com
 AURORA_FOFA_KEY=your-fofa-key
 ```
 
-查询仍必须严格匹配一个 `host="..."`、`domain="..."` 或 `ip="..."` 表达式，并且目标在项目授权范围内。
+当前网关会把 `query` 原样提交给 FOFA（`size` 钳制为 1–100），不会校验是否为单一 host/domain/ip 等式，也不会与项目目标比对。凭据只控制能力是否出现，不构成查询授权；请在组织侧限制账号权限，并审查 ToolTrace。
 
 ### 同容器 Subagents
 
@@ -366,12 +392,32 @@ AURORA_FOFA_KEY=your-fofa-key
 ```dotenv
 AURORA_SUBAGENTS_ENABLED=true
 AURORA_SUBAGENTS_MAX_CONCURRENT=2
-AURORA_SUBAGENTS_MAX_PER_WORKER=4
+AURORA_SUBAGENTS_MAX_PER_WORKER=2
 ```
 
 子 Agent 与父 Worker 共享容器和 `/workspace`，不会递归创建子 Agent；每个子 Agent 的结果和 transcript 都会写入独立的 Worker、Attempt、Trace 和 Artifact 记录。
 
-## 10. 常见问题
+## 10. 冻结评测
+
+Evaluation 目前只支持 TSecBench。先调用 `POST /api/evaluations/suites` 冻结题目元数据，再通过
+`POST /api/evaluations/suites/{suite_id}/runs` 创建 `baseline` 或 `candidate` 运行。套件默认排除已有正确答案或已完成题目；
+创建运行时还会重新查询平台，发现任一题已有接受进度就拒绝启动。同一套件只允许一个活动运行。
+
+baseline 与 candidate 必须使用相互独立的干净平台会话：baseline 一旦答对题目，同一 Token/账号就已被污染，
+不能直接启动 candidate。请改用独立 Benchmark Token/账号，或先由平台重置整套题目的接受进度。冻结快照中只要含远程附件，
+当前版本也会拒绝运行，因为 Evaluation 尚未实现附件物化，不能保证两组输入一致。
+
+每题按 5/20/25 分钟三个阶段执行，Worker hard timeout 同步钳制到对应阶段，总上限 50 分钟。报告以平台确认完成为成功，
+并统计错误提交、重复请求、派生候选验证覆盖率和终态 checkpoint 覆盖率。比较结果只有同时满足以下条件才会 `promoted=true`：
+
+- baseline/candidate 来自同一冻结套件，且两边有效样本数至少 30；
+- 成功率至少提升 15 个百分点，错误提交率不变差；
+- baseline 有重复请求时至少减少 50%；baseline 为零时 candidate 也必须为零；
+- 派生候选验证覆盖率与终态 checkpoint 覆盖率均为 100%。
+
+少于 30 个有效样本仍会给出 95% Wilson 置信区间，但 `promotion_eligible=false`。
+
+## 11. 常见问题
 
 ### Provider 检查失败
 
@@ -388,7 +434,7 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=4
 
 ### 请求被拒绝
 
-查看项目的 ToolTrace 和 Observer 事件。常见原因是目标不在 `allowed_hosts`/`allowed_domains`、访问元数据网络，或 FOFA 查询格式不符合限制。不要通过关闭策略来绕过授权问题，应修正项目范围。
+查看项目的 ToolTrace 和 Observer 事件。当前项目级授权策略不会拒绝目标；拒绝通常来自工具参数校验、浏览器会话/同域限制、附件与导入路径的 SSRF 检查、缺少 FOFA/比赛平台凭据、`flag.verify` 证据不完整，或 `flag.submit` 候选状态不合法。先根据 trace 的 `summary` 修正请求。网络访问范围应在容器、防火墙、VPN 或代理层控制。
 
 ### 自动解题停在 `no_progress` 或 `observer_escalate`
 
@@ -402,7 +448,7 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=4
 
 查看导入窗口中的诊断信息。零候选表示系统没有找到足够证据证明某个对象是题目，而不是自动把导航和资源链接降级为候选。确认 URL 保留了需要的筛选参数；若页面需要登录或登录后才加载题目，请提供有效短期 Cookie 后重新识别。
 
-## 11. 本地验证
+## 12. 本地验证
 
 运行后端测试和前端构建：
 
@@ -414,7 +460,10 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=4
 
 ```bash
 uv run --extra dev pytest
-cd apps/web && npm run build
+cd apps/web
+node_modules/.bin/tsc --noEmit -p tsconfig.json
+npm run build
+npm audit --audit-level=moderate
 ```
 
-生产部署前，请在反向代理层添加认证、TLS 和访问控制。当前 API 开放全量 CORS，不能直接暴露到不受信任的公网。
+生产部署前，请在反向代理层添加认证、TLS 和访问控制。当前 API 开放全量 CORS、没有内置认证，而且目标授权策略已禁用，不能直接暴露到不受信任的公网。不要提交 `.env`、数据库、Artifact、Codex workspace 或运行历史；仓库已忽略 ffuf 的运行时配置目录。

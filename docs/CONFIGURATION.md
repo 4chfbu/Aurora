@@ -92,9 +92,15 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `AURORA_DB_URL` | `sqlite:///./aurora.db` | SQLModel/SQLAlchemy 数据库 URL。默认数据库位于当前工作目录。使用其他数据库时还需要对应驱动。 |
+| `AURORA_DB_JOURNAL_MODE` | `wal` | SQLite journal 模式。WAL 允许读写并发，避免多写入方（租约心跳、Worker 回调、题目组并发）触发 `database is locked`。 |
+| `AURORA_DB_BUSY_TIMEOUT_MS` | `5000` | SQLite busy 超时（毫秒）。写入冲突时排队等待而非立即报错。 |
+| `AURORA_API_HOST` | `0.0.0.0` | `start.sh`/应用入口使用的 API 监听地址；生产环境仍应由受保护的反向代理接入。 |
+| `AURORA_API_PORT` | `8000` | API 监听端口，必须为 1–65535。 |
 | `AURORA_ARTIFACT_DIR` | `./artifacts` | 原始工具输出、导入附件和 Codex transcript 的存储目录。API 启动时会自动创建。 |
 | `AURORA_API_LOCK_DIR` | 系统临时目录 | API 单实例锁目录；测试和多环境部署应分别配置。 |
 | `AURORA_WORKER_RUNTIME` | `codex` | `codex`/`codex_harness`/`harness` 使用 Codex Harness；`openai_direct`/`openai`/`llm`/`real` 使用直接兼容接口。其他值直接报错。 |
+| `AURORA_TOOL_CONTRACT` | `native_privileged` | Codex 运行时的 `tool_requests` 契约。`native_privileged` 只暴露需要服务端隔离、凭据、会话控制或统一审计的能力；`full_gateway` 恢复旧的全量语义工具面。该设置不启用目标授权。 |
+| `AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY` | `true` | 在 `aurora_blackboard` MCP 可用性稳定前保留 `blackboard.query` 作为 `tool_requests` 退化回退；设为 `false` 关闭。 |
 | `AURORA_WORKER_IMAGE` | `aurora-kali-codex:latest` | 包含 Codex CLI 的 Kali Worker 镜像名。只有本地已存在的镜像才会被容器执行器使用。 |
 | `AURORA_WORKER_IMAGE_CORE` | `AURORA_WORKER_IMAGE` 或 `aurora-kali-codex:core` | Web 题和手工语义工具使用的常用 CTF 工具镜像。 |
 | `AURORA_WORKER_IMAGE_HEAVY` | `aurora-kali-codex:heavy` | Pwn、Reverse、Crypto、Forensics、Misc 和未知题型使用的完整分析镜像。 |
@@ -149,13 +155,21 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_LLM_API_KEY` | 未设置；回退到 `OPENAI_API_KEY` | `openai_direct` 和 Codex Harness 的上游凭据。 |
 | `AURORA_LLM_BASE_URL` | `https://api.openai.com/v1`；回退到 `OPENAI_BASE_URL` | OpenAI 兼容服务地址。 |
 | `AURORA_LLM_MODEL` | `gpt-4.1-mini`；回退到 `OPENAI_MODEL` | 默认模型。 |
+| `AURORA_TRIAGE_MODEL` | 未设置 | 5 分钟分诊阶段模型；为空时使用 `AURORA_LLM_MODEL`。 |
 | `AURORA_PLANNER_MODEL` | 未设置 | Planner 角色模型；为空时使用 `AURORA_LLM_MODEL`。 |
 | `AURORA_SOLVER_MODEL` | 未设置 | Solver 角色模型；为空时使用 `AURORA_LLM_MODEL`。 |
+| `AURORA_REVIEWER_MODEL` | 未设置 | 收尾、证据审查和 flag 验证修复模型；为空时使用 `AURORA_LLM_MODEL`。 |
+| `AURORA_<ROLE>_MODEL_CONTEXT_WINDOW` | 未设置 | 可分别为 `TRIAGE`、`SOLVER`、`REVIEWER` 声明上下文窗口；必须与对应压缩阈值同时设置。 |
+| `AURORA_<ROLE>_AUTO_COMPACT_TOKEN_LIMIT` | 未设置 | 对应角色的自动压缩阈值；为空时使用全局 Codex 元数据。 |
 | `AURORA_LLM_TIMEOUT_SECONDS` | `120` | `openai_direct` 请求和部分 LLM 辅助请求的 HTTP 超时。 |
+
+角色元数据变量的实际名称为 `AURORA_TRIAGE_MODEL_CONTEXT_WINDOW`、`AURORA_TRIAGE_AUTO_COMPACT_TOKEN_LIMIT`、
+`AURORA_SOLVER_MODEL_CONTEXT_WINDOW`、`AURORA_SOLVER_AUTO_COMPACT_TOKEN_LIMIT`、
+`AURORA_REVIEWER_MODEL_CONTEXT_WINDOW` 和 `AURORA_REVIEWER_AUTO_COMPACT_TOKEN_LIMIT`；同一角色的两个值必须成对设置。
 
 ### Intent 执行预算
 
-这些变量为新 Intent 提供默认预算；Intent 自身的 `budget` 字段可以覆盖它们：
+这些变量是通用回退值；Intent 自身的 `budget` 字段可以覆盖它们，但题目组和 Evaluation 还会按阶段设置更严格的上限：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -169,7 +183,17 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_DEFAULT_FINALIZE_GRACE_SECONDS` | `60` | 软截止后的收尾宽限时间。 |
 | `AURORA_RESUME_MAX_FILES` | `100` | 单个 Attempt 可进入恢复 manifest 的工作文件和 Codex 状态文件数量上限。 |
 | `AURORA_RESUME_MAX_BYTES` | `67108864` | `/workspace/work` 持久文件的总字节上限。 |
-| `AURORA_MAX_CHALLENGE_GROUP_CONCURRENT` | `2` | 题目组并行项目的全局上限；单项目仍保持单 Worker。 |
+| `AURORA_MAX_CHALLENGE_GROUP_CONCURRENT` | `2` | 题目组并行项目的全局上限（最大并发 Solver Agent 数）；单项目仍保持单 Worker。也可在 Web 题目组控制台直接调整，下次派发生效，重启后回退到环境变量。 |
+
+当前有效预算层级如下，越靠后的阶段钳制优先级越高：
+
+| 执行路径 | Phase 1 | Phase 2 | Phase 3 | 动作预算 |
+| --- | --- | --- | --- | --- |
+| 独立项目/普通 Scheduler 默认 | soft 3600s / hard 5400s | soft 3600s / hard 5400s | soft 3600s / hard 5400s | `max_agent_actions=0`、`max_no_progress_actions=0`，即默认不按命令数截断 |
+| 普通题目组 | soft 1500s / hard 1800s | soft 3300s / hard 3600s | soft 3300s / hard 3600s | 同上；仍由超时与 `max_route_repeats` 约束 |
+| Evaluation | soft 240s / hard 300s | soft 1140s / hard 1200s | soft 1440s / hard 1500s | 同上；对应 5/20/25 分钟阶段 |
+
+如果 Intent 显式给出更小的阶段超时，题目组会保留更小值；更大的值会被阶段上限钳制。当前 Phase 1–4 默认关闭固定 shell 动作数与“无进展动作数”截断，因此 `AURORA_DEFAULT_MAX_AGENT_ACTIONS` 和 `AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS` 主要是兼容回退值；要启用动作上限，应在 Intent `budget` 中显式设置 `max_agent_actions`。题目组会强制把 `max_no_progress_actions` 设为 `0`。
 
 ### Hands-free Cataloger
 
@@ -202,12 +226,46 @@ ImportBatch、Project、ChallengeGroupItem、数据库设置或 Artifact。
 `AURORA_TSECBENCH_TIMEOUT_SECONDS` 控制 API 请求超时，`AURORA_TSECBENCH_MAX_CONCURRENT` 最大为 `3`，对应平台同时最多启动 3 道题的限制。
 
 导入候选保存 `platform=tsecbench` 和 `unique_code`。Runner 在 Solver 前调用 start，使用返回的 `container_addr`
-建立项目目标和授权主机，按阶段获取 Hint、提交 Flag，并在终态调用 close。Token 缺失或认证失败时导入进入
+建立项目目标并同步兼容用的授权主机记录，按阶段获取 Hint、提交 Flag，并在终态调用 close。Token 缺失或认证失败时导入进入
 `NEEDS_SESSION`；Runner 的启动/Hint/关闭失败只记录诊断，不覆盖题目结果。
 
 平台下发的 `container_addr` 是 SSLVPN 内的直连地址。Web 的“测试连接”会先验证 Challenge API；若题目列表中已有
 `available` 容器，则从 API 宿主机对第一个地址执行短 TCP 探测并显示 VPN 路由状态。Aurora 不保存 VPN 凭据，也不自动拨号；
 具体 SSLVPN 客户端或配置文件格式未包含在 Challenges API 文档中，需要先在宿主机建立平台下发的 VPN 连接。
+
+### Slab Match Agent API
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AURORA_SLAB_MATCH_BASE_URL` | `https://example.com/slab-match/api/v1/agent` | Agent API 根地址；也兼容 `SLAB_MATCH_BASE_URL`。 |
+| `AURORA_SLAB_MATCH_ACCESS_KEY` | 未设置 | `X-Agent-AccessKey` 凭据；也兼容 `SLAB_MATCH_ACCESS_KEY`。 |
+| `AURORA_SLAB_MATCH_TIMEOUT_SECONDS` | `20` | 控制面请求、环境轮询和附件请求的基础超时秒数。 |
+| `AURORA_SLAB_MATCH_MAX_CONCURRENT` | `1` | 默认动态靶机预算，运行时配置可覆盖。 |
+| `AURORA_SLAB_MATCH_NOTICE_POLL_SECONDS` | `15` | 活动题组公告轮询间隔，必须为正数。 |
+
+设置 `AURORA_SLAB_MATCH_BASE_URL` 和 `AURORA_SLAB_MATCH_ACCESS_KEY` 后，直接导入服务会从
+`/slab-match/api/v1/agent` 读取开放题目列表与详情，并保存 `platform=slab_match` 和 `exercise_id`；
+Runner 会在 Solver 前按需调用 `build-exercise-env`，
+轮询题目详情直到 `isNeedCheck=false` 且 `endpoints` 可用，再把目标、账号密码摘要和附件注入项目上下文。
+每个 Solver turn 结束后立即调用 `recover-exercise-env` 并清除旧目标记录；环境准备超时或缺少可用 endpoint 时也会回收。
+
+也可以在 Web 左侧的 `Slab Match` 设置中配置 Base URL、Access Key、请求超时和 Planner 动态靶机预算；对应接口为
+`GET/PUT /api/settings/slab-match`。连接测试使用 `POST /api/settings/slab-match/test`，只读取一次题目列表，不扫描题目详情或靶机。网页提交的 Access Key 只保存在
+当前 API 进程内存，重启后回退到环境变量；GET 配置接口不会返回明文 Key。
+
+Slab Match 使用独立的直接导入接口 `POST /api/slab-match/import`，不经过“解放双手”的页面扫描和候选确认。
+该接口只顺序读取详情、下载附件并创建 `READY` 题组，不启动靶机、Planner 或 Agent。平台请求在进程内严格串行且间隔至少一秒。
+`AURORA_SLAB_MATCH_MAX_CONCURRENT` 只作为 Planner 的动态靶机预算写入题组元数据；附件直接写入项目的 `challenge_input` Artifact。
+API 还会按 `AURORA_SLAB_MATCH_NOTICE_POLL_SECONDS`（默认 15 秒）轮询公告列表；新公告正文、修正信息和公告附件会去重后写入所有活动
+Slab Match 项目的 Blackboard 与 `challenge_input` Artifact，使运行中的 Solver 也能读取最新题目信息。
+
+提交时，Runner 会读取 `match_info.rule`。只有规则明确要求“仅提交 `{}` 内内容”时，才从
+`DASCTF{...}`/`flag{...}` 中提取花括号 payload；否则把本地验证的完整 flag 原样提交。平台拒绝不会自动重试同一候选，
+拒绝值与原因会进入下一轮 Solver 上下文。
+
+Slab Match 的控制面重定向必须保持与配置的 Agent API 同源，否则请求失败，避免 `X-Agent-AccessKey` 泄漏。
+附件的初始 URL 和每次重定向都必须是无用户凭据、无 fragment 的绝对 HTTP(S) URL，并拒绝 localhost、
+metadata 主机以及字面量私网、回环、link-local、reserved IP。AccessKey 只发送给 Agent API 同源附件；跨域附件和重定向会移除该请求头。
 
 ### 容器化 OpenVPN（可选）
 
@@ -232,7 +290,8 @@ VPN 运行在独立容器网络命名空间中，不修改宿主机路由。连�
 | `AURORA_FOFA_BASE_URL` | `https://api.fofa.info/v1/search/all` |
 | `AURORA_FOFA_TIMEOUT_SECONDS` | `20` |
 
-FOFA 查询仍受项目允许的 host/domain/ip 范围和策略引擎限制。
+凭据只决定 `fofa.search` 是否对 Worker 可见。当前实现把 `query` 原样发送给 FOFA，并把 `size` 限制为 1–100；
+`PolicyEngine` 不再将查询约束为项目的 host/domain/ip。请通过 FOFA 账号权限、出站代理和 ToolTrace 审计控制使用范围。
 
 ### 同容器 Subagents
 
@@ -242,8 +301,22 @@ Subagents 需要同时满足全局开关、创建项目时的 `subagents_enabled
 | --- | --- | --- |
 | `AURORA_SUBAGENTS_ENABLED` | `false` | 接受 `1`、`true`、`yes`（不区分大小写）为启用。 |
 | `AURORA_SUBAGENTS_MAX_CONCURRENT` | `2` | 每个 Worker 同时运行的子 Agent 数。 |
-| `AURORA_SUBAGENTS_MAX_PER_WORKER` | `4` | 每个 Worker 的子 Agent 总数上限。 |
+| `AURORA_SUBAGENTS_MAX_PER_WORKER` | `2` | 每个 Worker 的子 Agent 总数上限。 |
 | `AURORA_SUBAGENT_CODEX_COMMAND` | 未设置 | 子 Agent 使用的 Codex 命令模板；应包含 `{prompt_filename}`、`{schema_filename}`、`{last_message_filename}`。默认 wrapper 会自动注入。 |
+
+### Evaluation 运行约束
+
+Evaluation 没有单独环境变量，使用 TSecBench 配置和角色模型配置。`POST /api/evaluations/suites` 会冻结当时的题目元数据和输入版本，
+默认排除已完成或已有正确 flag 进度的题目；创建 run 时再记录当次角色模型、prompt contract 与工具清单哈希，并重新读取平台状态，执行以下硬检查：
+
+- 同一 suite 不得存在另一个未进入 `COMPLETED`、`FAILED` 或 `STOPPED` 的 run；
+- 每道题当前必须仍存在且没有平台已接受进度；
+- suite 中不能包含尚未物化为本地 Artifact 的远程附件；
+- variant 只能是 `baseline` 或 `candidate`。
+
+一次成功的 baseline 会污染同一平台账号的题目状态，因此 candidate 必须使用独立的干净 Token/账号，或在平台重置接受进度后再创建。
+单题阶段预算固定为 5/20/25 分钟，共 50 分钟。晋级需要至少 30 个有效样本、成功率提升 15 个百分点、错误提交率不变差、
+重复请求达到降低门槛，并且派生候选验证覆盖率与终态 checkpoint 覆盖率都为 100%。
 
 ## 4. 前端与启动配置
 
@@ -285,7 +358,10 @@ uv run uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 ## 6. 安全与运维注意事项
 
 - API 当前启用全开放 CORS（`*`），没有内置认证配置。不要直接把开发服务器暴露到不受信任的网络；生产环境应在反向代理层增加认证、TLS 和访问控制。
+- 项目目标授权当前已禁用：`PolicyEngine` 对全部网关请求返回 `allow`。`AuthorizationScope`、`allowed_hosts`、`allowed_domains` 和 metadata 拒绝字段只保留为上下文/兼容数据，不是安全边界；原生 Codex shell 同样不按项目目标限流。必须在 Worker 网络、出站防火墙、VPN 或代理层强制允许范围。
 - `aurora-runtime` 是 Worker 与 CC Switch 共用的私有 bridge 网络；CC Switch 不向宿主机发布端口。
 - `codex` runtime 使用容器执行且禁用本地回退；`openai_direct` 和手工工具路径仍可能在 Kali 镜像不可用时回退到本地执行，结果中的 `ToolTrace.backend` 会记录实际后端。
+- 不要提交 `.env`、数据库、Artifact、Codex workspace 或运行历史；`.gitignore` 已包含 ffuf 的运行时配置目录 `runtime/home/.config/ffuf/`。
+- Worker 镜像内 vendored `glibc-all-in-one` 使用禁止商业使用的上游许可。分发镜像或用于商业环境前，应审查 `container/kali-codex/vendor/glibc-all-in-one/LICENSE` 并确认场景相容。
 - 修改数据库、Artifact 目录或 Worker workspace 的权限后，确认运行 API 的用户可读写这些目录。
-- 配置变更后的最小检查顺序：重启 API、访问 `GET /health`、运行 `./scripts/check.sh`；使用 Codex 时再运行 Worker 镜像和 Provider 预检。
+- 配置变更后的最小检查顺序：重启 API、访问 `GET /health`、运行 `./scripts/check.sh`；前端发布前进入 `apps/web` 执行 `node_modules/.bin/tsc --noEmit -p tsconfig.json`、`npm run build` 和 `npm audit --audit-level=moderate`；使用 Codex 时还要运行 Worker 镜像与 Provider 预检。

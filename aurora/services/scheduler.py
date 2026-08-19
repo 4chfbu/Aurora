@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from aurora.models import Attempt, Intent, Project, Worker, WorkerEvent, now_utc, new_id
@@ -23,23 +24,34 @@ class Scheduler:
             return None
 
         worker_id = new_id("worker")
-        intent.lease_generation += 1
-        intent.status = "RUNNING"
-        intent.lease_owner = worker_id
-        intent.lease_expires_at = now_utc() + timedelta(seconds=lease_seconds)
-        intent.updated_at = now_utc()
+        lease_generation = intent.lease_generation + 1
+        lease_expires_at = now_utc() + timedelta(seconds=lease_seconds)
+        claimed = session.exec(
+            update(Intent)
+            .where(Intent.id == intent.id, Intent.status == "PENDING")
+            .values(
+                status="RUNNING",
+                lease_owner=worker_id,
+                lease_expires_at=lease_expires_at,
+                lease_generation=lease_generation,
+                updated_at=now_utc(),
+            )
+        )
+        if claimed.rowcount != 1:
+            session.rollback()
+            return None
         worker = Worker(
             id=worker_id,
             project_id=project_id,
             intent_id=intent.id,
             status="RUNNING",
             capability_set=intent.capability_tags or ["sandbox.exec"],
-            lease={"expires_at": intent.lease_expires_at.isoformat()},
-            lease_generation=intent.lease_generation,
+            lease={"expires_at": lease_expires_at.isoformat()},
+            lease_generation=lease_generation,
         )
-        session.add(intent)
         session.add(worker)
         session.commit()
+        session.expire(intent)
         session.refresh(intent)
         session.refresh(worker)
         return intent, worker

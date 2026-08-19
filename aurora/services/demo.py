@@ -19,20 +19,31 @@ from aurora.services.scheduler import Scheduler
 from aurora.services.subagent_collector import SubagentCollector
 from aurora.services.worker_runtime import get_worker_runtime
 from aurora.services.tool_profiles import worker_preflight
+from aurora.services.project_run_control import project_run_control
 
 
 def _execution_budget(intent: object) -> dict:
     settings = get_settings()
     raw = getattr(intent, "budget", {}) or {}
     phase = int(raw.get("phase", 1) or 1)
+    # The Codex harness drives its own action loop and only writes to the
+    # blackboard at end-of-turn, so a "no progress" heuristic that counts
+    # mid-turn blackboard writes kills legitimate local analysis (crypto
+    # factoring, pwn RE) after a few shell commands. Disable it by default;
+    # the group runner (ChallengeGroupRunner._apply_phase_attempt_budget)
+    # already does the same. The per-attempt shell-action budget
+    # (max_agent_actions) is also disabled by default; soft/hard timeout
+    # is the real wall-clock bound. max_route_repeats still kills repeated
+    # failed routes. Set max_agent_actions on an intent to opt back in.
     phase_defaults = {
-        1: {"soft_timeout_seconds": 300, "hard_timeout_seconds": 420, "max_agent_actions": 12, "max_route_repeats": 2},
-        2: {"soft_timeout_seconds": 480, "hard_timeout_seconds": 600, "max_agent_actions": 20, "max_route_repeats": 2},
-        3: {"soft_timeout_seconds": 720, "hard_timeout_seconds": 900, "max_agent_actions": 30, "max_route_repeats": 3},
+        1: {"soft_timeout_seconds": 3600, "hard_timeout_seconds": 5400, "max_agent_actions": 0, "max_no_progress_actions": 0, "max_route_repeats": 2, "model_role": "triage"},
+        2: {"soft_timeout_seconds": 3600, "hard_timeout_seconds": 5400, "max_agent_actions": 0, "max_no_progress_actions": 0, "max_route_repeats": 2, "model_role": "solver"},
+        3: {"soft_timeout_seconds": 3600, "hard_timeout_seconds": 5400, "max_agent_actions": 0, "max_no_progress_actions": 0, "max_route_repeats": 2, "model_role": "solver"},
+        4: {"soft_timeout_seconds": 3600, "hard_timeout_seconds": 5400, "max_agent_actions": 0, "max_no_progress_actions": 0, "max_route_repeats": 2, "model_role": "reviewer"},
     }.get(phase, {})
     budget = {
         **raw,
-        "model_role": raw.get("model_role", "solver"),
+        "model_role": raw.get("model_role", phase_defaults.get("model_role", "solver")) if raw.get("model_role", phase_defaults.get("model_role", "solver")) in {"triage", "planner", "solver", "reviewer"} else "solver",
         "phase": phase,
         "soft_timeout_seconds": int(raw.get("soft_timeout_seconds", phase_defaults.get("soft_timeout_seconds", settings.default_soft_timeout_seconds))),
         "hard_timeout_seconds": int(raw.get("hard_timeout_seconds", phase_defaults.get("hard_timeout_seconds", settings.default_hard_timeout_seconds))),
@@ -40,7 +51,7 @@ def _execution_budget(intent: object) -> dict:
         "max_repeat_failures": int(raw.get("max_repeat_failures", settings.default_max_repeat_failures)),
         "max_agent_actions": int(raw.get("max_agent_actions", phase_defaults.get("max_agent_actions", settings.default_max_agent_actions))),
         "max_route_repeats": int(raw.get("max_route_repeats", phase_defaults.get("max_route_repeats", settings.default_max_route_repeats))),
-        "max_no_progress_actions": int(raw.get("max_no_progress_actions", settings.default_max_no_progress_actions)),
+        "max_no_progress_actions": int(raw.get("max_no_progress_actions", phase_defaults.get("max_no_progress_actions", settings.default_max_no_progress_actions))),
         "finalize_grace_seconds": int(raw.get("finalize_grace_seconds", settings.default_finalize_grace_seconds)),
     }
     if budget["hard_timeout_seconds"] <= budget["soft_timeout_seconds"]:
@@ -136,13 +147,29 @@ def create_project_with_bootstrap(
         capability_tags=["sandbox.exec", "blackboard.query"],
         priority=1.0,
         risk_level="low",
-        budget={"model_role": "planner", "max_tool_calls": 3},
+        budget={"model_role": "triage", "phase": 1, "max_tool_calls": 3},
     )
     session.refresh(project)
     return project
 
 
-def run_one_demo_step(session: Session, *, project_id: str) -> dict:
+def run_one_demo_step(session: Session, *, project_id: str, run_id: str | None = None) -> dict:
+    claim = None
+    if run_id is None:
+        claim = project_run_control.acquire(project_id=project_id, owner="worker.step")
+        if claim is None:
+            return {"status": "busy", "message": "project_run_active"}
+        run_id = claim.run_id
+    elif not project_run_control.owns(project_id=project_id, run_id=run_id):
+        return {"status": "busy", "message": "project_run_active"}
+    try:
+        return _run_one_demo_step_claimed(session, project_id=project_id)
+    finally:
+        if claim is not None:
+            project_run_control.release(project_id=project_id, run_id=claim.run_id)
+
+
+def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     project = session.get(Project, project_id)
     if project is not None and project.status == "COMPLETED":
         return {"status": "project_completed", "message": "project is already completed"}
@@ -329,20 +356,24 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     raw_tool_requests = structured.get("tool_requests", [])
     valid_tool_requests = [item for item in raw_tool_requests if isinstance(item, dict)] if isinstance(raw_tool_requests, list) else []
     if max_agent_actions and internal_action_count >= max_agent_actions:
-        valid_tool_requests = []
         session.add(WorkerEvent(
             project_id=project_id,
             worker_id=worker.id,
             intent_id=intent.id,
             attempt_id=attempt.id,
             event_type="attempt.finalization_started",
-            payload_json={"reason": "max_agent_actions", "observed": internal_action_count, "budget": max_agent_actions},
+            payload_json={
+                "reason": "max_agent_actions",
+                "observed": internal_action_count,
+                "budget": max_agent_actions,
+                "gateway_requests_preserved": len(valid_tool_requests),
+            },
         ))
         session.commit()
     # Verification is a post-solver gate, not another exploratory action.
     # Run it first so a valid derivation cannot be dropped merely because the
     # model also returned enough ordinary requests to fill the tool budget.
-    valid_tool_requests.sort(key=lambda item: item.get("tool_name") != "flag.verify")
+    valid_tool_requests.sort(key=lambda item: {"flag.verify": 0, "flag.submit": 1}.get(item.get("tool_name"), 2))
     for tool_request in valid_tool_requests[:max_tool_calls]:
         tool_name = str(tool_request.get("tool_name") or "")
         request = _route_request(project_id, tool_name, tool_request.get("request", {}))
@@ -435,6 +466,21 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
         )
         session.commit()
         structured.setdefault("artifact_refs", []).extend(result.artifact_refs)
+        if tool_request["tool_name"] == "flag.verify" and not result.success:
+            structured.setdefault("failed_attempts", []).append({
+                "reason": "flag_verification_failed",
+                "tool_name": "flag.verify",
+                "summary": result.summary,
+                "artifact_refs": result.artifact_refs,
+            })
+            structured.setdefault("suggested_intents", []).append({
+                "objective": f"Repair the rejected flag verification workflow: {result.summary[:500]}",
+                "expected_observation": "Two isolated replays exit successfully and print the same single flag derived from declared input artifacts.",
+                "capabilities": ["flag.verify", "sandbox.exec", "blackboard.query"],
+                "priority": 1.6,
+                "risk_level": "low",
+                "budget": {"model_role": "reviewer", "phase": 4},
+            })
 
     requested_tools = len(valid_tool_requests)
     if requested_tools > max_tool_calls or skipped_tools:
@@ -477,13 +523,15 @@ def run_one_demo_step(session: Session, *, project_id: str) -> dict:
     if candidate_flags:
         structured.setdefault("candidate_flags", []).extend(candidate_flags)
     ResultProcessor().apply(session, attempt=attempt, output=structured, llm_trace=runtime_output.llm_trace)
-    terminal_project = session.get(Project, project_id)
     checkpoint = RoundReflectionService().create(
         session,
         attempt=attempt,
         output=structured,
         budget=worker.budgets,
-        skip_planner=bool(terminal_project and terminal_project.status in {"COMPLETED", "FLAG_READY"}),
+        # The Solver already returns its evidence, next step, and continuation
+        # Intent. A second model pass here used to rewrite that plan between
+        # turns and made the outer loop part of the solving process.
+        skip_planner=True,
     )
     estimated_tokens = runtime_output.llm_trace.estimated_input_tokens + runtime_output.llm_trace.estimated_output_tokens
     token_budget = worker.budgets.get("token_budget")

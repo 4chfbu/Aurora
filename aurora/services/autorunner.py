@@ -11,7 +11,7 @@ from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, W
 from aurora.services.demo import run_one_demo_step
 from aurora.services.manager import ManagerService
 from aurora.services.observer import ObserverService
-from aurora.services.blackboard_repository import route_fingerprint
+from aurora.services.project_run_control import project_run_control
 
 
 @dataclass
@@ -39,6 +39,35 @@ class AutoRunnerService:
         project_id: str,
         limits: AutoRunLimits | None = None,
         should_stop: Callable[[], bool] | None = None,
+        run_id: str | None = None,
+    ) -> AutoRunResult:
+        claim = None
+        if run_id is None:
+            claim = project_run_control.acquire(project_id=project_id, owner="autorunner")
+            if claim is None:
+                return AutoRunResult("busy", "project_run_active", 0, project_id)
+            run_id = claim.run_id
+        elif not project_run_control.owns(project_id=project_id, run_id=run_id):
+            return AutoRunResult("busy", "project_run_active", 0, project_id)
+        try:
+            return self._run_until_stop_claimed(
+                session,
+                project_id=project_id,
+                limits=limits,
+                should_stop=lambda: project_run_control.should_stop(project_id=project_id, run_id=run_id) or bool(should_stop and should_stop()),
+                run_id=run_id,
+            )
+        finally:
+            project_run_control.release(project_id=project_id, run_id=run_id)
+
+    def _run_until_stop_claimed(
+        self,
+        session: Session,
+        *,
+        project_id: str,
+        limits: AutoRunLimits | None,
+        should_stop: Callable[[], bool] | None,
+        run_id: str,
     ) -> AutoRunResult:
         limits = limits or AutoRunLimits()
         project = session.get(Project, project_id)
@@ -50,7 +79,7 @@ class AutoRunnerService:
         started_at = now_utc()
         no_progress_count = 0
         events: list[dict[str, Any]] = []
-        self._event(session, project_id, "autorun.started", {"limits": limits.__dict__})
+        self._event(session, project_id, "autorun.started", {"limits": limits.__dict__, "run_id": run_id})
 
         iteration = 0
         while limits.max_iterations <= 0 or iteration < limits.max_iterations:
@@ -69,35 +98,32 @@ class AutoRunnerService:
                 self._event(session, project_id, "autorun.stopped", {"reason": "max_minutes", "iteration": iteration - 1})
                 return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
 
-            before = self._counts(session, project_id)
-            self._event(session, project_id, "autorun.iteration.started", {"iteration": iteration})
-
-            observer_decision = ObserverService().analyze_project(session, project_id=project_id)
-            if limits.stop_on_observer_escalate and observer_decision.decision in {"ESCALATE", "STOP", "PAUSE"}:
+            # The outer loop is deliberately a dispatcher, not another solver.
+            # Keep the one hard safety gate (a recorded policy denial), but do
+            # not let Observer route heuristics or Manager-authored advice run
+            # in front of every model turn. Those previously stopped valid
+            # resumed sessions before the Solver could use their checkpoints.
+            policy_denial = self._latest_policy_denial(session, project_id) if limits.stop_on_observer_escalate else None
+            if policy_denial is not None:
                 payload = {
                     "reason": "observer_escalate",
-                    "iteration": iteration,
-                    "observer_decision": observer_decision.__dict__,
+                    "iteration": iteration - 1,
+                    "observer_decision": policy_denial,
                 }
                 self._event(session, project_id, "autorun.blocked", payload)
                 events.append(payload)
-                return AutoRunResult("blocked", "observer_escalate", iteration, project_id, events)
-            if (
-                limits.no_progress_limit > 0
-                and observer_decision.decision == "REDIRECT"
-                and self._duplicate_streak(session, project_id) >= max(2, limits.no_progress_limit)
-            ):
-                payload = {
-                    "reason": "duplicate_tool_streak",
-                    "iteration": iteration,
-                    "observer_decision": observer_decision.__dict__,
-                }
-                self._event(session, project_id, "autorun.blocked", payload)
-                events.append(payload)
-                return AutoRunResult("blocked", "duplicate_tool_streak", iteration, project_id, events)
+                return AutoRunResult("blocked", "observer_escalate", iteration - 1, project_id, events)
 
-            manager_decision = ManagerService().run_project(session, project_id=project_id)
-            run_result = run_one_demo_step(session, project_id=project_id)
+            manager_decision = None
+            if not self._has_pending_intent(session, project_id):
+                manager_decision = ManagerService().run_project(session, project_id=project_id)
+                if not self._has_pending_intent(session, project_id):
+                    self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration - 1})
+                    return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
+
+            before = self._counts(session, project_id)
+            self._event(session, project_id, "autorun.iteration.started", {"iteration": iteration})
+            run_result = run_one_demo_step(session, project_id=project_id, run_id=run_id)
             after = self._counts(session, project_id)
             progress = self._progress(before, after)
             if progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"]:
@@ -107,8 +133,8 @@ class AutoRunnerService:
 
             payload = {
                 "iteration": iteration,
-                "observer": observer_decision.__dict__,
-                "manager": manager_decision.__dict__,
+                "observer": {"decision": "DEFERRED", "reason": "The Solver owns route selection inside this turn."},
+                "manager": manager_decision.__dict__ if manager_decision is not None else {"status": "SKIPPED", "reason": "A runnable Solver intent already exists.", "proposed_intents": []},
                 "run_result": run_result,
                 "progress": progress,
                 "no_progress_count": no_progress_count,
@@ -122,7 +148,7 @@ class AutoRunnerService:
                 if project.status == "FLAG_READY":
                     return AutoRunResult("candidate_ready", "candidate_ready", iteration, project_id, events)
                 return AutoRunResult("completed", "project_completed", iteration, project_id, events)
-            if run_result.get("status") == "idle" and manager_decision.status == "NOOP":
+            if run_result.get("status") == "idle":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)
             if run_result.get("status") in {"runtime_error", "runtime_preflight_failed"}:
@@ -136,13 +162,22 @@ class AutoRunnerService:
         return AutoRunResult("stopped", "max_iterations", limits.max_iterations, project_id, events)
 
     def step(self, session: Session, *, project_id: str) -> dict[str, Any]:
+        claim = project_run_control.acquire(project_id=project_id, owner="autorun.step")
+        if claim is None:
+            return {"status": "busy", "reason": "project_run_active"}
+        try:
+            return self._step_claimed(session, project_id=project_id, run_id=claim.run_id)
+        finally:
+            project_run_control.release(project_id=project_id, run_id=claim.run_id)
+
+    def _step_claimed(self, session: Session, *, project_id: str, run_id: str) -> dict[str, Any]:
         observer_decision = ObserverService().analyze_project(session, project_id=project_id)
         if observer_decision.decision in {"ESCALATE", "STOP", "PAUSE"}:
             payload = {"status": "blocked", "reason": "observer_escalate", "observer": observer_decision.__dict__}
             self._event(session, project_id, "autorun.blocked", payload)
             return payload
         manager_decision = ManagerService().run_project(session, project_id=project_id)
-        run_result = run_one_demo_step(session, project_id=project_id)
+        run_result = run_one_demo_step(session, project_id=project_id, run_id=run_id)
         payload = {"status": "stepped", "observer": observer_decision.__dict__, "manager": manager_decision.__dict__, "run_result": run_result}
         self._event(session, project_id, "autorun.iteration.completed", payload)
         return payload
@@ -163,12 +198,34 @@ class AutoRunnerService:
                 session.exec(
                     select(Artifact).where(
                         Artifact.project_id == project_id,
-                        Artifact.type.not_in(["codex-transcript", "resume-manifest", "resume-work-file"]),
+                        Artifact.origin_kind.in_(["challenge_input", "target_observation", "operator_observation", "verified_derivation"]),
                     )
                 ).all()
             ),
             "findings": len(session.exec(select(Finding).where(Finding.project_id == project_id)).all()),
             "attempts": len(session.exec(select(Intent).where(Intent.project_id == project_id, Intent.status.in_(["COMPLETED", "FAILED"]))).all()),
+        }
+
+    @staticmethod
+    def _has_pending_intent(session: Session, project_id: str) -> bool:
+        return session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+        ).first() is not None
+
+    @staticmethod
+    def _latest_policy_denial(session: Session, project_id: str) -> dict[str, Any] | None:
+        denial = session.exec(
+            select(ToolTrace)
+            .where(ToolTrace.project_id == project_id, ToolTrace.policy_decision == "deny")
+            .order_by(ToolTrace.created_at.desc())
+        ).first()
+        if denial is None:
+            return None
+        return {
+            "decision": "ESCALATE",
+            "reason": f"Tool request was denied by policy: {denial.summary or denial.tool_name}",
+            "severity": "high",
+            "references": {"tool_trace_id": denial.id, "tool_name": denial.tool_name},
         }
 
     def _progress(self, before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
@@ -178,21 +235,6 @@ class AutoRunnerService:
             "new_findings": after["findings"] - before["findings"],
             "new_attempts": after["attempts"] - before["attempts"],
         }
-
-    def _duplicate_streak(self, session: Session, project_id: str) -> int:
-        traces = session.exec(
-            select(ToolTrace).where(ToolTrace.project_id == project_id).order_by(ToolTrace.created_at.desc()).limit(10)
-        ).all()
-        if len(traces) < 2:
-            return 0
-        latest = traces[0]
-        latest_request = route_fingerprint(latest.request_json)
-        streak = 0
-        for trace in traces:
-            if trace.tool_name != latest.tool_name or route_fingerprint(trace.request_json) != latest_request:
-                break
-            streak += 1
-        return streak
 
     def _event(self, session: Session, project_id: str, event_type: str, payload: dict[str, Any]) -> None:
         session.add(WorkerEvent(project_id=project_id, event_type=event_type, payload_json=payload))

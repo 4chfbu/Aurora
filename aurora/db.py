@@ -1,17 +1,31 @@
 from collections.abc import Generator
 import hashlib
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import get_settings
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 settings = get_settings()
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=connect_args)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, connection_record):
+    """Enable WAL and a busy timeout so concurrent writers (lease heartbeat,
+    worker callback endpoints, and parallel challenge-group projects) do not
+    raise "database is locked" on the default rollback-journal profile."""
+    if not settings.database_url.startswith("sqlite"):
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute(f"PRAGMA journal_mode={settings.db_journal_mode}")
+    cursor.execute(f"PRAGMA busy_timeout={settings.db_busy_timeout_ms}")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
 
 
 def init_db() -> None:

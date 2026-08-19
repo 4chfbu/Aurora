@@ -11,6 +11,11 @@ if db_path.exists():
 from fastapi.testclient import TestClient  # noqa: E402
 
 from aurora.api import create_app  # noqa: E402
+from aurora.db import engine  # noqa: E402
+from aurora.models import Project, WorkerEvent  # noqa: E402
+from aurora.services.autorunner import AutoRunLimits, AutoRunnerService  # noqa: E402
+from aurora.services.project_run_control import project_run_control  # noqa: E402
+from sqlmodel import Session, select  # noqa: E402
 
 
 def test_autorun_stops_when_candidate_is_ready_for_final_validation() -> None:
@@ -51,9 +56,11 @@ def test_autorun_stops_on_observer_escalate() -> None:
             json={"name": "autorun-escalate", "goal": "触发观察器停止", "allowed_hosts": ["127.0.0.1"]},
         ).json()
         project_id = project["id"]
+        # capability.request is unsupported and records a policy deny, which
+        # Observer escalates on to stop the autorun.
         denied = client.post(
-            f"/api/projects/{project_id}/tools/http.request/execute",
-            json={"request": {"url": "http://169.254.169.254/latest/meta-data/"}},
+            f"/api/projects/{project_id}/tools/capability.request/execute",
+            json={"request": {"capability": "target.url"}},
         )
         assert denied.status_code == 200
         result = client.post(f"/api/projects/{project_id}/autorun/start", json={"max_iterations": 5})
@@ -112,3 +119,64 @@ def test_autorun_background_start_reports_status() -> None:
         status = client.get(f"/api/projects/{project_id}/autorun/status")
         assert status.status_code == 200
         assert status.json()["background"]["project_id"] == project_id
+
+
+def test_autorunner_rejects_a_second_project_loop() -> None:
+    with Session(engine) as session:
+        project = Project(name="single-flight", goal="Only one outer loop may run")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        claim = project_run_control.acquire(project_id=project.id, owner="test")
+        assert claim is not None
+        try:
+            result = AutoRunnerService().run_until_stop(
+                session,
+                project_id=project.id,
+                limits=AutoRunLimits(max_iterations=1),
+            )
+        finally:
+            project_run_control.release(project_id=project.id, run_id=claim.run_id)
+
+        starts = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project.id,
+                WorkerEvent.event_type == "autorun.started",
+            )
+        ).all()
+
+    assert result.status == "busy"
+    assert result.stop_reason == "project_run_active"
+    assert starts == []
+
+
+def test_project_run_stop_request_reaches_non_background_loops() -> None:
+    claim = project_run_control.acquire(project_id="proj_stop_control", owner="test")
+    assert claim is not None
+    try:
+        assert project_run_control.should_stop(project_id=claim.project_id, run_id=claim.run_id) is False
+        project_run_control.request_stop(claim.project_id)
+        assert project_run_control.should_stop(project_id=claim.project_id, run_id=claim.run_id) is True
+    finally:
+        project_run_control.release(project_id=claim.project_id, run_id=claim.run_id)
+
+
+def test_autorun_api_returns_conflict_for_an_active_project_loop() -> None:
+    client = TestClient(create_app())
+    with client:
+        project = client.post(
+            "/api/projects",
+            json={"name": "single-flight-api", "goal": "Reject duplicate starts", "allowed_hosts": ["127.0.0.1"]},
+        ).json()
+        claim = project_run_control.acquire(project_id=project["id"], owner="test")
+        assert claim is not None
+        try:
+            response = client.post(
+                f"/api/projects/{project['id']}/autorun/start",
+                json={"max_iterations": 1, "background": True},
+            )
+        finally:
+            project_run_control.release(project_id=project["id"], run_id=claim.run_id)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "project already has an active run"

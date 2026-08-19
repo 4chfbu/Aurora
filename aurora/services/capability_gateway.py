@@ -13,16 +13,18 @@ import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, FlagCandidate, Intent, ToolTrace
+from aurora.models import Artifact, FlagCandidate, Intent, ToolTrace, WorkerEvent
 from aurora.services.command_runner import AutoCommandRunner, CommandRunner
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.policy import PolicyEngine
 from aurora.services.browser_interaction import BrowserInteractionService
 from aurora.config import get_settings
 from aurora.services.flag_validator import FlagValidator
+from aurora.services.flag_submission import FlagSubmissionService
+from aurora.services.competition_adapter import CompetitionAdapter
 
 
 DENIED_TOKENS = ["rm -rf", "mkfs", ":(){", "dd if=", "shutdown", "reboot", "docker.sock"]
@@ -30,8 +32,16 @@ DENIED_TOKENS = ["rm -rf", "mkfs", ":(){", "dd if=", "shutdown", "reboot", "dock
 
 class FlagVerifyRequest(BaseModel):
     source_artifact_refs: list[str] = Field(min_length=1, max_length=20)
-    verification_script: str = Field(min_length=1, max_length=1000)
+    # Normally a workspace path; bounded inline Python is accepted as a
+    # compatibility form for providers that serialize the script body.
+    verification_script: str = Field(min_length=1, max_length=1_000_000)
     timeout_seconds: int = Field(default=30, ge=1, le=60)
+
+
+class FlagSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(min_length=1, max_length=128)
 
 
 @dataclass
@@ -51,6 +61,7 @@ class CapabilityGateway:
         command_runner: CommandRunner | None = None,
         verification_runner: CommandRunner | None = None,
         policy_engine: PolicyEngine | None = None,
+        competition_adapter: CompetitionAdapter | None = None,
     ) -> None:
         self.artifact_store = artifact_store or ArtifactStore()
         self.command_runner = command_runner or AutoCommandRunner()
@@ -61,6 +72,7 @@ class CapabilityGateway:
             workspace_read_only=True,
         )
         self.policy_engine = policy_engine or PolicyEngine()
+        self.competition_adapter = competition_adapter
 
     def execute(
         self,
@@ -90,10 +102,14 @@ class CapabilityGateway:
             session.refresh(trace)
             return ToolResult(False, policy.reason, [], {"exit_code": None, "backend": "policy"}, [policy.reason], trace.id)
 
+        if tool_name == "capability.request":
+            return self._capability_request_unsupported(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "sandbox.exec":
             return self._sandbox_exec(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "flag.verify":
             return self._flag_verify(session, project_id, request, worker_id, intent_id, attempt_id)
+        if tool_name == "flag.submit":
+            return self._flag_submit(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "fofa.search":
             return self._fofa_search(session, project_id, request, worker_id, intent_id, attempt_id)
         if tool_name == "blackboard.query":
@@ -175,8 +191,16 @@ class CapabilityGateway:
                 session, project_id, request, worker_id, intent_id, attempt_id,
                 "flag.verify requires verification_script",
             )
+        normalized_request = dict(request)
+        requested_timeout = normalized_request.get("timeout_seconds", 30)
         try:
-            validated = FlagVerifyRequest.model_validate(request)
+            numeric_timeout = int(requested_timeout)
+        except (TypeError, ValueError):
+            numeric_timeout = requested_timeout
+        if isinstance(numeric_timeout, int):
+            normalized_request["timeout_seconds"] = max(1, min(numeric_timeout, 60))
+        try:
+            validated = FlagVerifyRequest.model_validate(normalized_request)
         except ValidationError as exc:
             return self._verification_failure(
                 session, project_id, request, worker_id, intent_id, attempt_id,
@@ -201,16 +225,24 @@ class CapabilityGateway:
                 "flag.verify requires verification_script",
             )
 
-        # Worker containers see their mounted workspace at /workspace, while
-        # the gateway resolves files from the host-side worker directory.
-        # Accept that container spelling, then apply the normal workspace
-        # containment check below. Other absolute paths remain rejected.
-        if script_name == "/workspace":
-            script_name = ""
-        elif script_name.startswith("/workspace/"):
-            script_name = script_name[len("/workspace/"):]
         workspace = (get_settings().codex_workspace_dir / project_id / worker_id).resolve()
-        script_path = (workspace / script_name).resolve()
+        inline_script = "\n" in script_name or script_name.lstrip().startswith(("import ", "from ", "#!", "def ", "print("))
+        if inline_script:
+            script_bytes = script_name.encode("utf-8")
+            if len(script_bytes) > 1_000_000:
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification script exceeds 1 MB")
+            workspace.mkdir(parents=True, exist_ok=True)
+            inline_name = f".aurora-inline-verify-{hashlib.sha256(script_bytes).hexdigest()[:16]}.py"
+            script_path = (workspace / inline_name).resolve()
+            script_path.write_bytes(script_bytes)
+        else:
+            # Worker containers see their mounted workspace at /workspace,
+            # while the gateway resolves host-side worker files.
+            if script_name == "/workspace":
+                script_name = ""
+            elif script_name.startswith("/workspace/"):
+                script_name = script_name[len("/workspace/"):]
+            script_path = (workspace / script_name).resolve()
         try:
             script_path.relative_to(workspace)
         except ValueError:
@@ -294,6 +326,24 @@ class CapabilityGateway:
                 artifact_type="flag-verification",
                 origin_kind="verified_derivation",
             )
+            candidate = session.exec(
+                select(FlagCandidate).where(
+                    FlagCandidate.project_id == project_id,
+                    FlagCandidate.value_hash == value_hash,
+                )
+            ).first()
+            if candidate is None:
+                candidate = FlagCandidate(project_id=project_id, value=value, value_hash=value_hash)
+            if candidate.status not in {"ACCEPTED", "SUBMITTED", "AWAITING_MANUAL_VALIDATION"}:
+                candidate.status = "LOCAL_VERIFIED"
+                candidate.provenance_kind = "DERIVED_REPLAY"
+                candidate.artifact_refs = [artifact.id, *[source.id for source in artifacts]]
+                candidate.verification_artifact_ref = artifact.id
+                candidate.source_attempt_id = attempt_id
+                candidate.source_worker_id = worker_id
+                candidate.rejection_reason = None
+            session.add(candidate)
+            session.flush()
             trace = ToolTrace(
                 project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id,
                 tool_name="flag.verify", request_json=request, policy_decision="allow", exit_code=0,
@@ -302,9 +352,81 @@ class CapabilityGateway:
             session.add(trace)
             session.commit()
             session.refresh(trace)
-            return ToolResult(True, trace.summary or "Flag verified", [artifact.id, *[source.id for source in artifacts]], {"runs": 2, "backend": "isolated-replay"}, [], trace.id)
+            return ToolResult(
+                True,
+                trace.summary or "Flag verified",
+                [artifact.id, *[source.id for source in artifacts]],
+                {
+                    "runs": 2,
+                    "backend": "isolated-replay",
+                    "candidate_id": candidate.id,
+                    "effective_timeout_seconds": timeout,
+                    "inline_script": inline_script,
+                },
+                [],
+                trace.id,
+            )
         finally:
             shutil.rmtree(verify_root, ignore_errors=True)
+
+    def _flag_submit(
+        self,
+        session: Session,
+        project_id: str,
+        request: dict[str, Any],
+        worker_id: str | None,
+        intent_id: str | None,
+        attempt_id: str | None,
+    ) -> ToolResult:
+        try:
+            validated = FlagSubmitRequest.model_validate(request)
+        except ValidationError as exc:
+            return self._tool_error_result(
+                session,
+                project_id,
+                "flag.submit",
+                request,
+                worker_id,
+                intent_id,
+                attempt_id,
+                f"invalid flag.submit request: {exc.errors(include_url=False)}",
+            )
+        outcome = FlagSubmissionService().submit(
+            session,
+            project_id=project_id,
+            candidate_id=validated.candidate_id.strip(),
+            adapter=self.competition_adapter,
+            worker_id=worker_id,
+            intent_id=intent_id,
+            attempt_id=attempt_id,
+        )
+        executed = outcome.status in {"accepted", "partial", "rejected"}
+        candidate = session.get(FlagCandidate, outcome.candidate_id) if outcome.candidate_id else None
+        artifact_refs = list(candidate.artifact_refs) if candidate is not None else []
+        trace = ToolTrace(
+            project_id=project_id,
+            worker_id=worker_id,
+            intent_id=intent_id,
+            attempt_id=attempt_id,
+            tool_name="flag.submit",
+            request_json={"candidate_id": validated.candidate_id.strip()},
+            policy_decision="allow" if executed else "execution_error",
+            exit_code=0 if executed else 1,
+            summary=outcome.summary,
+            artifact_refs=artifact_refs,
+        )
+        session.add(trace)
+        session.commit()
+        session.refresh(trace)
+        metrics = {
+            "status": outcome.status,
+            "candidate_id": outcome.candidate_id,
+            "accepted": outcome.accepted,
+            "completed": outcome.completed,
+            "detail": outcome.detail,
+            "backend": "competition-adapter",
+        }
+        return ToolResult(executed, outcome.summary, artifact_refs, metrics, [] if executed else [outcome.summary], trace.id)
 
     def _verification_failure(
         self,
@@ -612,6 +734,41 @@ class CapabilityGateway:
         session.commit()
         session.refresh(trace)
         return ToolResult(True, summary, [artifact.id], {"stub": True}, [], trace.id)
+
+    def _capability_request_unsupported(
+        self,
+        session: Session,
+        project_id: str,
+        request: dict[str, Any],
+        worker_id: str | None,
+        intent_id: str | None,
+        attempt_id: str | None,
+    ) -> ToolResult:
+        reason = "capability.request is disabled; additional runtime capabilities require an operator escalation and a rebuilt worker image."
+        trace = ToolTrace(
+            project_id=project_id,
+            worker_id=worker_id,
+            intent_id=intent_id,
+            attempt_id=attempt_id,
+            tool_name="capability.request",
+            request_json=request,
+            policy_decision="deny",
+            summary=reason,
+        )
+        session.add(trace)
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                worker_id=worker_id,
+                intent_id=intent_id,
+                attempt_id=attempt_id,
+                event_type="operator.escalated",
+                payload_json={"reason": "capability_request_denied", "request": request},
+            )
+        )
+        session.commit()
+        session.refresh(trace)
+        return ToolResult(False, reason, [], {"backend": "policy"}, [reason], trace.id)
 
     def _deny_reason(self, command: str, cwd: Path) -> str | None:
         if not command:

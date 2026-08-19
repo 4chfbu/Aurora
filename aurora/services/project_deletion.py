@@ -15,6 +15,8 @@ from aurora.models import (
     ChallengeGroupItem,
     ContextSnapshot,
     DiscoveredTarget,
+    EvaluationItemResult,
+    EvaluationRun,
     Fact,
     Finding,
     FlagCandidate,
@@ -97,6 +99,10 @@ class ProjectDeletionService:
             session.delete(event)
         for item in session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id)).all():
             session.delete(item)
+        for run in session.exec(select(EvaluationRun).where(EvaluationRun.group_id == group_id)).all():
+            run.group_id = None
+            run.status = "DELETED"
+            session.add(run)
         session.delete(group)
         session.commit()
         return {"group_id": group_id, "deleted_project_ids": deleted_projects}
@@ -115,6 +121,10 @@ class ProjectDeletionService:
             candidate.project_id = None
             candidate.confirmed = False
             session.add(candidate)
+        for result in session.exec(select(EvaluationItemResult).where(EvaluationItemResult.project_id == project_id)).all():
+            result.project_id = None
+            result.status = "DELETED"
+            session.add(result)
 
         artifacts = session.exec(select(Artifact).where(Artifact.project_id == project_id)).all()
         for artifact in artifacts:
