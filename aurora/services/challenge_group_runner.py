@@ -52,8 +52,6 @@ class ChallengeGroupRunner:
     def _competition_for(self, item: ChallengeGroupItem | None) -> CompetitionAdapter:
         platform = competition_platform(item)
         if platform == "tsecbench" and isinstance(self.competition, LocalCompetitionAdapter):
-            if not get_settings().tsecbench_configured:
-                return self.competition
             if self._tsecbench_competition is None:
                 self._tsecbench_competition = TSecBenchCompetitionAdapter()
             return self._tsecbench_competition
@@ -220,7 +218,7 @@ class ChallengeGroupRunner:
                         environment_warning = health.reason or "environment_unavailable"
                 except Exception as exc:
                     environment_warning = str(exc)[:1000] or type(exc).__name__
-                    self._release_slab_environment_after_turn(session, item=item)
+                    self._release_managed_environment_after_failed_start(session, item=item)
                 if environment_warning:
                     self._event(
                         session,
@@ -250,10 +248,25 @@ class ChallengeGroupRunner:
                 session.commit()
                 try:
                     result = self.harvester.run(session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
-                finally:
-                    self._release_slab_environment_after_turn(session, item=item)
+                except Exception as exc:
+                    # A provider/runtime parser failure belongs to this
+                    # challenge attempt.  Let the phase scheduler retry or
+                    # retire the item instead of aborting the whole group.
+                    reason = self._runtime_exception_reason(exc)
+                    self._interrupt_project_execution(session, project_id=project.id, reason=reason)
+                    outcome = "CRASHED"
+                    result = None
+                    self._event(
+                        session,
+                        group_id,
+                        item.id,
+                        "group.item.solver_crashed",
+                        {"project_id": project.id, "phase": item.phase, "error": reason},
+                    )
                 project = session.get(Project, project.id)
-                if project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
+                if result is None:
+                    pass
+                elif project is not None and project.status in {"COMPLETED", "FLAG_READY"}:
                     outcome, reason = ("COMPLETED" if project.status == "COMPLETED" else "CANDIDATE_READY"), result.reason
                 else:
                     outcome, reason = self._failure_outcome(result.status), result.reason
@@ -370,7 +383,7 @@ class ChallengeGroupRunner:
                                 warning = health.reason or "environment_unavailable"
                         except Exception as exc:
                             warning = str(exc)[:1000]
-                            self._release_slab_environment_after_turn(worker_session, item=current)
+                            self._release_managed_environment_after_failed_start(worker_session, item=current)
                         if warning and self._is_managed_platform_item(current):
                             platform = competition_platform(current)
                             current.fused_status = "WAITING_INPUT"
@@ -387,10 +400,7 @@ class ChallengeGroupRunner:
                         task = self._task_payload(worker_session, item=current, project=project)
                         self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
                         worker_session.commit()
-                        try:
-                            result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=self._autorun_limits(current), should_stop=should_stop)
-                        finally:
-                            self._release_slab_environment_after_turn(worker_session, item=current)
+                        result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=self._autorun_limits(current), should_stop=should_stop)
                         project = worker_session.get(Project, project.id)
                         outcome, reason = (("COMPLETED" if project and project.status == "COMPLETED" else "CANDIDATE_READY", result.reason) if project and project.status in {"COMPLETED", "FLAG_READY"} else (self._failure_outcome(result.status), result.reason))
                     current_group = worker_session.get(ChallengeGroup, group_id)
@@ -399,9 +409,22 @@ class ChallengeGroupRunner:
                     return item_id, outcome, reason
 
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"aurora-group-{group_id}") as pool:
-                futures = [pool.submit(run_item, item_id) for item_id, _ in dispatch]
+                futures = {pool.submit(run_item, item_id): item_id for item_id, _ in dispatch}
                 for future in as_completed(futures):
-                    future.result()
+                    item_id = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        # Each worker owns an independent Session, so recover
+                        # with another fresh Session even when the failed one
+                        # was left in a transaction-error state.
+                        with Session(engine) as recovery_session:
+                            self._recover_crashed_item(
+                                recovery_session,
+                                group_id=group_id,
+                                item_id=item_id,
+                                error=exc,
+                            )
             session.expire_all()
 
     @staticmethod
@@ -409,10 +432,10 @@ class ChallengeGroupRunner:
         evaluation = str((item.competition_meta or {}).get("provenance") or "") == "evaluation_snapshot"
         evaluation_minutes = {1: 5, 2: 20, 3: 25}
         return AutoRunLimits(
-            # One full Solver turn per competition phase. The group scheduler
-            # owns retries; nesting another 8-12 turn planning loop here made
-            # Observer/Manager state compete with the model's own solve loop.
-            max_iterations=1,
+            # A phase is bounded by its deadline, not by an arbitrary number
+            # of Solver turns. AutoRunner treats zero as unlimited and still
+            # stops for completion, runtime failures, manual stop, or timeout.
+            max_iterations=0,
             # The Worker hard timeout is clamped to the same phase envelope in
             # _apply_phase_attempt_budget, so this outer deadline is effective
             # even while a model turn is still running.
@@ -524,8 +547,9 @@ class ChallengeGroupRunner:
                     {"project_id": item.project_id, "error": str(exc)[:1000]},
                 )
 
-    def _release_slab_environment_after_turn(self, session: Session, *, item: ChallengeGroupItem) -> None:
-        if competition_platform(item) != "slab_match":
+    def _release_managed_environment_after_failed_start(self, session: Session, *, item: ChallengeGroupItem) -> None:
+        platform = competition_platform(item)
+        if platform not in {"tsecbench", "slab_match"}:
             return
         try:
             self._close_environment(self._competition_for(item), session, project_id=item.project_id)
@@ -534,7 +558,7 @@ class ChallengeGroupRunner:
                 item.group_id,
                 item.id,
                 "group.item.environment_closed",
-                {"project_id": item.project_id, "reason": "solver_turn_finished"},
+                {"project_id": item.project_id, "platform": platform, "reason": "environment_start_failed"},
             )
             session.commit()
         except Exception as exc:
@@ -543,9 +567,152 @@ class ChallengeGroupRunner:
                 item.group_id,
                 item.id,
                 "group.item.environment_cleanup_failed",
-                {"project_id": item.project_id, "reason": "solver_turn_finished", "error": str(exc)[:1000]},
+                {"project_id": item.project_id, "platform": platform, "reason": "environment_start_failed", "error": str(exc)[:1000]},
             )
             session.commit()
+
+    def _release_managed_environment_after_phase(
+        self,
+        session: Session,
+        *,
+        item: ChallengeGroupItem,
+        executed_phase: int,
+        outcome: str,
+    ) -> None:
+        """Release a platform target only after its phase state is resolved."""
+        platform = competition_platform(item)
+        if platform not in {"tsecbench", "slab_match"}:
+            return
+        active_workers = session.exec(
+            select(Worker).where(Worker.project_id == item.project_id, Worker.status == "RUNNING")
+        ).all()
+        if active_workers:
+            self._event(
+                session,
+                item.group_id,
+                item.id,
+                "group.item.environment_release_deferred",
+                {
+                    "project_id": item.project_id,
+                    "platform": platform,
+                    "reason": "active_workers",
+                    "worker_ids": [worker.id for worker in active_workers],
+                    "phase": executed_phase,
+                    "outcome": outcome,
+                },
+            )
+            return
+        try:
+            self._close_environment(self._competition_for(item), session, project_id=item.project_id)
+            self._event(
+                session,
+                item.group_id,
+                item.id,
+                "group.item.environment_closed",
+                {
+                    "project_id": item.project_id,
+                    "platform": platform,
+                    "reason": "phase_finished",
+                    "phase": executed_phase,
+                    "outcome": outcome,
+                },
+            )
+        except Exception as exc:
+            self._event(
+                session,
+                item.group_id,
+                item.id,
+                "group.item.environment_cleanup_failed",
+                {
+                    "project_id": item.project_id,
+                    "platform": platform,
+                    "reason": "phase_finished",
+                    "phase": executed_phase,
+                    "outcome": outcome,
+                    "error": str(exc)[:1000],
+                },
+            )
+
+    @staticmethod
+    def _runtime_exception_reason(exc: Exception) -> str:
+        detail = str(exc).strip() or type(exc).__name__
+        return f"solver_runtime_exception: {type(exc).__name__}: {detail}"[:1000]
+
+    @staticmethod
+    def _interrupt_project_execution(session: Session, *, project_id: str, reason: str) -> None:
+        """Make a crashed Solver attempt safely resumable."""
+        stop_project_containers(project_id)
+        workers = session.exec(
+            select(Worker).where(Worker.project_id == project_id, Worker.status == "RUNNING")
+        ).all()
+        attempts = session.exec(
+            select(Attempt).where(Attempt.project_id == project_id, Attempt.status == "RUNNING")
+        ).all()
+        intents = session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "RUNNING")
+        ).all()
+        for worker in workers:
+            worker.status = "INTERRUPTED"
+            worker.lease = {}
+            worker.heartbeat = now_utc()
+            worker.updated_at = now_utc()
+            session.add(worker)
+        for attempt in attempts:
+            attempt.status = "INTERRUPTED"
+            attempt.failure_reason = reason
+            attempt.finished_at = now_utc()
+            session.add(attempt)
+        for intent in intents:
+            intent.status = "PENDING"
+            intent.lease_owner = None
+            intent.lease_expires_at = None
+            intent.updated_at = now_utc()
+            session.add(intent)
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                event_type="project.recovered_after_solver_crash",
+                payload_json={
+                    "reason": reason,
+                    "workers": [worker.id for worker in workers],
+                    "attempts": [attempt.id for attempt in attempts],
+                    "intents": [intent.id for intent in intents],
+                },
+            )
+        )
+
+    def _recover_crashed_item(
+        self,
+        session: Session,
+        *,
+        group_id: str,
+        item_id: str,
+        error: Exception,
+    ) -> None:
+        """Contain a concurrent Solver exception to its challenge item."""
+        group = session.get(ChallengeGroup, group_id)
+        item = session.get(ChallengeGroupItem, item_id)
+        if group is None or item is None or item.fused_status != "RUNNING":
+            return
+        project = session.get(Project, item.project_id)
+        reason = self._runtime_exception_reason(error)
+        if project is not None:
+            self._interrupt_project_execution(session, project_id=project.id, reason=reason)
+        self._event(
+            session,
+            group_id,
+            item_id,
+            "group.item.solver_crashed",
+            {"project_id": item.project_id, "phase": item.phase, "error": reason},
+        )
+        self._resolve_phase(
+            session,
+            group=group,
+            item=item,
+            project=project,
+            outcome="CRASHED",
+            reason=reason,
+        )
 
     @classmethod
     def _reactivate_waiting_inputs(cls, session: Session, *, group_id: str) -> None:
@@ -741,12 +908,16 @@ class ChallengeGroupRunner:
         group.updated_at = now_utc()
         session.add(item)
         session.add(group)
-        if item.fused_status in {"COMPLETED", "FAILED"}:
-            try:
-                self._close_environment(self._competition_for(item), session, project_id=item.project_id)
-            except Exception as exc:
-                self._event(session, group.id, item.id, "group.item.environment_cleanup_failed", {"project_id": item.project_id, "error": str(exc)[:1000]})
         self._event(session, group.id, item.id, "group.item.phase_finished", {"project_id": item.project_id, "outcome": outcome, "reason": reason, "phase": executed_phase, "next_phase": None if item.fused_status in {"COMPLETED", "FAILED"} else item.phase, "fused_status": item.fused_status})
+        # Target lifetime belongs to the phase, not an individual Worker
+        # invocation. At this point the item has left RUNNING and all phase
+        # output (including flag submission) has been folded into its state.
+        self._release_managed_environment_after_phase(
+            session,
+            item=item,
+            executed_phase=executed_phase,
+            outcome=outcome,
+        )
         session.commit()
 
     def _submit_pending_flag(self, session: Session, *, item: ChallengeGroupItem) -> bool | None | CompetitionSubmissionResult:
@@ -943,7 +1114,9 @@ def recover_interrupted_groups(session: Session) -> list[str]:
 
     Group workers run in daemon threads, whose state is intentionally local to
     the API process.  A restart used to leave the database row for the active
-    item in ``RUNNING`` forever even though no thread could finish it.
+    item in ``RUNNING`` forever even though no thread could finish it.  Older
+    runners also marked the whole group ``FAILED`` after one concurrent item
+    crashed; those explicitly recovered pending items are safe to resume too.
     """
     recovered_groups: set[str] = set()
     running_items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.status == "RUNNING")).all()
@@ -1005,6 +1178,32 @@ def recover_interrupted_groups(session: Session) -> list[str]:
             item.id,
             "group.item.recovered_after_api_restart",
             {"project_id": project.id, "new_status": item.status},
+        )
+        recovered_groups.add(group.id)
+
+    failed_groups = session.exec(
+        select(ChallengeGroup).where(ChallengeGroup.status == "FAILED")
+    ).all()
+    for group in failed_groups:
+        items = session.exec(
+            select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group.id)
+        ).all()
+        if not any(
+            item.fused_status == "PENDING" and item.stop_reason == "recovered_after_runner_failure"
+            for item in items
+        ):
+            continue
+        group.status = "READY"
+        group.current_item_id = None
+        group.finished_at = None
+        group.updated_at = now_utc()
+        session.add(group)
+        ChallengeGroupRunner._event(
+            session,
+            group.id,
+            None,
+            "group.recovered_after_runner_failure",
+            {"pending_items": sum(item.fused_status == "PENDING" for item in items)},
         )
         recovered_groups.add(group.id)
     session.commit()
@@ -1086,60 +1285,25 @@ def recover_legacy_target_blocked_groups(session: Session) -> list[str]:
 
 
 def fail_group_run(session: Session, *, group_id: str, error: str) -> None:
-    """Persist a runner failure without leaving its active item or lease live."""
+    """Persist a runner failure without leaving active items or leases live."""
     group = session.get(ChallengeGroup, group_id)
     if group is None:
         return
 
-    item = session.get(ChallengeGroupItem, group.current_item_id) if group.current_item_id else None
-    if item is None:
-        item = session.exec(
-            select(ChallengeGroupItem).where(
-                ChallengeGroupItem.group_id == group_id,
-                ChallengeGroupItem.status == "RUNNING",
-            )
-        ).first()
-
-    if item is not None and item.status == "RUNNING":
+    # ``current_item_id`` can represent only one item, while TSecBench runs up
+    # to three. Recover every active row so a group-level infrastructure fault
+    # cannot strand the other concurrent projects forever.
+    running_items = session.exec(
+        select(ChallengeGroupItem).where(
+            ChallengeGroupItem.group_id == group_id,
+            ChallengeGroupItem.status == "RUNNING",
+        )
+    ).all()
+    for item in running_items:
         project = session.get(Project, item.project_id)
         if project is not None:
-            stop_project_containers(project.id)
-            workers = session.exec(
-                select(Worker).where(Worker.project_id == project.id, Worker.status == "RUNNING")
-            ).all()
-            attempts = session.exec(
-                select(Attempt).where(Attempt.project_id == project.id, Attempt.status == "RUNNING")
-            ).all()
-            intents = session.exec(
-                select(Intent).where(Intent.project_id == project.id, Intent.status == "RUNNING")
-            ).all()
-            for worker in workers:
-                worker.status = "INTERRUPTED"
-                worker.lease = {}
-                worker.heartbeat = now_utc()
-                worker.updated_at = now_utc()
-                session.add(worker)
-            for attempt in attempts:
-                attempt.status = "INTERRUPTED"
-                attempt.failure_reason = "Challenge group runner failed; recovered for retry."
-                attempt.finished_at = now_utc()
-                session.add(attempt)
-            for intent in intents:
-                intent.status = "PENDING"
-                intent.lease_owner = None
-                intent.lease_expires_at = None
-                intent.updated_at = now_utc()
-                session.add(intent)
-            session.add(
-                WorkerEvent(
-                    project_id=project.id,
-                    event_type="project.recovered_after_runner_failure",
-                    payload_json={
-                        "workers": [worker.id for worker in workers],
-                        "attempts": [attempt.id for attempt in attempts],
-                    },
-                )
-            )
+            reason = f"Challenge group runner failed; recovered for retry: {error[:500]}"
+            ChallengeGroupRunner._interrupt_project_execution(session, project_id=project.id, reason=reason)
         item.status = "PENDING"
         item.fused_status = "PENDING"
         item.started_at = None

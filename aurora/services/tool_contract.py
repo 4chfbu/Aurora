@@ -6,10 +6,12 @@ from aurora.config import Settings
 # they need isolated replay, secrets, or browser session control.
 SERVER_GATE_TOOLS = frozenset({"flag.verify", "flag.submit", "fofa.search", "browser.interact"})
 
-# Network actions remain gateway-routed until egress authorization is enforced
-# at the container/network layer. Until then, native shell must not be
-# allowed to bypass the per-request authorization policy.
+# Network actions may still be gateway-routed in `native_privileged`/legacy mode.
+# In `kali_shell` mode they are executed directly inside the Kali Worker
+# container through Codex's native shell.
 POLICY_GATE_TOOLS = frozenset({"http.request", "network.scan", "web.enumerate"})
+
+KALI_SHELL_TOOL_CONTRACTS = frozenset({"kali_shell", "native_shell"})
 
 BLACKBOARD_FALLBACK_TOOL = "blackboard.query"
 
@@ -23,7 +25,9 @@ def is_codex_runtime(worker_runtime: str) -> bool:
 
 
 def native_visible_tool_names(settings: Settings) -> frozenset[str]:
-    names = set(SERVER_GATE_TOOLS) | set(POLICY_GATE_TOOLS)
+    names = set(SERVER_GATE_TOOLS)
+    if settings.tool_contract.strip().lower() not in KALI_SHELL_TOOL_CONTRACTS:
+        names |= set(POLICY_GATE_TOOLS)
     if settings.native_allow_blackboard_query:
         names.add(BLACKBOARD_FALLBACK_TOOL)
     return frozenset(names)

@@ -92,7 +92,7 @@ class CreateProjectRequest(BaseModel):
 
 
 class SolveProjectRequest(CreateProjectRequest):
-    max_iterations: int = 20
+    max_iterations: int = 0
     max_minutes: int = 0
     no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True
@@ -155,7 +155,7 @@ class BrowserSessionRequest(BaseModel):
 
 
 class AutoRunRequest(BaseModel):
-    max_iterations: int = 20
+    max_iterations: int = 0
     max_minutes: int = 0
     no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True

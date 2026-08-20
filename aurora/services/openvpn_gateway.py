@@ -277,21 +277,8 @@ class OpenVPNGatewayRegistry:
             self._cleanup_runtime()
             try:
                 self._start_container(setting.routes)
-                # OpenVPN 2.6 defaults to a 60-second TLS handshake window.
-                # Cutting the container off at the former 30-second default
-                # caused valid UDP profiles to fail during ordinary retransmit
-                # delays immediately after successful certificate validation.
-                connect_timeout = max(60, get_settings().openvpn_connect_timeout_seconds)
-                deadline = time.monotonic() + connect_timeout
-                while time.monotonic() < deadline:
-                    if self._healthy(setting.routes):
-                        return self.public_config(session)
-                    if not self._container_running():
-                        break
-                    time.sleep(0.5)
-                logs = self._run(["logs", "--tail", "60", get_settings().openvpn_container_name], timeout=10)
-                raw_logs = (logs.stderr or logs.stdout or "").strip()
-                raise OpenVPNRuntimeError(self._connection_failure_detail(raw_logs, connect_timeout))
+                self._wait_until_healthy(setting.routes)
+                return self.public_config(session)
             except Exception as exc:
                 self._last_error = str(exc)[:1000]
                 self._remove_container()
@@ -336,9 +323,45 @@ class OpenVPNGatewayRegistry:
         with self._lock:
             if not self._desired_connected:
                 return None
-            if not self._container_running() or not self._healthy(self._routes):
-                raise OpenVPNRuntimeError("OpenVPN is enabled but the tunnel is not healthy")
+            running = self._container_running()
+            if not running and self._payload is not None and self._last_error is None:
+                # The gateway container may be removed independently from the
+                # Aurora process (for example by Docker cleanup or a daemon
+                # restart). The decrypted profile is still available in this
+                # process, so restore the requested connection before rejecting
+                # every subsequent Worker preflight.
+                try:
+                    self._remove_container()
+                    self._cleanup_runtime()
+                    self._start_container(self._routes)
+                    self._wait_until_healthy(self._routes)
+                    running = True
+                except Exception as exc:
+                    self._last_error = str(exc)[:1000]
+                    self._remove_container()
+                    self._cleanup_runtime()
+                    if not isinstance(exc, OpenVPNError):
+                        exc = OpenVPNRuntimeError(str(exc))
+                    raise exc
+            if not running or not self._healthy(self._routes):
+                detail = f": {self._last_error}" if self._last_error else ""
+                raise OpenVPNRuntimeError(f"OpenVPN is enabled but the tunnel is not healthy{detail}")
             return f"container:{get_settings().openvpn_container_name}"
+
+    def _wait_until_healthy(self, routes: list[str]) -> None:
+        # OpenVPN 2.6 defaults to a 60-second TLS handshake window. Use the
+        # same envelope for explicit connects and automatic container recovery.
+        connect_timeout = max(60, get_settings().openvpn_connect_timeout_seconds)
+        deadline = time.monotonic() + connect_timeout
+        while time.monotonic() < deadline:
+            if self._healthy(routes):
+                return
+            if not self._container_running():
+                break
+            time.sleep(0.5)
+        logs = self._run(["logs", "--tail", "60", get_settings().openvpn_container_name], timeout=10)
+        raw_logs = (logs.stderr or logs.stdout or "").strip()
+        raise OpenVPNRuntimeError(self._connection_failure_detail(raw_logs, connect_timeout))
 
     def _start_container(self, routes: list[str]) -> None:
         assert self._payload is not None

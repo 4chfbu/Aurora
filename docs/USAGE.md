@@ -234,7 +234,7 @@ Fact 使用 `statement` 保存结论，使用 `evidence_items` 保存支撑结�
 curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/autorun/start \
   -H 'Content-Type: application/json' \
   -d '{
-    "max_iterations": 20,
+    "max_iterations": 0,
     "max_minutes": 0,
     "no_progress_limit": 4,
     "stop_on_observer_escalate": true,
@@ -249,7 +249,7 @@ Web 界面使用后台模式。启动后通过状态接口轮询，或在界面�
 ```bash
 curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/autorun/start \
   -H 'Content-Type: application/json' \
-  -d '{"max_iterations":20,"max_minutes":0,"no_progress_limit":4,"background":true}'
+  -d '{"max_iterations":0,"max_minutes":0,"no_progress_limit":4,"background":true}'
 
 curl -sS http://localhost:8000/api/projects/$PROJECT_ID/autorun/status
 curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/autorun/stop
@@ -272,7 +272,7 @@ Observer 是确定性的，不调用 LLM。它会在最近工具请求被工具�
 
 因此，项目配置不是安全边界。只应对已获授权的目标运行 Aurora，并在部署侧通过容器网络、出站防火墙、VPN 路由或代理白名单强制限制出口；纯附件题可把 `AURORA_CONTAINER_NETWORK` 设为 `none`。附件下载、浏览器、OpenVPN 配置及部分导入路径仍有各自的 SSRF/危险输入检查，但不能替代统一的出口控制。
 
-原生 Codex 运行时的 `tool_requests` 只暴露需要服务端隔离重放、平台凭据、浏览器会话或统一审计的能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`、`http.request`、`network.scan`、`web.enumerate`，外加 `blackboard.query` 退化回退。这里的“服务端门禁”指执行与凭据边界，不表示当前会校验目标授权。`sandbox.exec`、`binary.inspect`、`forensic.inspect` 不再出现在该契约中，本地分析由 Worker 容器内的 Codex shell/MCP 直接完成；这些行仍适用于 `openai_direct` 运行时和手动工具 API。
+默认 `kali_shell` 契约下，`tool_requests` 只暴露无法在 Worker 容器内完成的服务端能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`，外加可选 `blackboard.query` 退化回退。网络侦察由 Worker 容器内的 Kali shell 直接完成，因此 `http.request`、`network.scan`、`web.enumerate` 不再出现在 Codex 原生 `tool_requests`；这些工具仍保留给 `openai_direct`、手动工具 API 和 `native_privileged`/`full_gateway` 切回模式。这里的“服务端门禁”指执行与凭据边界，不表示当前会校验目标授权；项目配置不是安全边界，出口隔离必须由容器网络、防火墙、VPN 或代理白名单承担。
 
 | 工具 | 常用请求字段 | 说明 |
 | --- | --- | --- |

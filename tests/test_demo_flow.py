@@ -4,6 +4,7 @@ from datetime import timedelta
 
 os.environ["AURORA_DB_URL"] = "sqlite:////tmp/aurora_test.db"
 os.environ["AURORA_ARTIFACT_DIR"] = "/tmp/aurora_test_artifacts"
+os.environ["AURORA_TOOL_CONTRACT"] = "native_privileged"
 
 db_path = Path("/tmp/aurora_test.db")
 if db_path.exists():

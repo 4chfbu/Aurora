@@ -44,6 +44,34 @@ def test_codex_native_contract_excludes_local_semantic_tools(monkeypatch) -> Non
     assert "flag.submit" in visible
 
 
+def test_codex_kali_shell_contract_keeps_only_server_gates(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    monkeypatch.setenv("AURORA_TOOL_CONTRACT", "kali_shell")
+    monkeypatch.setenv("AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY", "false")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    names = tools_for_runtime(settings)
+    assert names is not None
+    assert {
+        "flag.verify",
+        "flag.submit",
+    } <= names
+    assert "http.request" not in names
+    assert "network.scan" not in names
+    assert "web.enumerate" not in names
+    assert "sandbox.exec" not in names
+    assert "binary.inspect" not in names
+    assert "forensic.inspect" not in names
+
+    visible = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False)}
+    assert "flag.verify" in visible
+    assert "flag.submit" in visible
+    assert "http.request" not in visible
+    assert "network.scan" not in visible
+    assert "web.enumerate" not in visible
+
+
 def test_codex_native_contract_subagent_still_visible_when_enabled(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
     monkeypatch.setenv("AURORA_TOOL_CONTRACT", "native_privileged")

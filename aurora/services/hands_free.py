@@ -317,7 +317,7 @@ class HandsFreeService:
         group = ChallengeGroup(
             import_batch_id=batch_id,
             name=(batch.title or f"Imported batch {batch_id[-8:]}")[:240],
-            limits={"max_iterations": 20, "max_minutes": 0, "no_progress_limit": 4, "stop_on_observer_escalate": True},
+            limits={"max_iterations": 0, "max_minutes": 0, "no_progress_limit": 4, "stop_on_observer_escalate": True},
             # TSecBench targets are allocated lazily when an item is
             # dispatched.  The platform permits a small bounded pool rather
             # than requiring every imported challenge to own a target.

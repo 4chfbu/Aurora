@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlmodel import Session, select
 
 from aurora.models import Artifact, FlagCandidate, Intent, ToolTrace, WorkerEvent
@@ -41,7 +41,14 @@ class FlagVerifyRequest(BaseModel):
 class FlagSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    candidate_id: str = Field(min_length=1, max_length=128)
+    candidate_id: str | None = Field(default=None, min_length=1, max_length=128)
+    value: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _require_one_submission_target(self):
+        if bool(self.candidate_id) == bool(self.value):
+            raise ValueError("flag.submit requires exactly one of candidate_id or value")
+        return self
 
 
 @dataclass
@@ -394,7 +401,8 @@ class CapabilityGateway:
         outcome = FlagSubmissionService().submit(
             session,
             project_id=project_id,
-            candidate_id=validated.candidate_id.strip(),
+            candidate_id=validated.candidate_id.strip() if validated.candidate_id else None,
+            value=validated.value.strip() if validated.value else None,
             adapter=self.competition_adapter,
             worker_id=worker_id,
             intent_id=intent_id,
@@ -403,13 +411,18 @@ class CapabilityGateway:
         executed = outcome.status in {"accepted", "partial", "rejected"}
         candidate = session.get(FlagCandidate, outcome.candidate_id) if outcome.candidate_id else None
         artifact_refs = list(candidate.artifact_refs) if candidate is not None else []
+        submitted_with = (
+            {"candidate_id": validated.candidate_id.strip()}
+            if validated.candidate_id
+            else {"value": validated.value.strip()}
+        )
         trace = ToolTrace(
             project_id=project_id,
             worker_id=worker_id,
             intent_id=intent_id,
             attempt_id=attempt_id,
             tool_name="flag.submit",
-            request_json={"candidate_id": validated.candidate_id.strip()},
+            request_json=submitted_with,
             policy_decision="allow" if executed else "execution_error",
             exit_code=0 if executed else 1,
             summary=outcome.summary,
@@ -649,9 +662,24 @@ class CapabilityGateway:
         if tool_name == "http.request":
             url = self._safe_url(str(request.get("url", "")))
             method = str(request.get("method", "GET")).upper()
-            if method not in {"GET", "HEAD", "OPTIONS"}:
-                raise ValueError("http.request MVP only allows GET, HEAD, and OPTIONS")
-            return f"curl -i -L --max-time 10 -X {method} {self._quote(url)}"
+            if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
+                raise ValueError("http.request does not support this HTTP method")
+            parts = [f"curl -i -L --max-time 10 -X {method}", self._quote(url)]
+            headers = request.get("headers")
+            if isinstance(headers, dict):
+                for name, value in headers.items():
+                    parts.append(f"-H {self._quote(f'{name}: {value}')}")
+            body = request.get("body")
+            data = request.get("data")
+            if body is not None:
+                payload = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+                parts.append(f"--data-binary {self._quote(payload)}")
+            elif isinstance(data, dict):
+                for name, value in data.items():
+                    parts.append(f"--data-urlencode {self._quote(f'{name}={value}')}")
+            elif data is not None:
+                parts.append(f"--data-raw {self._quote(str(data))}")
+            return " ".join(parts)
 
         if tool_name == "network.scan":
             target = self._safe_target(str(request.get("target", "")))

@@ -10,6 +10,7 @@ from aurora.api import create_app
 from aurora.services.openvpn_gateway import (
     OpenVPNGatewayRegistry,
     OpenVPNLocked,
+    OpenVPNRuntimeError,
     normalize_routes,
     validate_ovpn,
 )
@@ -139,6 +140,31 @@ def test_gateway_command_is_isolated_and_routes_only_selected_networks() -> None
         assert ((gateway._runtime_dir / "auth.txt").stat().st_mode & 0o777) == 0o644
     finally:
         gateway._cleanup_runtime()
+
+
+def test_worker_network_recovers_when_requested_gateway_container_disappears() -> None:
+    gateway = FakeGateway()
+    gateway._payload = {"ovpn": PROFILE.decode(), "username": "", "password": ""}
+    gateway._routes = ["10.20.0.0/16"]
+    gateway._desired_connected = True
+
+    assert gateway.worker_network() == "container:aurora-openvpn"
+    assert gateway.running is True
+    assert len([command for command in gateway.commands if command[:2] == ["run", "-d"]]) == 1
+    gateway._cleanup_runtime()
+
+
+def test_worker_network_does_not_retry_a_known_connection_failure() -> None:
+    gateway = FakeGateway()
+    gateway._payload = {"ovpn": PROFILE.decode(), "username": "", "password": ""}
+    gateway._routes = ["10.20.0.0/16"]
+    gateway._desired_connected = True
+    gateway._last_error = "OpenVPN authentication failed"
+
+    with pytest.raises(OpenVPNRuntimeError, match="OpenVPN authentication failed"):
+        gateway.worker_network()
+
+    assert not any(command[:2] == ["run", "-d"] for command in gateway.commands)
 
 
 def test_auth_profile_requires_web_credentials() -> None:

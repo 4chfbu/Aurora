@@ -302,19 +302,29 @@ class TSecBenchCompetitionAdapter:
         return value
 
     def close_environment(self, *, project_id: str, session: Session | None = None) -> None:
-        # The runner has no Session in this protocol method. It resolves the
-        # unique code from the project metadata through a short-lived session.
-        code = self._codes.get(project_id)
-        if not code:
+        if session is None:
             from aurora.db import engine
-            with Session(engine) as session:
-                item = self._item(session, project_id)
-                code = self._code(item)
-        self.client.close(code)
-        self._codes.pop(project_id, None)
-        if session is not None:
-            item = self._item(session, project_id)
-            meta = dict(item.competition_meta or {})
+            with Session(engine) as owned_session:
+                try:
+                    self.close_environment(project_id=project_id, session=owned_session)
+                finally:
+                    owned_session.commit()
+            return
+
+        item = self._item(session, project_id)
+        meta = dict(item.competition_meta or {})
+        code = self._codes.get(project_id) or self._code(item)
+        # Cleanup may be requested both at the end of the Solver turn and
+        # again when the phase becomes terminal. Keep it idempotent so a
+        # successful release cannot turn into a spurious platform error.
+        try:
+            if self._running(meta.get("container_status")) or bool(self._addresses(meta.get("container_addr"))):
+                self.client.close(code)
+        finally:
+            # Platform close failures must still clear the local "available"
+            # state. Otherwise the capacity check keeps counting a released or
+            # dead challenge as occupied and later projects remain blocked.
+            self._codes.pop(project_id, None)
             meta["container_status"] = "stopped"
             meta["container_addr"] = []
             item.competition_meta = meta

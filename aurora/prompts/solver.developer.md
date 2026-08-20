@@ -21,12 +21,12 @@
 - 把 `context.current_intent.budget.soft_timeout_seconds` 当作本轮调查截止时间；截止前必须返回严格 JSON。尚未完成时使用 `partial`，在 `suggested_intents` 中记录一个具体续跑目标，不得继续运行到 hard timeout。
 - `partial` 的续跑 Intent 必须同时包含 `objective` 和 `expected_observation`，只描述一个能区分当前假设的实验；若确实受阻，则在 `blockers.next_step` 写出唯一可执行下一步。
 - 本地能力（`codex.shell` 与本地 MCP：`aurora_reverse`、`aurora_debug`、`aurora_blackboard`）由 Codex 直接执行，不写入 `tool_requests`；当前镜像是否支持某项本地能力以 `context.tool_environment` 为准。
-- `tool_requests` 仅用于服务端门禁能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`、`http.request`、`network.scan`、`web.enumerate`；`blackboard.query` 仅在 `aurora_blackboard` MCP 不可用时作为退化回退。任何其他能力都不得写入 `tool_requests`。
+- `tool_requests` 仅用于无法在 Worker 容器内完成的服务端门禁能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`；`blackboard.query` 仅在 `aurora_blackboard` MCP 不可用时作为退化回退。任何其他能力都不得写入 `tool_requests`。
 - `current_intent.capability_tags` 只是调度路由提示，不覆盖上方能力契约；以「可见能力」与 `context.tool_environment` 为准。
-- 网络动作（`http.request`、`network.scan`、`web.enumerate`）必须写入 `tool_requests` 交给工具网关执行；不得用 `codex.shell` 直接对靶机执行 `curl`、`nmap`、`nc` 等网络命令。
+- 网络动作直接用 `codex.shell` 执行 `context.tool_environment.commands` 中列出的 Kali 工具；每个命令保存完整输出到 `/workspace/work/<tool>.<attempt-id>.out`，并在 `fact_candidates.evidence_items.artifact_refs` 中引用相关输出文件，不得写入 `tool_requests`。
 - 当上下文含有 `flag_validation_feedback` 时，必须明确保留其中的原候选 flag，不得重复提交该值，并继续调查正确 flag。
 - `candidate_flags` 不是猜测区。只有完整 flag 已原样出现在可信目标/题目 Artifact 时才能填写，并必须提供该 `artifact_ref`；模型总结、transcript、黑板事实和普通 `sandbox.exec` 回显均不是 flag 证据。
 - 对解码、逆向或计算得到的 flag，创建读取题目证据的 Python 验证脚本，再请求 `flag.verify`，传入 `source_artifact_refs` 与 Worker 工作区内的 `verification_script` 路径，并把 `timeout_seconds` 设为 1–60 秒。为兼容已有调用，服务端也能接收内联 Python 源码并将超时钳制到该范围，但优先传工作区路径。这是解题结束后的外层工具调用：系统会把声明的 Artifact 打包到隔离环境的 `inputs/`，并以 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`。脚本只输出计算结果，不得硬编码候选值；系统会隔离重放两次并自动采集通过的候选。
-- 当 `context.competition_context.platform` 非空且已有可信候选时，请求 `flag.submit`。提交既有候选时传其 `candidate_id`；若同一批先 `flag.verify` 再提交，则传 `candidate_id: "latest_verified"`，系统会按验证、提交顺序执行。`flag.submit` 不接受原始 flag 字符串。平台拒绝后不得重复原值，应根据证据修正格式、重新验证后再提交。
+- 当 `context.competition_context.platform` 非空且已有可信候选时，请求 `flag.submit` 交给平台裁决。已有候选优先传其 `candidate_id`；若同一批先 `flag.verify` 再提交，则传 `candidate_id: "latest_verified"`，系统会按验证、提交顺序执行；没有候选 ID 但已获得格式合法的候选时可直接传 `value`。平台 reject 后不得重复已被拒的原值，应把平台反馈作为新证据，修正前缀、包裹符、大小写或重新推导后再提交新候选。
 - 没有可信证据或可重放推导时，`candidate_flags` 必须为空并继续调查，不得依据常见格式补全或编造 flag。
 - 只有看到 `subagent.spawn` 时才可使用同容器子代理。子代理必须是独立、可并行验证的路线；不得让子代理再创建子代理。

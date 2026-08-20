@@ -312,7 +312,14 @@ class CodexHarnessRuntime:
                 soft_timeout_seconds=worker.budgets.get("soft_timeout_seconds"),
                 finalize_grace_seconds=worker.budgets.get("finalize_grace_seconds"),
                 runner=runner,
-                on_output=lambda stream, line: self._record_codex_event(session, worker=worker, attempt=attempt, stream=stream, line=line),
+                on_output=lambda stream, line: self._record_codex_event(
+                    session,
+                    worker=worker,
+                    attempt=attempt,
+                    stream=stream,
+                    line=line,
+                    artifact_store=self.artifact_store,
+                ),
             )
         finally:
             if attempt is not None:
@@ -580,7 +587,15 @@ class CodexHarnessRuntime:
         return skipped
 
     @staticmethod
-    def _record_codex_event(session: Session, *, worker: Worker, attempt: Attempt | None, stream: str, line: str) -> str | None:
+    def _record_codex_event(
+        session: Session,
+        *,
+        worker: Worker,
+        attempt: Attempt | None,
+        stream: str,
+        line: str,
+        artifact_store: ArtifactStore | None = None,
+    ) -> str | None:
         if attempt is None:
             return None
         if stream == "control":
@@ -615,6 +630,28 @@ class CodexHarnessRuntime:
                 exit_code = None
             cwd = str(item.get("cwd") or event.get("cwd") or "")[:300]
             raw_output = str(item.get("aggregated_output") or item.get("output") or event.get("output") or "")
+            artifact_refs: list[str] = []
+            if artifact_store is not None and raw_output.strip():
+                origin_kind = (
+                    "target_observation"
+                    if CodexHarnessRuntime._is_network_shell_command(command)
+                    else "model_output"
+                )
+                try:
+                    shell_artifact = artifact_store.write_text(
+                        session,
+                        project_id=worker.project_id,
+                        source_attempt_id=attempt.id if attempt is not None else None,
+                        content=raw_output,
+                        summary=f"codex.shell {command[:120]} exit={exit_code}",
+                        artifact_type="terminal",
+                        origin_kind=origin_kind,
+                    )
+                    artifact_refs = [shell_artifact.id]
+                except Exception:
+                    # Streaming event accounting must not kill the Codex worker
+                    # because an output could not be persisted.
+                    artifact_refs = []
             trace = ToolTrace(
                 project_id=worker.project_id,
                 worker_id=worker.id,
@@ -626,6 +663,7 @@ class CodexHarnessRuntime:
                 cwd=cwd or None,
                 exit_code=exit_code,
                 summary=raw_output[-1000:] or None,
+                artifact_refs=artifact_refs,
             )
             session.add(trace)
             session.flush()
@@ -720,7 +758,12 @@ class CodexHarnessRuntime:
                 },
             )
         )
-        session.commit()
+        try:
+            session.commit()
+        except Exception:
+            # Streaming Codex progress is non-authoritative. A busy SQLite
+            # database must not abort the actual solver command.
+            session.rollback()
         if finalization_reason:
             CodexHarnessRuntime._begin_finalization(
                 session,
@@ -729,6 +772,14 @@ class CodexHarnessRuntime:
                 reason=finalization_reason,
             )
         return finalization_reason
+
+    @staticmethod
+    def _is_network_shell_command(command: str) -> bool:
+        return re.search(
+            r"\b(?:curl|wget|nmap|ffuf|gobuster|dirb|nikto|whatweb|wafw00f|sqlmap|nc|netcat|ncat|socat)\b",
+            command,
+            re.IGNORECASE,
+        ) is not None
 
     @staticmethod
     def _begin_finalization(session: Session, *, worker: Worker, attempt: Attempt, reason: str) -> None:

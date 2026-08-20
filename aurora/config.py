@@ -32,7 +32,7 @@ class DebugConfig(BaseModel):
 class Settings(BaseModel):
     database_url: str = Field(default_factory=lambda: os.getenv("AURORA_DB_URL", "sqlite:///./aurora.db"))
     db_journal_mode: str = Field(default_factory=lambda: os.getenv("AURORA_DB_JOURNAL_MODE", "wal"))
-    db_busy_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("AURORA_DB_BUSY_TIMEOUT_MS", "5000")))
+    db_busy_timeout_ms: int = Field(default_factory=lambda: int(os.getenv("AURORA_DB_BUSY_TIMEOUT_MS", "30000")))
     artifact_dir: Path = Field(default_factory=lambda: Path(os.getenv("AURORA_ARTIFACT_DIR", "./artifacts")))
     api_lock_dir: Path | None = Field(default_factory=lambda: Path(value) if (value := os.getenv("AURORA_API_LOCK_DIR")) else None)
     api_host: str = Field(default_factory=lambda: os.getenv("AURORA_API_HOST", "0.0.0.0"))
@@ -43,7 +43,7 @@ class Settings(BaseModel):
     worker_image_heavy: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_IMAGE_HEAVY", "aurora-kali-codex:heavy"))
     default_container_network: str = Field(default_factory=lambda: os.getenv("AURORA_CONTAINER_NETWORK", "aurora-runtime"))
     worker_runtime: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_RUNTIME", "codex"))
-    tool_contract: str = Field(default_factory=lambda: os.getenv("AURORA_TOOL_CONTRACT", "native_privileged"))
+    tool_contract: str = Field(default_factory=lambda: os.getenv("AURORA_TOOL_CONTRACT", "kali_shell"))
     native_allow_blackboard_query: bool = Field(default_factory=lambda: os.getenv("AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY", "true").lower() in {"1", "true", "yes"})
     codex_command_template: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_COMMAND_TEMPLATE", "/workspace/runtime/codex-via-cc-switch.sh {prompt_filename} {output_schema_filename} {last_message_filename}"))
     codex_proxy_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_PROXY_BASE_URL", "http://aurora-cc-switch:15723/v1"))

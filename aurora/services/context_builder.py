@@ -66,6 +66,21 @@ def redact(text: str) -> str:
     return redacted
 
 
+def _redact_sections(value: Any) -> Any:
+    """Redact secret-like text inside an already-decoded JSON object.
+
+    JSON structure is preserved because the regex only runs on string leaf
+    values, never on the serialized representation.
+    """
+    if isinstance(value, dict):
+        return {key: _redact_sections(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_sections(item) for item in value]
+    if isinstance(value, str):
+        return redact(value)
+    return value
+
+
 class ContextBuilder:
     def build(self, session: Session, *, project_id: str, intent_id: str, worker_id: str | None = None) -> ContextSnapshot:
         settings = get_settings()
@@ -222,7 +237,7 @@ class ContextBuilder:
             },
         }
         if settings.debug.redact_secrets:
-            sections = json.loads(redact(json.dumps(sections, ensure_ascii=False)))
+            sections = _redact_sections(sections)
 
         serialized = json.dumps(sections, ensure_ascii=False)
         truncation_report = {"truncated": False, "original_chars": len(serialized)}

@@ -625,6 +625,36 @@ def test_recover_interrupted_group_requeues_its_running_item() -> None:
         assert group.current_item_id is None
 
 
+def test_recover_interrupted_groups_resumes_retryable_failed_group() -> None:
+    with Session(service_session_engine()) as session:
+        project = Project(name="failed-runner-item", goal="resume after runner crash")
+        group = ChallengeGroup(name="failed-runner-group", status="FAILED")
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            status="PENDING",
+            fused_status="PENDING",
+            stop_reason="recovered_after_runner_failure",
+        )
+        session.add(item)
+        session.commit()
+
+        assert recover_interrupted_groups(session) == [group.id]
+        session.refresh(group)
+        assert group.status == "READY"
+        assert group.finished_at is None
+        recovered = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.recovered_after_runner_failure",
+            )
+        ).one()
+        assert recovered.payload_json["pending_items"] == 1
+
+
 def test_recover_legacy_target_blocked_group_is_scoped_and_idempotent() -> None:
     with Session(service_session_engine()) as session:
         project = Project(
@@ -678,15 +708,20 @@ def test_group_runner_failure_requeues_active_item_and_releases_worker(monkeypat
     monkeypatch.setattr("aurora.services.challenge_group_runner.stop_project_containers", lambda _project_id: [])
     with Session(service_session_engine()) as session:
         project = Project(name="runner-failure", goal="retry after infrastructure failure")
+        second_project = Project(name="runner-failure-2", goal="retry the other concurrent item")
         group = ChallengeGroup(name="batch", status="RUNNING")
-        session.add_all([project, group])
+        session.add_all([project, second_project, group])
         session.commit()
         item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="RUNNING", fused_status="RUNNING")
+        second_item = ChallengeGroupItem(group_id=group.id, project_id=second_project.id, position=2, status="RUNNING", fused_status="RUNNING")
         intent = Intent(project_id=project.id, objective="solve", status="RUNNING", lease_owner="worker_test")
+        second_intent = Intent(project_id=second_project.id, objective="solve", status="RUNNING", lease_owner="worker_test_2")
         worker = Worker(id="worker_test", project_id=project.id, intent_id=intent.id, status="RUNNING")
+        second_worker = Worker(id="worker_test_2", project_id=second_project.id, intent_id=second_intent.id, status="RUNNING")
         attempt = Attempt(project_id=project.id, intent_id=intent.id, worker_id=worker.id, status="RUNNING")
+        second_attempt = Attempt(project_id=second_project.id, intent_id=second_intent.id, worker_id=second_worker.id, status="RUNNING")
         group.current_item_id = item.id
-        session.add_all([item, intent, worker, attempt, group])
+        session.add_all([item, second_item, intent, second_intent, worker, second_worker, attempt, second_attempt, group])
         session.commit()
 
         fail_group_run(session, group_id=group.id, error="database write failed")
@@ -695,6 +730,10 @@ def test_group_runner_failure_requeues_active_item_and_releases_worker(monkeypat
         session.refresh(intent)
         session.refresh(worker)
         session.refresh(attempt)
+        session.refresh(second_item)
+        session.refresh(second_intent)
+        session.refresh(second_worker)
+        session.refresh(second_attempt)
         session.refresh(group)
         assert group.status == "FAILED"
         assert group.current_item_id is None
@@ -705,6 +744,11 @@ def test_group_runner_failure_requeues_active_item_and_releases_worker(monkeypat
         assert intent.lease_owner is None
         assert worker.status == "INTERRUPTED"
         assert attempt.status == "INTERRUPTED"
+        assert second_item.status == second_item.fused_status == "PENDING"
+        assert second_item.stop_reason == "recovered_after_runner_failure"
+        assert second_intent.status == "PENDING" and second_intent.lease_owner is None
+        assert second_worker.status == "INTERRUPTED"
+        assert second_attempt.status == "INTERRUPTED"
 
 
 def test_paused_batch_can_continue_with_ephemeral_authenticated_fetcher(tmp_path: Path) -> None:

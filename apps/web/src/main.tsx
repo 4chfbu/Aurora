@@ -348,7 +348,7 @@ function App() {
         <IconAction icon={<BrainCircuit />} label="运行规划器" disabled={busy || !selectedProjectId} onClick={() => void command('/manager/run')} />
         <IconAction icon={<Play />} label="执行下一个意图" disabled={busy || !selectedProjectId || projectLocked} onClick={() => void command('/scheduler/run-next')} />
         <IconAction icon={<ShieldCheck />} label="运行观察器" disabled={busy || !selectedProjectId} onClick={() => void command('/observer/run')} />
-        <IconAction icon={<Sparkles />} label="开始自动解题" disabled={busy || !selectedProjectId || projectLocked} onClick={() => void command('/autorun/start', { max_iterations: 20, max_minutes: 0, no_progress_limit: 2, stop_on_observer_escalate: true, background: true })} />
+        <IconAction icon={<Sparkles />} label="开始自动解题" disabled={busy || !selectedProjectId || projectLocked} onClick={() => void command('/autorun/start', { max_iterations: 0, max_minutes: 0, no_progress_limit: 2, stop_on_observer_escalate: true, background: true })} />
         <IconAction icon={<PauseCircle />} label="停止自动解题" disabled={busy || !selectedProjectId} onClick={() => void command('/autorun/stop')} danger />
         <IconAction icon={<TimerReset />} label="回收过期租约" disabled={busy || !selectedProjectId} onClick={() => void command('/scheduler/reap-expired')} />
       </nav>

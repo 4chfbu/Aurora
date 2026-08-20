@@ -719,3 +719,52 @@ def test_codex_action_progress_comparison_accepts_sqlite_naive_timestamp() -> No
 
         assert reason is None
         assert len(session.exec(select(ToolTrace).where(ToolTrace.attempt_id == attempt.id)).all()) == 1
+
+
+def test_codex_shell_output_is_persisted_as_trusted_evidence(tmp_path) -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    worker = Worker(
+        id="worker_shell_evidence",
+        project_id="proj_shell_evidence",
+        intent_id="intent_shell_evidence",
+    )
+    attempt = Attempt(
+        id="attempt_shell_evidence",
+        project_id=worker.project_id,
+        intent_id=worker.intent_id,
+        worker_id=worker.id,
+    )
+    event = json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "status": "completed",
+            "command": "curl http://10.0.0.1/",
+            "exit_code": 0,
+            "aggregated_output": "flag{observed-in-shell-output}",
+        },
+    })
+
+    with Session(engine) as session:
+        session.add_all([worker, attempt])
+        session.commit()
+        reason = CodexHarnessRuntime._record_codex_event(
+            session,
+            worker=worker,
+            attempt=attempt,
+            stream="stdout",
+            line=event,
+            artifact_store=artifact_store,
+        )
+        traces = session.exec(select(ToolTrace).where(ToolTrace.attempt_id == attempt.id)).all()
+        artifacts = session.exec(select(Artifact).where(Artifact.project_id == worker.project_id)).all()
+
+    assert reason is None
+    assert len(traces) == 1
+    assert len(artifacts) == 1
+    assert traces[0].artifact_refs == [artifacts[0].id]
+    assert artifacts[0].origin_kind == "target_observation"
+    assert artifacts[0].type == "terminal"
+    assert (tmp_path / "artifacts" / worker.project_id / f"{artifacts[0].id}.txt").read_text(encoding="utf-8") == "flag{observed-in-shell-output}"

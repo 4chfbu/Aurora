@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,7 @@ from aurora.services.competition_adapter import (
     competition_platform,
 )
 from aurora.services.flag_rejection import record_flag_rejection
+from aurora.services.flag_validator import FlagValidator
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 
 
@@ -47,7 +49,8 @@ class FlagSubmissionService:
         session: Session,
         *,
         project_id: str,
-        candidate_id: str,
+        candidate_id: str | None = None,
+        value: str | None = None,
         adapter: CompetitionAdapter | None = None,
         worker_id: str | None = None,
         intent_id: str | None = None,
@@ -64,21 +67,25 @@ class FlagSubmissionService:
                 "flag.submit requires a challenge-group item with a competition adapter", {},
             )
 
-        candidate = self._candidate(session, project_id=project_id, candidate_id=candidate_id, attempt_id=attempt_id)
+        if bool(candidate_id) == bool(value):
+            return FlagSubmissionOutcome(
+                "invalid_candidate", None, None, False,
+                "flag.submit requires exactly one of candidate_id or value", {},
+            )
+
+        if value is not None:
+            candidate = self._candidate_for_value(session, project_id=project_id, value=value)
+        else:
+            candidate = self._candidate(session, project_id=project_id, candidate_id=candidate_id or "", attempt_id=attempt_id)
         if candidate is None:
             return FlagSubmissionOutcome(
                 "invalid_candidate", None, None, False,
-                "candidate_id does not identify a locally verified candidate in this project", {},
+                "submission target does not identify an eligible candidate in this project", {},
             )
-        if candidate.submission_count >= 1 or candidate.status in {"ACCEPTED", "REJECTED", "SUBMITTED", "AWAITING_MANUAL_VALIDATION"}:
+        if candidate.submission_count >= 1 and candidate.status in {"ACCEPTED", "REJECTED", "SUBMITTED", "AWAITING_MANUAL_VALIDATION"}:
             return FlagSubmissionOutcome(
                 "duplicate", candidate.id, None, False,
-                "candidate has already been submitted or is no longer eligible", {},
-            )
-        if candidate.status != "LOCAL_VERIFIED":
-            return FlagSubmissionOutcome(
-                "invalid_candidate", candidate.id, None, False,
-                "candidate has not passed local evidence verification", {},
+                "candidate has already been decided by the competition platform", {},
             )
 
         candidate.submission_count += 1
@@ -320,5 +327,30 @@ class FlagSubmissionService:
         self._event(
             session, item, "group.item.flag_submission_rejected",
             {"project_id": item.project_id, "candidate_id": candidate.id, "value": candidate.value, "reason": reason, **detail},
-        )
+            )
         return FlagSubmissionOutcome("rejected", candidate.id, False, False, reason, detail)
+
+    @staticmethod
+    def _candidate_for_value(session: Session, *, project_id: str, value: str) -> FlagCandidate | None:
+        normalized = value.strip()
+        if not FlagValidator.is_valid_flag_value(normalized):
+            return None
+        value_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        candidate = session.exec(
+            select(FlagCandidate).where(
+                FlagCandidate.project_id == project_id,
+                FlagCandidate.value_hash == value_hash,
+            )
+        ).first()
+        if candidate is not None:
+            return candidate
+        candidate = FlagCandidate(
+            project_id=project_id,
+            value=normalized,
+            value_hash=value_hash,
+            status="PROPOSED",
+            provenance_kind="DIRECT_SUBMISSION",
+        )
+        session.add(candidate)
+        session.flush()
+        return candidate

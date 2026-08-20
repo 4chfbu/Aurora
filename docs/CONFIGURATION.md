@@ -99,7 +99,7 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_ARTIFACT_DIR` | `./artifacts` | 原始工具输出、导入附件和 Codex transcript 的存储目录。API 启动时会自动创建。 |
 | `AURORA_API_LOCK_DIR` | 系统临时目录 | API 单实例锁目录；测试和多环境部署应分别配置。 |
 | `AURORA_WORKER_RUNTIME` | `codex` | `codex`/`codex_harness`/`harness` 使用 Codex Harness；`openai_direct`/`openai`/`llm`/`real` 使用直接兼容接口。其他值直接报错。 |
-| `AURORA_TOOL_CONTRACT` | `native_privileged` | Codex 运行时的 `tool_requests` 契约。`native_privileged` 只暴露需要服务端隔离、凭据、会话控制或统一审计的能力；`full_gateway` 恢复旧的全量语义工具面。该设置不启用目标授权。 |
+| `AURORA_TOOL_CONTRACT` | `kali_shell` | Codex 运行时的 `tool_requests` 契约。`kali_shell` 只暴露无法在 Worker 容器内完成的服务端能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`、可选 `blackboard.query`；网络侦察由 Kali shell 直接执行。`native_privileged` 恢复旧 gateway 网络工具，`full_gateway` 恢复全量语义工具面。该设置不启用目标授权。 |
 | `AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY` | `true` | 在 `aurora_blackboard` MCP 可用性稳定前保留 `blackboard.query` 作为 `tool_requests` 退化回退；设为 `false` 关闭。 |
 | `AURORA_WORKER_IMAGE` | `aurora-kali-codex:latest` | 包含 Codex CLI 的 Kali Worker 镜像名。只有本地已存在的镜像才会被容器执行器使用。 |
 | `AURORA_WORKER_IMAGE_CORE` | `AURORA_WORKER_IMAGE` 或 `aurora-kali-codex:core` | Web 题和手工语义工具使用的常用 CTF 工具镜像。 |

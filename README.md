@@ -121,7 +121,10 @@ Useful endpoints:
 
 ## Kali Worker Tooling
 
-The capability gateway prefers Kali native tooling over MCP. It currently maps these semantic tools to restricted shell commands:
+In the default `kali_shell` Codex contract, network reconnaissance runs directly
+inside the Kali Worker through `codex.shell`; the gateway is kept only for
+server-side gates (`flag.*`, FOFA, browser interaction). The reference mappings
+for the legacy/full-gateway contract are:
 
 - `network.scan` -> `nmap`
 - `http.request` -> `curl`

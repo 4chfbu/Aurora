@@ -604,11 +604,11 @@ def test_slab_match_notice_poller_persists_context_and_files_idempotently(tmp_pa
         assert len(facts) == 1
 
 
-def test_slab_match_group_uses_one_unopinionated_outer_turn() -> None:
+def test_competition_group_has_no_solver_turn_limit() -> None:
     item = ChallengeGroupItem(group_id="group", project_id="project", position=1, phase=2)
     limits = ChallengeGroupRunner._autorun_limits(item)
 
-    assert limits.max_iterations == 1
+    assert limits.max_iterations == 0
     assert limits.no_progress_limit == 0
 
 

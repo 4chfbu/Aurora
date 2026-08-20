@@ -1,16 +1,19 @@
 import hashlib
 from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.api import create_app
 from aurora.config import Settings, get_settings
-from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, FlagCandidate, Intent, Project
+from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, FlagCandidate, Intent, Project, Worker
 from aurora.services.challenge_group_runner import ChallengeGroupRunner
 from aurora.services.competition_adapter import CompetitionSubmissionResult, TSecBenchCompetitionAdapter
+from aurora.services.harvester_runner import HarvesterResult
 from aurora.services.hands_free import HandsFreeService
-from aurora.services.tsecbench import TSecBenchChallenge, TSecBenchClient, TSecBenchNeedsSession, configure_tsecbench, public_tsecbench_config
+from aurora.services.tsecbench import TSecBenchChallenge, TSecBenchClient, TSecBenchError, TSecBenchNeedsSession, configure_tsecbench, public_tsecbench_config
 
 
 def test_tsecbench_accepts_platform_native_environment(monkeypatch) -> None:
@@ -160,6 +163,290 @@ def test_tsecbench_close_releases_target_and_authorization(tmp_path: Path) -> No
         assert scope.allowed_hosts == []
 
 
+def test_tsecbench_close_failure_clears_local_target_state(tmp_path: Path) -> None:
+    class FailingClient:
+        def close(self, code):
+            raise TSecBenchError("The read operation timed out")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="challenge", goal="solve", challenge_type="web")
+        group = ChallengeGroup(name="group")
+        session.add_all([project, group])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={
+                "platform": "tsecbench",
+                "unique_code": "u-1",
+                "container_status": "available",
+                "container_addr": ["https://target.example:8443"],
+            },
+        )
+        session.add_all([AuthorizationScope(project_id=project.id), item])
+        session.commit()
+        project.target_url = "https://target.example:8443"
+        project.target_verification_status = "VERIFIED"
+        session.add(project)
+        session.commit()
+
+        adapter = TSecBenchCompetitionAdapter(_settings(tmp_path), FailingClient())
+        try:
+            adapter.close_environment(project_id=project.id, session=session)
+        except TSecBenchError:
+            pass
+        else:
+            raise AssertionError("close failure was swallowed")
+        session.commit()
+
+        session.refresh(project)
+        session.refresh(item)
+        scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project.id)).one()
+        assert project.target_url is None
+        assert project.target_verification_status == "UNVERIFIED"
+        assert item.competition_meta["container_status"] == "stopped"
+        assert item.competition_meta["container_addr"] == []
+        assert scope.allowed_hosts == []
+
+
+def test_tsecbench_group_releases_each_target_before_starting_the_next_challenge(tmp_path: Path) -> None:
+    lifecycle: list[tuple[str, str]] = []
+
+    class Client:
+        active: str | None = None
+
+        def start(self, code):
+            assert self.active is None, f"target {self.active} was not released before starting {code}"
+            self.active = code
+            lifecycle.append(("start", code))
+            return {"container_addr": f"http://{code}.target.example:8080"}
+
+        def close(self, code):
+            assert self.active == code
+            lifecycle.append(("close", code))
+            self.active = None
+
+        def hint(self, code):
+            return None
+
+    class FailedHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            lifecycle.append(("solve", task["title"]))
+            return HarvesterResult(status="FAILED", reason="try_next_phase")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="sequential-target-cycle", max_concurrent=1)
+        projects = [Project(name="one", goal="solve one"), Project(name="two", goal="solve two")]
+        session.add_all([group, *projects])
+        session.commit()
+        session.add_all([
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=position,
+                competition_meta={"platform": "tsecbench", "unique_code": project.name, "container_status": "stopped"},
+            )
+            for position, project in enumerate(projects, start=1)
+        ])
+        session.commit()
+
+        adapter = TSecBenchCompetitionAdapter(_settings(tmp_path), Client())
+        ChallengeGroupRunner(harvester=FailedHarvester(), competition=adapter).run(session, group_id=group.id)
+
+        session.refresh(group)
+        assert group.status == "COMPLETED"
+        assert lifecycle == [
+            (action, name)
+            for _phase in range(3)
+            for name in ("one", "two")
+            for action in ("start", "solve", "close")
+        ]
+        items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group.id)).all()
+        assert all(item.fused_status == "FAILED" for item in items)
+        assert all(item.competition_meta["container_status"] == "stopped" for item in items)
+
+
+def test_tsecbench_target_is_released_only_after_phase_state_is_resolved() -> None:
+    worker_calls: list[tuple[int, int]] = []
+    close_states: list[tuple[str, int]] = []
+
+    class Adapter:
+        active = False
+
+        def ensure_environment(self, session, *, project_id):
+            self.active = True
+            return SimpleNamespace(available=True, reason=None)
+
+        def close_environment(self, *, project_id, session=None):
+            assert session is not None
+            item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project_id)).one()
+            # Closing while RUNNING is the regression: it means a Worker call,
+            # rather than the phase transition, owned target lifetime.
+            assert item.fused_status != "RUNNING"
+            close_states.append((item.fused_status, item.phase))
+            self.active = False
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    adapter = Adapter()
+
+    class MultiWorkerPhaseHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            phase = task["phase"]
+            for worker_number in (1, 2):
+                assert adapter.active is True
+                worker_calls.append((phase, worker_number))
+            return HarvesterResult(status="FAILED", reason="phase_exhausted")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="phase-owned-target", max_concurrent=1)
+        project = Project(name="one", goal="solve one")
+        session.add_all([group, project])
+        session.commit()
+        session.add(ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "one"},
+        ))
+        session.commit()
+
+        ChallengeGroupRunner(harvester=MultiWorkerPhaseHarvester(), competition=adapter).run(
+            session,
+            group_id=group.id,
+        )
+
+        assert worker_calls == [(phase, worker) for phase in (1, 2, 3) for worker in (1, 2)]
+        assert close_states == [("PENDING", 2), ("PENDING", 3), ("FAILED", 3)]
+        close_events = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.item.environment_closed",
+            )
+        ).all()
+        assert [event.payload_json["reason"] for event in close_events] == ["phase_finished"] * 3
+
+
+def test_tsecbench_target_release_is_deferred_while_a_worker_is_active() -> None:
+    class Adapter:
+        def close_environment(self, *, project_id, session=None):
+            raise AssertionError("active Worker must retain the challenge target")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="active-worker-target", status="RUNNING")
+        project = Project(name="one", goal="solve one")
+        session.add_all([group, project])
+        session.commit()
+        intent = Intent(project_id=project.id, objective="continue phase", status="RUNNING")
+        session.add(intent)
+        session.commit()
+        worker = Worker(project_id=project.id, intent_id=intent.id, status="RUNNING")
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            status="RUNNING",
+            fused_status="RUNNING",
+            competition_meta={"platform": "tsecbench", "unique_code": "one"},
+        )
+        session.add_all([worker, item])
+        session.commit()
+
+        ChallengeGroupRunner(competition=Adapter())._resolve_phase(
+            session,
+            group=group,
+            item=item,
+            project=project,
+            outcome="FAILED",
+            reason="phase scheduler raced with active worker",
+        )
+
+        deferred = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.item.environment_release_deferred",
+            )
+        ).one()
+        assert deferred.payload_json["reason"] == "active_workers"
+        assert deferred.payload_json["worker_ids"] == [worker.id]
+
+
+def test_concurrent_tsecbench_solver_crash_does_not_stop_later_challenges(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    lock = Lock()
+    crashed = False
+
+    class Adapter:
+        def ensure_environment(self, session, *, project_id):
+            return SimpleNamespace(available=True, reason=None)
+
+        def close_environment(self, *, project_id, session=None):
+            return None
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    class CrashOnceHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            nonlocal crashed
+            with lock:
+                calls.append(task["title"])
+                if task["title"] == "one" and not crashed:
+                    crashed = True
+                    raise ValueError("malformed provider JSON")
+            return HarvesterResult(status="FAILED", reason="try_next_phase")
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.stop_project_containers", lambda _project_id: {})
+
+    with Session(test_engine) as session:
+        group = ChallengeGroup(name="crash-contained", max_concurrent=2)
+        projects = [Project(name=name, goal=f"solve {name}") for name in ("one", "two", "three")]
+        session.add_all([group, *projects])
+        session.commit()
+        session.add_all([
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=position,
+                competition_meta={"platform": "tsecbench", "unique_code": project.name},
+            )
+            for position, project in enumerate(projects, start=1)
+        ])
+        session.commit()
+
+        ChallengeGroupRunner(harvester=CrashOnceHarvester(), competition=Adapter()).run(
+            session,
+            group_id=group.id,
+        )
+
+        session.refresh(group)
+        crash_event = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.item.solver_crashed",
+            )
+        ).one()
+        assert group.status == "COMPLETED"
+        assert crash_event.payload_json["error"].startswith("solver_runtime_exception: ValueError")
+        assert "three" in calls
+
+
 def test_tsecbench_capacity_is_checked_before_start(tmp_path: Path) -> None:
     class Client:
         def start(self, code):
@@ -248,6 +535,24 @@ def test_tsecbench_group_is_detected_for_platform_dispatch() -> None:
         session.add(ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, competition_meta={"platform": "tsecbench", "unique_code": "one"}))
         session.commit()
         assert ChallengeGroupRunner._is_tsecbench_group(session, group.id) is True
+
+
+def test_unconfigured_tsecbench_never_falls_back_to_local_solver() -> None:
+    settings = get_settings()
+    original = settings.tsecbench_token
+    settings.tsecbench_token = None
+    try:
+        item = ChallengeGroupItem(
+            group_id="group_test",
+            project_id="project_test",
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "one"},
+        )
+        adapter = ChallengeGroupRunner()._competition_for(item)
+        assert isinstance(adapter, TSecBenchCompetitionAdapter)
+        assert adapter.settings.tsecbench_configured is False
+    finally:
+        settings.tsecbench_token = original
 
 
 def test_tsecbench_group_uses_platform_concurrency_limit() -> None:
