@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import urllib.error
@@ -74,4 +72,3 @@ def save_checkpoint(
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
-

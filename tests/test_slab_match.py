@@ -700,3 +700,46 @@ def test_slab_match_runtime_configuration_does_not_expose_access_key() -> None:
         assert public_slab_match_config()["base_url"] == "https://agent.example/slab-match/api/v1/agent"
     finally:
         settings.slab_match_base_url, settings.slab_match_access_key, settings.slab_match_timeout_seconds, settings.slab_match_max_concurrent = original
+
+
+def test_slab_match_group_uses_platform_concurrency_limit() -> None:
+    settings = get_settings()
+    original = settings.slab_match_max_concurrent
+    settings.slab_match_max_concurrent = 2
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            group = ChallengeGroup(name="slab", max_concurrent=8)
+            project = Project(name="one", goal="solve")
+            session.add_all([group, project])
+            session.commit()
+            session.add(ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=1,
+                competition_meta={"platform": "slab_match", "exercise_id": 1001},
+            ))
+            session.commit()
+            assert ChallengeGroupRunner._is_slab_match_group(session, group.id) is True
+            assert ChallengeGroupRunner._max_workers(session, group) == 2
+    finally:
+        settings.slab_match_max_concurrent = original
+
+
+def test_unconfigured_slab_match_never_falls_back_to_local_solver() -> None:
+    settings = get_settings()
+    original = settings.slab_match_access_key
+    settings.slab_match_access_key = None
+    try:
+        item = ChallengeGroupItem(
+            group_id="group_test",
+            project_id="project_test",
+            position=1,
+            competition_meta={"platform": "slab_match", "exercise_id": 1001},
+        )
+        adapter = ChallengeGroupRunner()._competition_for(item)
+        assert isinstance(adapter, SlabMatchCompetitionAdapter)
+        assert adapter.settings.slab_match_configured is False
+    finally:
+        settings.slab_match_access_key = original

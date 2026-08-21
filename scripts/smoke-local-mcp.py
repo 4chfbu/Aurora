@@ -5,8 +5,10 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -15,6 +17,7 @@ from mcp.client.stdio import stdio_client
 SERVERS = {
     "aurora_reverse": ("/opt/aurora-mcp/reverse_server.py", {"open_binary", "decompile_function", "find_xrefs", "list_sessions"}),
     "aurora_debug": ("/opt/aurora-mcp/debug_server.py", {"start_session", "read_memory", "stop_session"}),
+    "aurora_blackboard": ("/opt/aurora-mcp/blackboard_server.py", {"query", "append_fact", "save_checkpoint"}),
 }
 
 SMOKE_SOURCE = """\
@@ -88,8 +91,14 @@ async def check_reverse_behavior(session: ClientSession, binary: Path) -> None:
         await session.call_tool("close_session", {"session_id": session_id})
 
 
-async def check_server(name: str, script: str, expected: set[str], binary: Path) -> None:
-    parameters = StdioServerParameters(command="/opt/aurora-venv/bin/python", args=[script])
+async def check_blackboard_behavior(session: ClientSession) -> None:
+    response = tool_payload(await session.call_tool("query", {}))
+    if response.get("project_id") != "smoke-worker" or response.get("facts") != []:
+        raise RuntimeError("aurora_blackboard query did not return the control-plane response")
+
+
+async def check_server(name: str, script: str, expected: set[str], binary: Path, env: dict[str, str] | None = None) -> None:
+    parameters = StdioServerParameters(command="/opt/aurora-venv/bin/python", args=[script], env=env)
     async with stdio_client(parameters) as (reader, writer):
         async with ClientSession(reader, writer) as session:
             await session.initialize()
@@ -100,13 +109,45 @@ async def check_server(name: str, script: str, expected: set[str], binary: Path)
                 raise RuntimeError(f"{name} is missing MCP tools: {', '.join(sorted(missing))}")
             if name == "aurora_reverse":
                 await check_reverse_behavior(session, binary)
+            if name == "aurora_blackboard":
+                await check_blackboard_behavior(session)
             print(f"{name}: {len(names)} tools")
+
+
+class BlackboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path != "/internal/workers/smoke-worker/blackboard" or self.headers.get("Authorization") != "Bearer smoke-token":
+            self.send_error(403)
+            return
+        body = json.dumps({"project_id": "smoke-worker", "facts": [], "checkpoints": []}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
 
 
 async def main() -> None:
     binary = build_smoke_binary()
-    for name, (script, expected) in SERVERS.items():
-        await check_server(name, script, expected, binary)
+    control = ThreadingHTTPServer(("127.0.0.1", 0), BlackboardHandler)
+    threading.Thread(target=control.serve_forever, daemon=True).start()
+    try:
+        for name, (script, expected) in SERVERS.items():
+            env = None
+            if name == "aurora_blackboard":
+                env = {
+                    **os.environ,
+                    "AURORA_WORKER_CONTROL_BASE_URL": f"http://127.0.0.1:{control.server_port}",
+                    "AURORA_WORKER_ID": "smoke-worker",
+                    "AURORA_WORKER_CONTROL_TOKEN": "smoke-token",
+                }
+            await check_server(name, script, expected, binary, env)
+    finally:
+        control.shutdown()
+        control.server_close()
 
 
 if __name__ == "__main__":

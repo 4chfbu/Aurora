@@ -1,6 +1,6 @@
 import hashlib
 from pathlib import Path
-from threading import Lock
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -445,6 +445,158 @@ def test_concurrent_tsecbench_solver_crash_does_not_stop_later_challenges(tmp_pa
         assert group.status == "COMPLETED"
         assert crash_event.payload_json["error"].startswith("solver_runtime_exception: ValueError")
         assert "three" in calls
+
+
+def test_concurrent_group_refills_a_slot_before_other_work_finishes(tmp_path: Path, monkeypatch) -> None:
+    initial_pair_started = Barrier(2)
+    third_started = Event()
+    timeline: list[tuple[str, str]] = []
+    lock = Lock()
+    active = 0
+    peak_active = 0
+
+    class Adapter:
+        def ensure_environment(self, session, *, project_id):
+            return SimpleNamespace(available=True, reason=None)
+
+        def close_environment(self, *, project_id, session=None):
+            return None
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    class RollingHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            nonlocal active, peak_active
+            title = task["title"]
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                timeline.append(("started", title))
+            try:
+                if title in {"one", "two"}:
+                    initial_pair_started.wait(timeout=3)
+                if title == "two":
+                    assert third_started.wait(timeout=3), "the free concurrency slot was not refilled"
+                    with lock:
+                        timeline.append(("observed_third", title))
+                elif title == "three":
+                    third_started.set()
+                project = session.get(Project, project_id)
+                project.status = "COMPLETED"
+                session.add(project)
+                session.commit()
+                return HarvesterResult(status="COMPLETED", reason="solved")
+            finally:
+                with lock:
+                    timeline.append(("finished", title))
+                    active -= 1
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'rolling-concurrency.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
+
+    with Session(test_engine) as session:
+        group = ChallengeGroup(name="rolling-concurrency", max_concurrent=2)
+        projects = [Project(name=name, goal=f"solve {name}") for name in ("one", "two", "three")]
+        session.add_all([group, *projects])
+        session.commit()
+        session.add_all([
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=position,
+                competition_meta={"platform": "tsecbench", "unique_code": project.name},
+            )
+            for position, project in enumerate(projects, start=1)
+        ])
+        session.commit()
+
+        ChallengeGroupRunner(harvester=RollingHarvester(), competition=Adapter()).run(
+            session,
+            group_id=group.id,
+        )
+
+        session.refresh(group)
+        assert group.status == "COMPLETED"
+        assert peak_active == 2
+        assert timeline.index(("started", "three")) < timeline.index(("finished", "two"))
+
+
+def test_capacity_waiter_is_requeued_after_a_target_is_released(tmp_path: Path, monkeypatch) -> None:
+    environment_lock = Lock()
+    capacity_denied = Event()
+    active_environment: set[str] = set()
+    allocated_projects: set[str] = set()
+    first_allocation: str | None = None
+    capacity_denials = 0
+
+    class Adapter:
+        def ensure_environment(self, session, *, project_id):
+            nonlocal first_allocation, capacity_denials
+            with environment_lock:
+                if active_environment and project_id not in active_environment:
+                    capacity_denials += 1
+                    capacity_denied.set()
+                    return SimpleNamespace(available=False, reason="tsecbench_capacity_exhausted")
+                active_environment.add(project_id)
+                allocated_projects.add(project_id)
+                if first_allocation is None:
+                    first_allocation = project_id
+            return SimpleNamespace(available=True, reason=None)
+
+        def close_environment(self, *, project_id, session=None):
+            with environment_lock:
+                active_environment.discard(project_id)
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    class CompletingHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            if project_id == first_allocation:
+                assert capacity_denied.wait(timeout=3)
+            project = session.get(Project, project_id)
+            project.status = "COMPLETED"
+            session.add(project)
+            session.commit()
+            return HarvesterResult(status="COMPLETED", reason="solved")
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'capacity-refill.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
+
+    with Session(test_engine) as session:
+        group = ChallengeGroup(name="capacity-refill", max_concurrent=2)
+        projects = [Project(name=name, goal=f"solve {name}") for name in ("one", "two", "three")]
+        session.add_all([group, *projects])
+        session.commit()
+        session.add_all([
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=position,
+                competition_meta={"platform": "tsecbench", "unique_code": project.name},
+            )
+            for position, project in enumerate(projects, start=1)
+        ])
+        session.commit()
+
+        ChallengeGroupRunner(harvester=CompletingHarvester(), competition=Adapter()).run(
+            session,
+            group_id=group.id,
+        )
+
+        session.refresh(group)
+        assert group.status == "COMPLETED"
+        assert capacity_denials >= 1
+        assert allocated_projects == {project.id for project in projects}
 
 
 def test_tsecbench_capacity_is_checked_before_start(tmp_path: Path) -> None:

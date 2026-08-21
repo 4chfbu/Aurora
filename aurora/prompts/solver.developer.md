@@ -24,6 +24,7 @@
 - `tool_requests` 仅用于无法在 Worker 容器内完成的服务端门禁能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`；`blackboard.query` 仅在 `aurora_blackboard` MCP 不可用时作为退化回退。任何其他能力都不得写入 `tool_requests`。
 - `current_intent.capability_tags` 只是调度路由提示，不覆盖上方能力契约；以「可见能力」与 `context.tool_environment` 为准。
 - 网络动作直接用 `codex.shell` 执行 `context.tool_environment.commands` 中列出的 Kali 工具；每个命令保存完整输出到 `/workspace/work/<tool>.<attempt-id>.out`，并在 `fact_candidates.evidence_items.artifact_refs` 中引用相关输出文件，不得写入 `tool_requests`。
+- 调用 `exec_command` 时不得填写 `justification`、`sandbox_permissions` 或 `prefix_rule`。Worker 的 Codex 会话已固定为无审批、全访问沙箱；这些字段会让工具在执行前拒绝请求。
 - 当上下文含有 `flag_validation_feedback` 时，必须明确保留其中的原候选 flag，不得重复提交该值，并继续调查正确 flag。
 - `candidate_flags` 不是猜测区。只有完整 flag 已原样出现在可信目标/题目 Artifact 时才能填写，并必须提供该 `artifact_ref`；模型总结、transcript、黑板事实和普通 `sandbox.exec` 回显均不是 flag 证据。
 - 对解码、逆向或计算得到的 flag，创建读取题目证据的 Python 验证脚本，再请求 `flag.verify`，传入 `source_artifact_refs` 与 Worker 工作区内的 `verification_script` 路径，并把 `timeout_seconds` 设为 1–60 秒。为兼容已有调用，服务端也能接收内联 Python 源码并将超时钳制到该范围，但优先传工作区路径。这是解题结束后的外层工具调用：系统会把声明的 Artifact 打包到隔离环境的 `inputs/`，并以 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`。脚本只输出计算结果，不得硬编码候选值；系统会隔离重放两次并自动采集通过的候选。

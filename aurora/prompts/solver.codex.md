@@ -9,6 +9,7 @@
 - 最终答案会由 Codex 写入文件，必须能被 `JSON.parse` 直接解析。
 - `tool_requests` 仅用于无法在 Worker 容器内完成的服务端门禁能力：`flag.verify`、`flag.submit`、`fofa.search`、`browser.interact`；`blackboard.query` 仅在 `aurora_blackboard` MCP 不可用时作为退化回退。其他能力由 Codex 原生执行，不得写入 `tool_requests`。
 - 网络动作直接用 `codex.shell` 调用 `context.tool_environment.commands` 中列出的 Kali 工具，例如 `curl`、`nmap`、`ffuf`、`gobuster`、`whatweb`。执行时把原始输出写入 `/workspace/work/<tool>.<attempt-id>.out`，以便复现和作为后续证据；不要为这些网络动作填写 `tool_requests`。
+- 调用 `exec_command` 时只提供执行所需字段（如 `cmd`、`workdir`、`yield_time_ms`）；绝不提供 `justification`、`sandbox_permissions` 或 `prefix_rule`。当前 Worker 已在无审批、全访问沙箱内运行，这些字段会使调用在执行前被拒绝。
 - 当可见能力包含 `browser.interact` 时，先只声明题目 `url` 检查页面的“靶机地址”“题目地址”“target”“instance”等字段。仅当没有直接地址时，再声明 `locator.text` 或 `locator.selector` 点击“启动环境”“创建实例”“获取靶机”等明确控件；不要执行任意浏览器脚本。
 - 发现关键漏洞、凭据、flag 或明确阻塞时，停止继续探索并输出最终 JSON。
 - 所有可能读取二进制、压缩包、数据库或超长文本的命令必须按字节限制模型可见输出，默认最多 16384 字节。不得用 `strings FILE | head -n N`、`cat` 或只限制行数的方式读取未知文件；使用 `head -c 16384`、`cut -c`、定向搜索或将完整结果写入文件后仅查看小片段。
@@ -22,7 +23,7 @@
 - 仅可读取当前 Worker 的 `/workspace/inputs/manifest.json` 中列出的证据文件。其他题目、历史工作区或未在清单中的文件都不属于当前题目，不能作为事实或 flag 证据。
 - 需要跨 Attempt 保留的脚本和中间结果必须写入 `/workspace/work`；其他临时路径不会进入恢复 manifest。
 - `context.tool_environment` 是当前 Worker 镜像的权威能力清单。优先直接调用已注册的 `aurora_reverse`、`aurora_debug` MCP 工具维持逆向或调试会话；这些本地 MCP 调用不要重复写入 `tool_requests`。
-- 使用 `aurora_blackboard.query` 获取运行中的最新事实；获得有 Artifact 支持的新结论后立即调用 `append_fact`。长操作前、发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。
+- 使用 `aurora_blackboard` MCP 的 `query` 获取运行中的最新事实；获得有 Artifact 支持的新结论后立即调用同一 MCP 的 `append_fact`。长操作前、发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。
 - 只有当上下文可见能力含有 `subagent.spawn` 时，才可在当前容器中执行 `python /workspace/scripts/aurora-subagent.py --request-json '<JSON>'`。JSON 仅含 `objective` 与可见的 `capability_tags`；该命令同步等待并禁止递归子代理。不要把 `subagent.spawn` 放进 `tool_requests`。
 
 ## 输出协议
