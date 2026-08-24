@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 
 from aurora.models import AttemptCheckpoint, Hint, ImportCandidate, Intent, Project, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.services.solver_playbooks import select_playbook
 
 
 URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+")
@@ -158,6 +159,7 @@ class ManagerService:
             attachments = [*candidate.staged_attachments_json, *candidate.external_attachments_json]
         names = [str(item.get("filename") or item.get("name") or item.get("path") or "") for item in attachments if isinstance(item, dict)]
         attachment_note = f" Available attachments: {', '.join(name for name in names if name)[:500]}." if names else ""
+        playbook = select_playbook(challenge_type, f"{project.name if project else ''} {project.goal if project else ''} {hint}")
         playbooks = {
             "reverse": ("Identify the attached binary, inspect protections and entry points, then use aurora_reverse to locate the validation path." + attachment_note, ["binary.inspect", "sandbox.exec"]),
             "crypto": ("Inventory the attached data and identify encoding, key material, and algebraic structure before writing a reproducible verifier." + attachment_note, ["python.analyze", "sandbox.exec"]),
@@ -165,7 +167,7 @@ class ManagerService:
             "pwn": ("Inspect the attached executable and identify architecture, mitigations, and the first controllable input before attempting exploitation." + attachment_note, ["binary.inspect", "sandbox.exec"]),
             "web": ("Use the supplied web context to map the application surface and identify the next authorized request; a target is required for network actions." + attachment_note, ["blackboard.query", "http.request"]),
         }
-        objective, capabilities = next((value for key, value in playbooks.items() if key in kind), (f"Inspect the supplied challenge evidence and perform the first concrete local analysis step.{attachment_note}", ["blackboard.query", "sandbox.exec"]))
+        objective, capabilities = next((value for key, value in playbooks.items() if key in kind), (f"Use the {playbook.challenge_type} playbook: {'; '.join(playbook.first_steps)}.{attachment_note}", list(playbook.capabilities)))
         objective = f"{objective} Operator hint: {hint[:500]}"
         return objective, capabilities, None
 

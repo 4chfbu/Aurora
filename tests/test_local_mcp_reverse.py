@@ -126,3 +126,42 @@ def test_auto_decompile_falls_back_to_rizin(reverse_server, monkeypatch, tmp_pat
     assert result["representation"] == "disassembly"
     assert result["code"] == "fallback assembly"
     assert result["fallback_reason"] == "script failed"
+
+
+def test_find_string_xrefs_returns_only_matching_strings(reverse_server) -> None:
+    class StringPipe(FakePipe):
+        def cmdj(self, command: str):
+            if command == "izj":
+                return [{"string": "wrong", "vaddr": 0x402000}, {"string": "flag is here", "vaddr": 0x402100}]
+            if command == "iij":
+                return [{"name": "puts"}]
+            if command == "axtj @ 0x402100":
+                return [{"fcn_name": "sym.check", "from": 0x401200}]
+            return super().cmdj(command)
+
+    reverse_server.SESSIONS["rev_strings"] = {"pipe": StringPipe([]), "path": Path("/workspace/sample")}
+
+    result = reverse_server.find_string_xrefs("rev_strings", "flag")
+    imports = reverse_server.list_imports("rev_strings")
+
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["xrefs"][0]["fcn_name"] == "sym.check"
+    assert imports["imports"] == [{"name": "puts"}]
+
+
+def test_triage_binary_bounds_probe_output(reverse_server, monkeypatch, tmp_path: Path) -> None:
+    binary = tmp_path / "sample"
+    binary.write_bytes(b"sample")
+    reverse_server.WORKSPACE = tmp_path
+
+    monkeypatch.setattr(
+        reverse_server.subprocess,
+        "run",
+        lambda command, **kwargs: type("Completed", (), {"stdout": "ok", "stderr": "", "returncode": 0})(),
+    )
+
+    result = reverse_server.triage_binary(str(binary))
+
+    assert result["size"] == 6
+    assert len(result["probes"]) == 6
+    assert result["next"] == ["open_binary", "list_strings", "find_string_xrefs"]

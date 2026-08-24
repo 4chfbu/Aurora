@@ -15,8 +15,8 @@ from mcp.client.stdio import stdio_client
 
 
 SERVERS = {
-    "aurora_reverse": ("/opt/aurora-mcp/reverse_server.py", {"open_binary", "decompile_function", "find_xrefs", "list_sessions"}),
-    "aurora_debug": ("/opt/aurora-mcp/debug_server.py", {"start_session", "read_memory", "stop_session"}),
+    "aurora_reverse": ("/opt/aurora-mcp/reverse_server.py", {"triage_binary", "open_binary", "decompile_function", "find_xrefs", "find_string_xrefs", "list_imports", "list_sessions"}),
+    "aurora_debug": ("/opt/aurora-mcp/debug_server.py", {"start_session", "read_memory", "pwndbg_command", "stop_session"}),
     "aurora_blackboard": ("/opt/aurora-mcp/blackboard_server.py", {"query", "append_fact", "save_checkpoint"}),
 }
 
@@ -59,6 +59,9 @@ def tool_payload(response: Any) -> dict[str, Any]:
 
 
 async def check_reverse_behavior(session: ClientSession, binary: Path) -> None:
+    triage = tool_payload(await session.call_tool("triage_binary", {"path": str(binary)}))
+    if triage.get("size") != binary.stat().st_size or len(triage.get("probes", [])) != 6:
+        raise RuntimeError("aurora_reverse binary triage returned incomplete baseline")
     opened = tool_payload(await session.call_tool("open_binary", {"path": str(binary), "analyze": True}))
     session_id = str(opened["session_id"])
     try:
@@ -97,6 +100,18 @@ async def check_blackboard_behavior(session: ClientSession) -> None:
         raise RuntimeError("aurora_blackboard query did not return the control-plane response")
 
 
+async def check_debug_behavior(session: ClientSession, binary: Path) -> None:
+    started = tool_payload(await session.call_tool("start_session", {"program": str(binary)}))
+    session_id = str(started["session_id"])
+    try:
+        diagnostic = tool_payload(await session.call_tool("pwndbg_command", {"session_id": session_id, "command": "checksec"}))
+        rendered = json.dumps(diagnostic.get("responses", []), ensure_ascii=False)
+        if diagnostic.get("errors") or "Undefined command" in rendered or "RELRO" not in rendered:
+            raise RuntimeError("aurora_debug did not execute Pwndbg checksec successfully")
+    finally:
+        await session.call_tool("stop_session", {"session_id": session_id})
+
+
 async def check_server(name: str, script: str, expected: set[str], binary: Path, env: dict[str, str] | None = None) -> None:
     parameters = StdioServerParameters(command="/opt/aurora-venv/bin/python", args=[script], env=env)
     async with stdio_client(parameters) as (reader, writer):
@@ -109,6 +124,8 @@ async def check_server(name: str, script: str, expected: set[str], binary: Path,
                 raise RuntimeError(f"{name} is missing MCP tools: {', '.join(sorted(missing))}")
             if name == "aurora_reverse":
                 await check_reverse_behavior(session, binary)
+            if name == "aurora_debug":
+                await check_debug_behavior(session, binary)
             if name == "aurora_blackboard":
                 await check_blackboard_behavior(session)
             print(f"{name}: {len(names)} tools")

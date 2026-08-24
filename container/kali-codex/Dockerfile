@@ -101,6 +101,25 @@ RUN npm config set registry https://registry.npmmirror.com \
     && npm install -g @openai/codex \
     && codex --version \
     && rm -rf /root/.npm/_cacache
+
+# Use Pwndbg's pinned official Debian package. Keep this after the large,
+# stable toolchain layers so Pwndbg upgrades do not invalidate them.
+ARG PWNDBG_VERSION=2026.07.29
+ARG PWNDBG_AMD64_SHA256=27030bb5c86e54a386aed88a309a844483fe0ef63e0be28ab7a024e0e627a79b
+ARG PWNDBG_RELEASE_MIRROR=https://ghfast.top/https://github.com/pwndbg/pwndbg/releases/download
+RUN (curl -fL --retry 5 \
+      "${PWNDBG_RELEASE_MIRROR}/${PWNDBG_VERSION}/pwndbg_${PWNDBG_VERSION}_amd64.deb" \
+      -o /tmp/pwndbg.deb \
+      || curl -fL --retry 5 \
+      "https://github.com/pwndbg/pwndbg/releases/download/${PWNDBG_VERSION}/pwndbg_${PWNDBG_VERSION}_amd64.deb" \
+      -o /tmp/pwndbg.deb) \
+    && echo "${PWNDBG_AMD64_SHA256}  /tmp/pwndbg.deb" | sha256sum -c - \
+    && apt-get -o Acquire::Retries=20 update \
+    && apt-get -o Acquire::Retries=20 install -y --no-install-recommends /tmp/pwndbg.deb \
+    && pwndbg --version \
+    && rm -f /tmp/pwndbg.deb \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 COPY container/kali-codex/mcp /opt/aurora-mcp
 COPY --chmod=0755 container/kali-codex/python-wrapper.sh /usr/local/bin/python
 COPY container/kali-codex/codex-config.toml /root/.codex/config.toml
@@ -140,6 +159,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements-heavy.txt lief /opt/glibc-al
     && rm /tmp/requirements-heavy.txt
 COPY --chmod=0755 container/kali-codex/analyze-headless-wrapper.sh /usr/local/bin/analyzeHeadless
 COPY --chmod=0755 container/kali-codex/ghidra-wrapper.sh /usr/local/bin/ghidra
+COPY --chmod=0755 container/kali-codex/glibc-aio-wrapper.sh /usr/local/bin/glibc-aio
 COPY --chmod=0755 container/kali-codex/vol-wrapper.sh /usr/local/bin/vol
 
 LABEL io.aurora.worker.profile="heavy" \

@@ -25,11 +25,11 @@
       "mcp_servers": {
         "aurora_reverse": {
           "backend": "rizin",
-          "tools": ["open_binary", "list_functions", "list_strings", "disassemble", "find_xrefs", "decompile_function", "close_session"]
+          "tools": ["triage_binary", "open_binary", "list_functions", "list_strings", "find_string_xrefs", "list_imports", "disassemble", "find_xrefs", "decompile_function", "close_session"]
         },
         "aurora_debug": {
           "backend": "gdb-mi",
-          "tools": ["start_session", "set_breakpoint", "run", "continue_execution", "step_instruction", "next_instruction", "read_registers", "read_memory", "evaluate", "backtrace", "disassemble", "stop_session"]
+          "tools": ["start_session", "set_breakpoint", "run", "continue_execution", "step_instruction", "next_instruction", "read_registers", "read_memory", "evaluate", "backtrace", "disassemble", "pwndbg_command", "stop_session"]
         },
         "aurora_blackboard": {
           "backend": "aurora-control-api",

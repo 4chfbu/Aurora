@@ -239,3 +239,5 @@ def test_context_builder_filters_removed_capability_tags(monkeypatch) -> None:
         snapshot = ContextBuilder().build(session, project_id=project.id, intent_id=intent.id)
         assert snapshot.sections_json["current_intent"]["capability_tags"] == ["blackboard.query", "http.request"]
         assert snapshot.sections_json["current_intent"]["capability_tags"] != intent.capability_tags
+        assert snapshot.sections_json["solver_playbook"]["challenge_type"] == "web"
+        assert snapshot.sections_json["solver_playbook"]["first_steps"]

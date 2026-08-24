@@ -15,5 +15,5 @@ fi
 build_args+=(--build-arg "AURORA_TOOL_MANIFEST_SHA=${MANIFEST_SHA}")
 docker build "${build_args[@]}" --target core -t "${CORE_IMAGE}" -t aurora-kali-codex:latest -f container/kali-codex/Dockerfile .
 docker build "${build_args[@]}" --target heavy -t "${HEAVY_IMAGE}" -f container/kali-codex/Dockerfile .
-docker run --rm "${CORE_IMAGE}" bash -lc 'cat /etc/os-release | sed -n "1,3p"; codex --version; rizin -v | head -n 1; gdb --version | head -n 1; test -f /opt/aurora-skills/glibc-heap-primitives/SKILL.md; grep -q "aurora-skills" /root/.codex/config.toml'
-docker run --rm -e AURORA_SMOKE_GHIDRA=1 -v "$(pwd)/scripts/smoke-local-mcp.py:/tmp/smoke-local-mcp.py:ro" "${HEAVY_IMAGE}" bash -lc 'command -v analyzeHeadless ghidra hashcat vol; python -c "import angr, volatility3, lief"; python /tmp/smoke-local-mcp.py; test -x "$(command -v glibc-aio)"; hashcat -I'
+docker run --rm "${CORE_IMAGE}" bash -lc 'set -e; cat /etc/os-release | sed -n "1,3p"; codex --version; rizin -v | head -n 1; gdb --version | head -n 1; pwndbg --version; test -f /opt/aurora-skills/glibc-heap-primitives/SKILL.md; grep -q "aurora-skills" /root/.codex/config.toml'
+docker run --rm -e AURORA_SMOKE_GHIDRA=1 -v "$(pwd)/scripts/smoke-local-mcp.py:/tmp/smoke-local-mcp.py:ro" "${HEAVY_IMAGE}" bash -lc 'set -e; command -v analyzeHeadless ghidra hashcat vol; python -c "import angr, volatility3, lief"; python /tmp/smoke-local-mcp.py; test -x "$(command -v glibc-aio)"; hashcat -I'

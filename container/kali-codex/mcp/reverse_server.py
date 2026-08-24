@@ -22,6 +22,7 @@ NUMERIC_SELECTOR = re.compile(r"^(?:0[xX][0-9a-fA-F]+|[0-9]+)$")
 RIZIN_NAME_PREFIXES = ("sym.", "fcn.", "loc.", "dbg.", "sub.")
 GHIDRA_ANALYSIS_TIMEOUT_SECONDS = 240
 GHIDRA_PROCESS_TIMEOUT_SECONDS = 270
+TRIAGE_OUTPUT_LIMIT = 6000
 
 
 def _session(session_id: str) -> dict[str, Any]:
@@ -90,6 +91,17 @@ def _rizin_decompile(pipe: Any, selector: str) -> tuple[str, str]:
     return disassembly, "disassembly"
 
 
+def _run_probe(command: list[str], *, timeout: float = 20.0) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"command": command, "exit_code": None, "output": f"{type(exc).__name__}: {exc}"[:TRIAGE_OUTPUT_LIMIT]}
+    output = (completed.stdout or "")
+    if completed.stderr:
+        output = f"{output}\n[stderr]\n{completed.stderr}"
+    return {"command": command, "exit_code": completed.returncode, "output": output[:TRIAGE_OUTPUT_LIMIT]}
+
+
 def _selector_alias(name: str) -> str:
     for prefix in RIZIN_NAME_PREFIXES:
         if name.startswith(prefix):
@@ -115,6 +127,31 @@ def open_binary(path: str, analyze: bool = True) -> dict[str, Any]:
 
 
 @mcp.tool()
+def triage_binary(path: str) -> dict[str, Any]:
+    """Collect bounded, structured ELF/PE triage before opening a reverse session."""
+    def operation() -> dict[str, Any]:
+        binary = workspace_path(path)
+        if not binary.is_file():
+            raise ValueError("binary path must be a file")
+        probes = [
+            ["file", "-b", str(binary)],
+            ["sha256sum", str(binary)],
+            ["checksec", f"--file={binary}"],
+            ["readelf", "-hW", str(binary)],
+            ["readelf", "-lW", str(binary)],
+            ["readelf", "-dW", str(binary)],
+        ]
+        results = [_run_probe(command) for command in probes]
+        return {
+            "path": str(binary),
+            "size": binary.stat().st_size,
+            "probes": results,
+            "next": ["open_binary", "list_strings", "find_string_xrefs"],
+        }
+    return audited("aurora_reverse", "triage_binary", {"path": path}, operation)
+
+
+@mcp.tool()
 def list_functions(session_id: str, query: str = "", offset: int = 0, limit: int = 100) -> dict[str, Any]:
     """List analyzed functions, optionally filtering by name."""
     def operation() -> dict[str, Any]:
@@ -137,6 +174,41 @@ def list_strings(session_id: str, query: str = "", offset: int = 0, limit: int =
         start = max(0, offset)
         return {"session_id": session_id, "total": len(strings), "strings": strings[start:start + max(1, min(limit, 500))]}
     return audited("aurora_reverse", "list_strings", {"session_id": session_id, "query": query, "offset": offset, "limit": limit}, operation)
+
+
+@mcp.tool()
+def find_string_xrefs(session_id: str, query: str, limit: int = 20) -> dict[str, Any]:
+    """Find strings matching query and their code cross-references."""
+    def operation() -> dict[str, Any]:
+        needle = _target(query).strip()
+        if not needle:
+            raise ValueError("query must not be empty")
+        pipe = _session(session_id)["pipe"]
+        strings = [item for item in (pipe.cmdj("izj") or []) if isinstance(item, dict)]
+        matches = [item for item in strings if needle.lower() in str(item.get("string", "")).lower()]
+        rows: list[dict[str, Any]] = []
+        for item in matches[:max(1, min(limit, 100))]:
+            raw_address = item.get("vaddr") or item.get("paddr") or item.get("offset")
+            try:
+                address = int(raw_address)
+            except (TypeError, ValueError):
+                rows.append({"string": item.get("string"), "address": raw_address, "xrefs": []})
+                continue
+            xrefs = pipe.cmdj(f"axtj @ {hex(address)}") or []
+            rows.append({"string": item.get("string"), "address": hex(address), "xrefs": xrefs[:50]})
+        return {"session_id": session_id, "query": needle, "total_matches": len(matches), "matches": rows}
+    return audited("aurora_reverse", "find_string_xrefs", {"session_id": session_id, "query": query, "limit": limit}, operation)
+
+
+@mcp.tool()
+def list_imports(session_id: str, query: str = "", limit: int = 100) -> dict[str, Any]:
+    """List imported symbols to identify input, parsing, crypto and sink APIs."""
+    def operation() -> dict[str, Any]:
+        imports = [item for item in (_session(session_id)["pipe"].cmdj("iij") or []) if isinstance(item, dict)]
+        if query:
+            imports = [item for item in imports if query.lower() in str(item.get("name", "")).lower()]
+        return {"session_id": session_id, "query": query, "total": len(imports), "imports": imports[:max(1, min(limit, 500))]}
+    return audited("aurora_reverse", "list_imports", {"session_id": session_id, "query": query, "limit": limit}, operation)
 
 
 @mcp.tool()

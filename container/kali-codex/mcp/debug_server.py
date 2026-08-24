@@ -1,7 +1,10 @@
 import re
 import shlex
+import shutil
 import sys
+from itertools import count
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +19,15 @@ mcp = FastMCP("aurora_debug")
 SESSIONS: dict[str, GdbController] = {}
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ALLOWED_ENV = {"LD_LIBRARY_PATH", "LD_PRELOAD", "PATH", "LANG", "LC_ALL", "TERM"}
+PWNDBG_COMMANDS = {
+    "checksec", "context", "contextnext", "contextprev", "contextsearch", "regs", "vmmap", "vmmap-explore",
+    "telescope", "hexdump", "search", "got", "gotplt", "plt", "canary", "retaddr", "stack", "stackf",
+    "cyclic", "xinfo", "p2p", "probeleak", "parse-seccomp", "libcinfo", "heap", "tcache", "vis-heap-chunks",
+    "nextcall", "nextjmp", "nextret", "nextsyscall", "bt", "info",
+}
+PWNDBG_RESPONSE_ROWS = 128
+PWNDBG_RESPONSE_TEXT = 4096
+MI_TOKENS = count(1)
 
 
 def _controller(session_id: str) -> GdbController:
@@ -25,9 +37,45 @@ def _controller(session_id: str) -> GdbController:
 
 
 def _write(session_id: str, command: str, timeout: float = 10.0) -> dict[str, Any]:
-    responses = _controller(session_id).write(command, timeout_sec=timeout, raise_error_on_timeout=False)
+    if not command.startswith("-"):
+        raise ValueError("GDB/MI command must start with '-'")
+    controller = _controller(session_id)
+    token = str(next(MI_TOKENS))
+    controller.write(f"{token}{command}", timeout_sec=timeout, raise_error_on_timeout=False, read_response=False)
+    deadline = monotonic() + timeout
+    responses: list[dict[str, Any]] = []
+    completed = False
+    while not completed and (remaining := deadline - monotonic()) > 0:
+        batch = controller.get_gdb_response(timeout_sec=min(0.25, remaining), raise_error_on_timeout=False)
+        responses.extend(batch)
+        completed = any(
+            row.get("type") == "result" and str(row.get("token")) == token
+            for row in batch
+        )
     errors = [row for row in responses if row.get("message") == "error"]
-    return {"session_id": session_id, "command": command, "responses": responses, "errors": errors}
+    return {
+        "session_id": session_id,
+        "command": command,
+        "responses": responses,
+        "errors": errors,
+        "completed": completed,
+        "timed_out": not completed,
+    }
+
+
+def _debugger_command() -> list[str]:
+    """Prefer the packaged Pwndbg launcher while retaining a GDB fallback."""
+    return [shutil.which("pwndbg") or "gdb", "--quiet", "--interpreter=mi3"]
+
+
+def _bound_pwndbg_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:PWNDBG_RESPONSE_TEXT]
+    if isinstance(value, list):
+        return [_bound_pwndbg_value(item) for item in value[:PWNDBG_RESPONSE_ROWS]]
+    if isinstance(value, dict):
+        return {str(key): _bound_pwndbg_value(item) for key, item in value.items()}
+    return value
 
 
 @mcp.tool()
@@ -41,15 +89,25 @@ def start_session(program: str, args: list[str] | None = None, cwd: str = "/work
         for name in (env or {}):
             if name not in ALLOWED_ENV or not ENV_NAME.fullmatch(name):
                 raise ValueError(f"environment variable is not allowed: {name}")
-        controller = GdbController(command=["gdb", "--quiet", "--interpreter=mi3"])
+        controller = GdbController(command=_debugger_command())
         session_id = f"dbg_{uuid4().hex[:12]}"
         SESSIONS[session_id] = controller
-        _write(session_id, f"-file-exec-and-symbols {shlex.quote(str(executable))}")
-        _write(session_id, f"-environment-cd {shlex.quote(str(working_dir))}")
-        if args:
-            _write(session_id, "-exec-arguments " + " ".join(shlex.quote(str(item)) for item in args))
-        for name, value in (env or {}).items():
-            _write(session_id, f"-gdb-set environment {name}={shlex.quote(str(value))}")
+        try:
+            setup = [
+                _write(session_id, "-gdb-set debuginfod enabled off", 30.0),
+                _write(session_id, f"-file-exec-and-symbols {shlex.quote(str(executable))}", 30.0),
+                _write(session_id, f"-environment-cd {shlex.quote(str(working_dir))}"),
+            ]
+            if args:
+                setup.append(_write(session_id, "-exec-arguments " + " ".join(shlex.quote(str(item)) for item in args)))
+            for name, value in (env or {}).items():
+                setup.append(_write(session_id, f"-gdb-set environment {name}={shlex.quote(str(value))}"))
+            if any(item["timed_out"] or item["errors"] for item in setup):
+                raise RuntimeError("debugger session setup did not complete successfully")
+        except Exception:
+            controller.exit()
+            del SESSIONS[session_id]
+            raise
         return {"session_id": session_id, "program": str(executable), "cwd": str(working_dir), "status": "ready"}
     return audited("aurora_debug", "start_session", {"program": program, "args": args or [], "cwd": cwd, "env": env or {}}, operation)
 
@@ -120,6 +178,33 @@ def backtrace(session_id: str, max_frames: int = 64) -> dict[str, Any]:
 def disassemble(session_id: str, location: str = "$pc") -> dict[str, Any]:
     """Disassemble a symbol, address, or the current program counter."""
     return audited("aurora_debug", "disassemble", locals(), lambda: _write(session_id, f"-interpreter-exec console {shlex.quote('disassemble /r ' + location)}"))
+
+
+def _validate_pwndbg_command(command: str) -> str:
+    value = command.strip()
+    forbidden = ("\n", "\r", ";", "`", "|", "&", "<", ">")
+    if not value or len(value) > 400 or any(character in value for character in forbidden):
+        raise ValueError("invalid Pwndbg command")
+    try:
+        parts = shlex.split(value)
+    except ValueError as exc:
+        raise ValueError("invalid Pwndbg command quoting") from exc
+    if not parts or parts[0] not in PWNDBG_COMMANDS:
+        raise ValueError(f"Pwndbg command is not allowlisted: {parts[0] if parts else ''}")
+    return value
+
+
+@mcp.tool()
+def pwndbg_command(session_id: str, command: str) -> dict[str, Any]:
+    """Run one bounded, allowlisted high-signal Pwndbg/GDB diagnostic command."""
+    value = _validate_pwndbg_command(command)
+    def operation() -> dict[str, Any]:
+        result = _write(session_id, f"-interpreter-exec console {shlex.quote(value)}")
+        original_rows = len(result["responses"])
+        result["responses"] = _bound_pwndbg_value(result["responses"])
+        result["truncated"] = original_rows > PWNDBG_RESPONSE_ROWS
+        return result
+    return audited("aurora_debug", "pwndbg_command", {"session_id": session_id, "command": value}, operation)
 
 
 @mcp.tool()

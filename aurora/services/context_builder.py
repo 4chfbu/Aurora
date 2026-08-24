@@ -11,6 +11,7 @@ from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, Chall
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.tool_contract import tools_for_runtime
 from aurora.services.tool_profiles import tool_environment
+from aurora.services.solver_playbooks import select_playbook
 
 
 SECRET_PATTERNS = [
@@ -109,6 +110,13 @@ class ContextBuilder:
             .where(ChallengeGroupItem.project_id == project_id, ChallengeGroupItem.fused_status != "COMPLETED")
             .order_by(ChallengeGroupItem.updated_at.desc())
         ).first()
+        evidence_text = " ".join(str(value or "") for value in (
+            project.name,
+            project.goal,
+            group_item.hint_content if group_item else "",
+            group_item.competition_meta if group_item else "",
+        ))
+        playbook = select_playbook(project.challenge_type, evidence_text)
         harvester_task = session.exec(
             select(WorkerEvent)
             .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "harvester.task_dispatched")
@@ -150,6 +158,14 @@ class ContextBuilder:
                 "required_for_solver_start": False,
             },
             "tool_environment": tool_environment(settings, project.challenge_type),
+            "solver_playbook": {
+                "challenge_type": playbook.challenge_type,
+                "confidence": playbook.confidence,
+                "first_steps": list(playbook.first_steps),
+                "stop_conditions": list(playbook.stop_conditions),
+                "capabilities": list(playbook.capabilities),
+                "discipline": "每轮只验证一个可证伪假设；5-10 分钟无新权限、Artifact 或候选空间收敛就保存 checkpoint 并止损。",
+            },
             "competition_context": {
                 "platform": str((group_item.competition_meta or {}).get("platform") or ""),
                 "phase": group_item.phase,
