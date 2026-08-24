@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from aurora.config import get_settings
 from aurora.models import Artifact, new_id
@@ -60,8 +60,22 @@ class ArtifactStore:
         artifact_type: str = "file",
         sensitivity: str = "normal",
         origin_kind: str = "unclassified",
+        deduplicate: bool = False,
     ) -> Artifact:
         data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if deduplicate:
+            existing = session.exec(
+                select(Artifact)
+                .where(
+                    Artifact.project_id == project_id,
+                    Artifact.sha256 == digest,
+                    Artifact.type == artifact_type,
+                )
+                .order_by(Artifact.created_at)
+            ).first()
+            if existing is not None and Path(existing.path).is_file():
+                return existing
         artifact_id = new_id("artifact")
         project_dir = self.base_dir / project_id
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -74,7 +88,7 @@ class ArtifactStore:
             source_attempt_id=source_attempt_id,
             type=artifact_type,
             path=str(path),
-            sha256=hashlib.sha256(data).hexdigest(),
+            sha256=digest,
             mime_type="application/octet-stream",
             size=len(data),
             summary=summary,

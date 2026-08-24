@@ -177,7 +177,7 @@ class ResultProcessor:
                     intent_id=attempt.intent_id,
                     attempt_id=attempt.id,
                     event_type="finding.flag_candidate",
-                    payload_json={"value": value, "candidate_id": flag_candidate.id, "status": "LOCAL_VERIFIED", "provenance_kind": provenance_kind, "evidence_refs": evidence_refs},
+                    payload_json={"value_hash": flag_candidate.value_hash, "candidate_id": flag_candidate.id, "status": "LOCAL_VERIFIED", "provenance_kind": provenance_kind, "evidence_refs": evidence_refs},
                 )
             )
             verified_flags.append((value, evidence_refs))
@@ -208,7 +208,8 @@ class ResultProcessor:
                         event_type="project.flag_ready",
                         payload_json={
                             "reason": "candidate flag passed local evidence validation",
-                            "candidate_flags": [value for value, _ in verified_flags],
+                            "candidate_count": len(verified_flags),
+                            "candidate_hashes": [hashlib.sha256(value.encode("utf-8")).hexdigest() for value, _ in verified_flags],
                         },
                     )
                 )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from collections.abc import Callable
 from typing import Any
 
@@ -9,7 +9,8 @@ from sqlmodel import Session, select
 
 from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
 from aurora.services.demo import run_one_demo_step
-from aurora.services.manager import ManagerService
+from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.services.manager import ManagerDecision, ManagerService
 from aurora.services.observer import ObserverService
 from aurora.services.project_run_control import project_run_control
 
@@ -20,6 +21,8 @@ class AutoRunLimits:
     max_minutes: int = 0
     no_progress_limit: int = 2
     stop_on_observer_escalate: bool = True
+    phase: int | None = None
+    deadline_at: datetime | None = None
 
 
 @dataclass
@@ -77,9 +80,17 @@ class AutoRunnerService:
             return AutoRunResult(project.status.lower(), "project_terminal", 0, project_id)
 
         started_at = now_utc()
+        deadline_at = limits.deadline_at
+        if deadline_at is None and limits.max_minutes > 0:
+            deadline_at = started_at + timedelta(minutes=limits.max_minutes)
         no_progress_count = 0
+        recovery_intent_seeded = False
         events: list[dict[str, Any]] = []
-        self._event(session, project_id, "autorun.started", {"limits": limits.__dict__, "run_id": run_id})
+        limits_payload = {
+            **limits.__dict__,
+            "deadline_at": deadline_at.isoformat() if deadline_at is not None else None,
+        }
+        self._event(session, project_id, "autorun.started", {"limits": limits_payload, "run_id": run_id})
 
         iteration = 0
         while limits.max_iterations <= 0 or iteration < limits.max_iterations:
@@ -94,7 +105,7 @@ class AutoRunnerService:
                 self._event(session, project_id, "autorun.completed", {"iteration": iteration - 1, "project_status": project.status})
                 reason = "candidate_ready" if project.status == "FLAG_READY" else "project_terminal"
                 return AutoRunResult(project.status.lower(), reason, iteration - 1, project_id, events)
-            if limits.max_minutes > 0 and now_utc() - started_at > timedelta(minutes=limits.max_minutes):
+            if deadline_at is not None and now_utc() >= deadline_at:
                 self._event(session, project_id, "autorun.stopped", {"reason": "max_minutes", "iteration": iteration - 1})
                 return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
 
@@ -117,9 +128,27 @@ class AutoRunnerService:
             manager_decision = None
             if not self._has_pending_intent(session, project_id):
                 manager_decision = ManagerService().run_project(session, project_id=project_id)
+                if not self._has_pending_intent(session, project_id) and not recovery_intent_seeded:
+                    self._seed_fallback_intent(
+                        session,
+                        project_id=project_id,
+                        phase=limits.phase or 1,
+                        deadline_at=deadline_at,
+                    )
+                    recovery_intent_seeded = True
+                    manager_decision = ManagerDecision("PROPOSED", "Scheduler seeded one fallback continuation intent to avoid an empty phase.")
                 if not self._has_pending_intent(session, project_id):
                     self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration - 1})
                     return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
+
+            if deadline_at is not None and not self._clamp_pending_intents_to_deadline(
+                session,
+                project_id=project_id,
+                phase=limits.phase,
+                deadline_at=deadline_at,
+            ):
+                self._event(session, project_id, "autorun.stopped", {"reason": "max_minutes", "iteration": iteration - 1})
+                return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
 
             before = self._counts(session, project_id)
             self._event(session, project_id, "autorun.iteration.started", {"iteration": iteration})
@@ -211,6 +240,127 @@ class AutoRunnerService:
         return session.exec(
             select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
         ).first() is not None
+
+    @staticmethod
+    def _seed_fallback_intent(
+        session: Session,
+        *,
+        project_id: str,
+        phase: int = 1,
+        deadline_at: datetime | None = None,
+    ) -> None:
+        """Create one explicit continuation Intent when the Manager has none.
+
+        An empty intent queue is not evidence of task completion.  Without this
+        fallback, a model turn that produced no validated checkpoints consumed a
+        scheduler phase and could retire a challenge without any runnable work.
+        """
+        project = session.get(Project, project_id)
+        objective = (
+            "Continue the current challenge using the retained artifacts, facts, "
+            "checkpoints, and prior failure feedback; choose one different evidence-backed "
+            "route and produce a reproducible result."
+        )
+        tags = ["blackboard.query", "codex.shell"]
+        budget = {"model_role": "solver", "phase": phase, "max_tool_calls": 5, "max_route_repeats": 3, "finalize_grace_seconds": 60}
+        if deadline_at is not None:
+            budget["phase_deadline_at"] = deadline_at.isoformat()
+        if project is not None and (project.target_url or project.challenge_type == "web"):
+            tags.append("http.request")
+        repository = BlackboardRepository()
+        repository.upsert_intent(
+            session,
+            project_id=project_id,
+            objective=objective,
+            capability_tags=tags,
+            priority=1.0,
+            risk_level="low",
+            budget=budget,
+        )
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                event_type="manager.fallback_intent_seeded",
+                payload_json={"objective": objective, "capability_tags": tags, "phase": phase},
+            )
+        )
+        session.commit()
+
+    @classmethod
+    def ensure_runnable_intent(
+        cls,
+        session: Session,
+        *,
+        project_id: str,
+        phase: int,
+        deadline_at: datetime | None,
+    ) -> bool:
+        """Materialize and budget work before a scarce target is allocated."""
+        if not cls._has_pending_intent(session, project_id):
+            ManagerService().run_project(session, project_id=project_id)
+        if not cls._has_pending_intent(session, project_id):
+            cls._seed_fallback_intent(
+                session,
+                project_id=project_id,
+                phase=phase,
+                deadline_at=deadline_at,
+            )
+        if not cls._has_pending_intent(session, project_id):
+            return False
+        if deadline_at is None:
+            return True
+        return cls._clamp_pending_intents_to_deadline(
+            session,
+            project_id=project_id,
+            phase=phase,
+            deadline_at=deadline_at,
+        )
+
+    @staticmethod
+    def _clamp_pending_intents_to_deadline(
+        session: Session,
+        *,
+        project_id: str,
+        phase: int | None,
+        deadline_at: datetime,
+    ) -> bool:
+        """Apply the remaining absolute phase budget to every new runnable Intent."""
+        remaining_seconds = int((deadline_at - now_utc()).total_seconds())
+        if remaining_seconds < 2:
+            return False
+        intents = session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+        ).all()
+        for intent in intents:
+            budget = dict(intent.budget or {})
+            configured_hard = budget.get("hard_timeout_seconds")
+            try:
+                hard_timeout = min(int(configured_hard), remaining_seconds) if configured_hard is not None else remaining_seconds
+            except (TypeError, ValueError):
+                hard_timeout = remaining_seconds
+            hard_timeout = max(2, hard_timeout)
+            configured_grace = budget.get("finalize_grace_seconds", 60)
+            try:
+                finalize_grace = max(1, min(int(configured_grace), hard_timeout - 1))
+            except (TypeError, ValueError):
+                finalize_grace = min(60, hard_timeout - 1)
+            configured_soft = budget.get("soft_timeout_seconds")
+            default_soft = max(1, hard_timeout - finalize_grace)
+            try:
+                soft_timeout = min(int(configured_soft), default_soft) if configured_soft is not None else default_soft
+            except (TypeError, ValueError):
+                soft_timeout = default_soft
+            budget["hard_timeout_seconds"] = hard_timeout
+            budget["soft_timeout_seconds"] = max(1, min(soft_timeout, hard_timeout - 1))
+            budget["finalize_grace_seconds"] = finalize_grace
+            budget["phase_deadline_at"] = deadline_at.isoformat()
+            if phase is not None:
+                budget["phase"] = phase
+            intent.budget = budget
+            intent.updated_at = now_utc()
+            session.add(intent)
+        session.commit()
+        return bool(intents)
 
     @staticmethod
     def _latest_policy_denial(session: Session, project_id: str) -> dict[str, Any] | None:

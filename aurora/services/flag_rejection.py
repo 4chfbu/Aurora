@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from sqlmodel import Session
 
 from aurora.models import WorkerEvent
@@ -49,6 +51,11 @@ def record_flag_rejection(
             intent_id=intent_id,
             attempt_id=attempt_id,
             event_type=event_type,
-            payload_json={"value": value, "reason": reason, "evidence_refs": refs, "continue": True},
+            payload_json={
+                "value_hash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "reason": reason,
+                "evidence_refs": refs,
+                "continue": True,
+            },
         )
     )

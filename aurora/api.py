@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import logging
 from threading import Event, Lock, Thread
@@ -1282,7 +1283,7 @@ def create_app() -> FastAPI:
                 intent.status = "CANCELLED"
                 intent.updated_at = now_utc()
                 session.add(intent)
-            session.add(WorkerEvent(project_id=project_id, event_type="project.completed", payload_json={"reason": "flag manually accepted", "candidate_id": candidate.id, "value": candidate.value, "cancelled_intent_ids": [intent.id for intent in pending_intents]}))
+            session.add(WorkerEvent(project_id=project_id, event_type="project.completed", payload_json={"reason": "flag manually accepted", "candidate_id": candidate.id, "value_hash": hashlib.sha256(candidate.value.encode("utf-8")).hexdigest(), "cancelled_intent_ids": [intent.id for intent in pending_intents]}))
             session.add(project)
             session.add(candidate)
             session.commit()

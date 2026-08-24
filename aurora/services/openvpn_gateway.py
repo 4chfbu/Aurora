@@ -419,6 +419,8 @@ class OpenVPNGatewayRegistry:
         upper = logs.upper()
         if "AUTH_FAILED" in upper:
             summary = "OpenVPN authentication failed; check the VPN username, password, and client certificate"
+        elif "TLS KEY NEGOTIATION FAILED" in upper and "VERIFY OK" not in upper:
+            summary = "OpenVPN server did not reply to the UDP TLS handshake; check that the VPN instance is active and UDP reachability to the remote endpoint"
         elif "TLS ERROR" in upper or "TLS KEY NEGOTIATION FAILED" in upper:
             summary = "OpenVPN TLS negotiation failed; check UDP reachability and the client certificate/key"
         elif "VERIFY OK" in upper and "INITIALIZATION SEQUENCE COMPLETED" not in upper:

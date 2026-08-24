@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pathlib import Path
 
 os.environ["AURORA_DB_URL"] = "sqlite:////tmp/aurora_test.db"
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from aurora.api import create_app  # noqa: E402
 from aurora.db import engine  # noqa: E402
-from aurora.models import Project, WorkerEvent  # noqa: E402
+from aurora.models import Intent, Project, WorkerEvent, now_utc  # noqa: E402
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService  # noqa: E402
 from aurora.services.project_run_control import project_run_control  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
@@ -180,3 +181,55 @@ def test_autorun_api_returns_conflict_for_an_active_project_loop() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "project already has an active run"
+
+
+def test_autorunner_seeds_fallback_continuation_intent() -> None:
+    with Session(engine) as session:
+        project = Project(name="fallback-seed", goal="continue and solve")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+
+        AutoRunnerService()._seed_fallback_intent(session, project_id=project.id)
+
+        intent = session.exec(
+            select(Intent).where(Intent.project_id == project.id, Intent.status == "PENDING")
+        ).one()
+        event = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project.id,
+                WorkerEvent.event_type == "manager.fallback_intent_seeded",
+            )
+        ).one()
+        assert "different evidence-backed route" in intent.objective
+        assert intent.capability_tags == ["blackboard.query", "codex.shell"]
+        assert event.payload_json["phase"] == 1
+
+
+def test_pending_intent_is_clamped_to_absolute_phase_deadline() -> None:
+    with Session(engine) as session:
+        project = Project(name="deadline-clamp", goal="respect the phase deadline")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        intent = Intent(
+            project_id=project.id,
+            objective="dynamically proposed work",
+            budget={"model_role": "triage", "finalize_grace_seconds": 60},
+        )
+        session.add(intent)
+        session.commit()
+        deadline_at = now_utc() + timedelta(seconds=90)
+
+        assert AutoRunnerService._clamp_pending_intents_to_deadline(
+            session,
+            project_id=project.id,
+            phase=2,
+            deadline_at=deadline_at,
+        )
+
+        session.refresh(intent)
+        assert 2 <= intent.budget["hard_timeout_seconds"] <= 90
+        assert 1 <= intent.budget["soft_timeout_seconds"] < intent.budget["hard_timeout_seconds"]
+        assert intent.budget["phase"] == 2
+        assert intent.budget["phase_deadline_at"] == deadline_at.isoformat()

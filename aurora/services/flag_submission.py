@@ -180,7 +180,7 @@ class FlagSubmissionService:
         session.add_all([item, candidate])
         self._event(
             session, item, "group.item.flag_submission_unavailable",
-            {"project_id": item.project_id, "candidate_id": candidate.id, "value": candidate.value, "reason": reason},
+            {"project_id": item.project_id, "candidate_id": candidate.id, "value_hash": candidate.value_hash, "reason": reason},
         )
         session.commit()
         return FlagSubmissionOutcome("unavailable", candidate.id, None, False, reason, {})
@@ -195,7 +195,7 @@ class FlagSubmissionService:
         detail: dict[str, Any],
     ) -> FlagSubmissionOutcome:
         accepted_at = now_utc()
-        item.submission_status = "SUBMITTED" if completed else "PARTIAL"
+        item.submission_status = "ACCEPTED" if completed else "PARTIAL"
         candidate.status = "ACCEPTED"
         candidate.updated_at = accepted_at
         project = session.get(Project, item.project_id)
@@ -245,7 +245,7 @@ class FlagSubmissionService:
                 payload_json={
                     "reason": "competition platform accepted flag",
                     "candidate_id": candidate.id,
-                    "value": candidate.value,
+                    "value_hash": candidate.value_hash,
                     "cancelled_intent_ids": [intent.id for intent in pending],
                 },
             ))
@@ -326,7 +326,7 @@ class FlagSubmissionService:
             )
         self._event(
             session, item, "group.item.flag_submission_rejected",
-            {"project_id": item.project_id, "candidate_id": candidate.id, "value": candidate.value, "reason": reason, **detail},
+            {"project_id": item.project_id, "candidate_id": candidate.id, "value_hash": candidate.value_hash, "reason": reason, **detail},
             )
         return FlagSubmissionOutcome("rejected", candidate.id, False, False, reason, detail)
 

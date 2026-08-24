@@ -11,6 +11,7 @@ from sqlmodel import Session, create_engine, select
 import pytest
 
 from aurora.services.worker_runtime import CodexHarnessRuntime, OpenAICompatibleRuntime, get_worker_runtime
+from aurora.services.demo import _attempt_shell_artifact_refs
 
 
 def test_default_worker_runtime_is_codex(monkeypatch) -> None:
@@ -396,6 +397,51 @@ def test_codex_harness_classifies_unavailable_cc_switch(monkeypatch, tmp_path) -
     assert output["failed_attempts"][0]["reason"] == "provider_unavailable"
 
 
+def test_native_shell_artifacts_are_promoted_to_result_evidence() -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    worker = Worker(id="worker_shell_artifacts", project_id="proj_shell_artifacts", intent_id="intent_shell_artifacts")
+    attempt = Attempt(
+        id="attempt_shell_artifacts",
+        project_id="proj_shell_artifacts",
+        intent_id="intent_shell_artifacts",
+        worker_id=worker.id,
+    )
+    session = Session(engine)
+    session.add(worker)
+    session.add(attempt)
+    session.add_all([
+        ToolTrace(
+            id="trace_shell_first",
+            project_id=attempt.project_id,
+            worker_id=worker.id,
+            intent_id=attempt.intent_id,
+            attempt_id=attempt.id,
+            tool_name="codex.shell",
+            request_json={"command": "curl target"},
+            artifact_refs=["artifact_target", "artifact_shared"],
+        ),
+        ToolTrace(
+            id="trace_shell_second",
+            project_id=attempt.project_id,
+            worker_id=worker.id,
+            intent_id=attempt.intent_id,
+            attempt_id=attempt.id,
+            tool_name="codex.shell",
+            request_json={"command": "read evidence"},
+            artifact_refs=["artifact_shared", "artifact_local"],
+        ),
+    ])
+    session.commit()
+
+    assert _attempt_shell_artifact_refs(session, attempt.id) == [
+        "artifact_target",
+        "artifact_shared",
+        "artifact_local",
+    ]
+    session.close()
+
+
 def test_codex_harness_bounds_transcript_by_bytes(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_CODEX_TRANSCRIPT_MAX_BYTES", "2048")
     get_settings.cache_clear()
@@ -668,6 +714,19 @@ def test_codex_runtime_imports_local_mcp_events(tmp_path) -> None:
     assert traces[0].tool_name == "mcp.aurora_reverse.open_binary"
     assert traces[0].request_json["duration_ms"] == 12
     assert artifacts[0].type == "mcp-tool-log"
+
+
+def test_artifact_store_deduplicates_resume_files_within_project(tmp_path) -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    source = tmp_path / "state.bin"
+    source.write_bytes(b"stable resume state")
+    store = ArtifactStore(tmp_path / "artifacts")
+    with Session(engine) as session:
+        first = store.write_file(session, project_id="project", source=source, summary="first", artifact_type="resume-work-file", deduplicate=True)
+        second = store.write_file(session, project_id="project", source=source, summary="second", artifact_type="resume-work-file", deduplicate=True)
+        assert second.id == first.id
+        assert len(session.exec(select(Artifact)).all()) == 1
 
 
 def test_codex_action_progress_comparison_accepts_sqlite_naive_timestamp() -> None:

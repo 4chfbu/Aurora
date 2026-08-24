@@ -6,7 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from aurora.config import get_settings
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 settings = get_settings()
@@ -97,6 +97,8 @@ def _add_sqlite_columns() -> None:
             "hint_taken": "BOOLEAN DEFAULT 0",
             "hint_content": "TEXT",
             "submission_status": "TEXT DEFAULT 'NOT_SUBMITTED'",
+            "phase_started_at": "DATETIME",
+            "phase_deadline_at": "DATETIME",
         },
     }
     inspector = inspect(engine)
@@ -110,6 +112,7 @@ def _add_sqlite_columns() -> None:
             text("CREATE UNIQUE INDEX IF NOT EXISTS uq_flagcandidate_project_value ON flagcandidate (project_id, value_hash)")
         )
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_attempt_resume_manifest_artifact_id ON attempt (resume_manifest_artifact_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_challengegroupitem_phase_deadline_at ON challengegroupitem (phase_deadline_at)"))
 
 
 def _record_schema_version() -> None:

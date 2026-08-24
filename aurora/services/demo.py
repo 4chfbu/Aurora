@@ -493,6 +493,25 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
         )
         session.commit()
 
+    # Native Codex shell calls are persisted asynchronously while the Harness
+    # streams. The model only sees workspace paths, not the server-side
+    # Artifact IDs created for those calls, so merge them before evidence and
+    # flag processing. FlagValidator still applies the trusted-origin gate.
+    shell_artifact_refs = _attempt_shell_artifact_refs(session, attempt.id)
+    if shell_artifact_refs:
+        model_artifact_refs = [
+            ref
+            for ref in (structured.get("artifact_refs", []) if isinstance(structured.get("artifact_refs"), list) else [])
+            if isinstance(ref, str) and ref
+        ]
+        structured["artifact_refs"] = list(dict.fromkeys([
+            *model_artifact_refs,
+            *shell_artifact_refs,
+        ]))
+        runtime_output.llm_trace.structured_output = structured
+        session.add(runtime_output.llm_trace)
+        session.commit()
+
     attempt.tool_calls = tool_calls
     if not scheduler.owns_active_lease(session, intent=intent, worker=worker):
         # A background reaper already made the authoritative timeout decision.
@@ -586,6 +605,22 @@ def _activity_label(tool_request: dict) -> str:
         "python.analyze": "正在尝试 Python 分析", "php.unserialize": "正在尝试反序列化", "blackboard.query": "正在查询解题上下文",
     }
     return labels.get(tool_name, f"正在执行 {tool_name or '工具操作'}")
+
+
+def _attempt_shell_artifact_refs(session: Session, attempt_id: str) -> list[str]:
+    """Return server-side Artifact IDs emitted by native shell actions."""
+    refs: list[str] = []
+    traces = session.exec(
+        select(ToolTrace).where(
+            ToolTrace.attempt_id == attempt_id,
+            ToolTrace.tool_name == "codex.shell",
+        ).order_by(ToolTrace.created_at)
+    ).all()
+    for trace in traces:
+        for artifact_ref in trace.artifact_refs or []:
+            if isinstance(artifact_ref, str) and artifact_ref and artifact_ref not in refs:
+                refs.append(artifact_ref)
+    return refs
 
 
 def _route_request(project_id: str, tool_name: str, request: object) -> dict:

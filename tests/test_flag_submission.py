@@ -3,7 +3,7 @@ from pathlib import Path
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import get_settings
-from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupItem, Fact, FlagCandidate, Project, ToolTrace
+from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupItem, Fact, FlagCandidate, Project, ToolTrace, WorkerEvent
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.command_runner import LocalCommandRunner
@@ -106,7 +106,12 @@ def test_verify_then_submit_latest_verified_candidate(monkeypatch, tmp_path) -> 
         assert candidate.submission_count == 1
         assert project is not None and project.status == "COMPLETED"
         assert item is not None
-        assert item.submission_status == "SUBMITTED"
+        assert item.submission_status == "ACCEPTED"
+        completed_event = session.exec(
+            select(WorkerEvent).where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "project.completed")
+        ).one()
+        assert completed_event.payload_json["value_hash"] == candidate.value_hash
+        assert "value" not in completed_event.payload_json
         assert item.status == "COMPLETED"
         assert item.fused_status == "COMPLETED"
         assert item.finished_at is not None

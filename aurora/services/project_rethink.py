@@ -37,7 +37,7 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
     reset_group_item_ids: list[str] = []
     group_ids: set[str] = set()
     for group_item in session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project_id)).all():
-        if group_item.fused_status == "COMPLETED" or group_item.submission_status in {"SUBMITTED", "MANUALLY_ACCEPTED"}:
+        if group_item.fused_status == "COMPLETED" or group_item.submission_status in {"SUBMITTED", "ACCEPTED", "MANUALLY_ACCEPTED"}:
             continue
         group_item.status = "PENDING"
         group_item.fused_status = "PENDING"
@@ -47,6 +47,8 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         group_item.submission_status = "NOT_SUBMITTED"
         group_item.stop_reason = None
         group_item.started_at = None
+        group_item.phase_started_at = None
+        group_item.phase_deadline_at = None
         group_item.finished_at = None
         group_item.updated_at = now_utc()
         session.add(group_item)
@@ -56,7 +58,7 @@ def rethink_project(session: Session, *, project_id: str) -> Intent:
         group = session.get(ChallengeGroup, group_id)
         if group is None:
             continue
-        if group.status in {"COMPLETED", "FAILED", "STOPPED", "WAITING_INPUT", "AWAITING_MANUAL_VALIDATION"}:
+        if group.status in {"COMPLETED", "FAILED", "STOPPED", "WAITING_INPUT", "WAITING_RESOURCE", "AWAITING_MANUAL_VALIDATION"}:
             group.status = "READY"
             group.finished_at = None
         if group.current_item_id in reset_group_item_ids:

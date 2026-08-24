@@ -119,6 +119,15 @@ def test_openvpn_timeout_explains_incomplete_handshake() -> None:
     assert "VERIFY OK" in detail
 
 
+def test_openvpn_timeout_without_server_reply_points_to_endpoint_or_udp() -> None:
+    detail = OpenVPNGatewayRegistry._connection_failure_detail(
+        "TLS key negotiation failed to occur within 60 seconds (check your network connectivity)",
+        75,
+    )
+    assert "did not reply" in detail
+    assert "UDP" in detail
+
+
 def test_gateway_command_is_isolated_and_routes_only_selected_networks() -> None:
     gateway = FakeGateway()
     gateway._payload = {"ovpn": PROFILE.decode(), "username": "alice", "password": "vpn-secret"}

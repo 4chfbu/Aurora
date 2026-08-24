@@ -414,7 +414,10 @@ class HandsFreeService:
                 "title": challenge.title[:500],
                 "description": challenge.description[:5000],
                 "challenge_url": f"{self.settings.tsecbench_base_url.rstrip('/')}/openapi/v1/challenges?unique_code={quote(challenge.unique_code, safe='')}",
-                "challenge_type": self._challenge_type(f"{challenge.challenge_type} {challenge.unique_code}", []),
+                "challenge_type": self._challenge_type(
+                    f"{challenge.challenge_type or ''} {challenge.unique_code} {challenge.title} {challenge.description}",
+                    [],
+                ),
                 "confidence": 1.0,
                 "attachment_urls": [],
                 "source_metadata": metadata,
@@ -769,7 +772,15 @@ class HandsFreeService:
     @staticmethod
     def _challenge_type(category: str, tags: list[str]) -> str:
         text = " ".join([category, *tags]).lower()
-        for pattern, challenge_type in ((r"\bweb\b", "web"), (r"\bpwn\b|binary exploitation", "pwn"), (r"crypto", "crypto"), (r"reverse|reversing|\bre\b", "reverse"), (r"forensic", "forensics"), (r"misc|osint|steg", "misc")):
+        patterns = (
+            (r"\bweb\b|网站|网页|登录|sql注入|xss|ssrf|csrf|命令注入|文件上传", "web"),
+            (r"\bpwn\b|binary exploitation|栈溢出|堆利用|格式化字符串|\brop\b", "pwn"),
+            (r"crypto|密码学|加密|解密|密文|签名算法", "crypto"),
+            (r"reverse|reversing|\bre\b|逆向|反编译|固件|恶意代码分析", "reverse"),
+            (r"forensic|取证|流量分析|内存分析|日志分析", "forensics"),
+            (r"misc|osint|steg|杂项|隐写|开源情报", "misc"),
+        )
+        for pattern, challenge_type in patterns:
             if re.search(pattern, text):
                 return challenge_type
         return "unknown"

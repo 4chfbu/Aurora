@@ -1030,6 +1030,7 @@ class CodexHarnessRuntime:
                 artifact_type="resume-work-file",
                 sensitivity="restricted",
                 origin_kind="runtime_state",
+                deduplicate=True,
             )
             work_files.append({
                 "path": str(relative),

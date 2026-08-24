@@ -201,6 +201,71 @@ class TSecBenchCompetitionAdapter:
     def _running(status: object) -> bool:
         return str(status or "").strip().lower() in {"available", "running", "started", "starting", "active", "up", "online"}
 
+    @classmethod
+    def _occupies_capacity(cls, meta: dict[str, object]) -> bool:
+        status = str(meta.get("container_status") or "").strip().lower()
+        return bool(cls._addresses(meta.get("container_addr"))) and (
+            cls._running(status) or status in {"release_failed", "releasing", "unknown"}
+        )
+
+    @staticmethod
+    def _capacity_exhausted(exc: TSecBenchError) -> bool:
+        """Normalize platform quota responses into a scheduler-owned reason."""
+        detail = " ".join(
+            str(value or "")
+            for value in (exc.code, exc.status, exc, exc.detail)
+        ).strip().lower()
+        return (
+            exc.status == 429
+            or str(exc.code or "").strip().lower() == "resource_unavailable"
+            or any(
+                marker in detail
+                for marker in (
+                    "capacity exhausted",
+                    "capacity_exhausted",
+                    "max active challenge instances reached",
+                    "maximum active challenge instances",
+                    "too many active challenge instances",
+                    "no available challenge instance",
+                )
+            )
+        )
+
+    @staticmethod
+    def _already_released(exc: Exception) -> bool:
+        """Return whether a close failure confirms that no live task remains."""
+        code = str(getattr(exc, "code", "") or "").strip().lower()
+        message = str(exc).strip().lower()
+        return code in {"task_not_found", "challenge_not_found"} or any(
+            marker in message
+            for marker in (
+                "already finished",
+                "already closed",
+                "task does not exist",
+                "challenge does not exist",
+                "task not found",
+                "challenge not found",
+            )
+        )
+
+    def _reconcile_release_failures(self, session: Session, *, exclude_project_id: str) -> None:
+        stale_items = session.exec(select(ChallengeGroupItem)).all()
+        for stale in stale_items:
+            meta = stale.competition_meta or {}
+            if (
+                stale.project_id == exclude_project_id
+                or str(meta.get("platform") or "").strip().lower() != "tsecbench"
+                or str(meta.get("container_status") or "").strip().lower() != "release_failed"
+            ):
+                continue
+            try:
+                self.close_environment(project_id=stale.project_id, session=session)
+                session.commit()
+            except Exception:
+                # Ambiguous failures remain capacity-owning and can be retried by
+                # a later admission attempt without advertising a false vacancy.
+                session.commit()
+
     def ensure_environment(self, session: Session, *, project_id: str) -> EnvironmentHealth:
         if not self.settings.tsecbench_configured:
             return EnvironmentHealth(False, "tsecbench is not configured; set AURORA_TSECBENCH_TOKEN")
@@ -226,11 +291,12 @@ class TSecBenchCompetitionAdapter:
             # final authority, but avoiding the fourth request locally makes
             # quota pressure a normal waiting state instead of an API error.
             with self._allocation_lock:
+                self._reconcile_release_failures(session, exclude_project_id=project_id)
+                session.expire_all()
                 active_projects = {
                     current.project_id
                     for current in session.exec(select(ChallengeGroupItem)).all()
-                    if self._running((current.competition_meta or {}).get("container_status"))
-                    and bool(self._addresses((current.competition_meta or {}).get("container_addr")))
+                    if self._occupies_capacity(current.competition_meta or {})
                     and str((current.competition_meta or {}).get("platform") or "").lower() == "tsecbench"
                 }
                 if project_id not in active_projects and len(active_projects) >= max(1, int(self.settings.tsecbench_max_concurrent or 1)):
@@ -240,6 +306,8 @@ class TSecBenchCompetitionAdapter:
                 except TSecBenchNeedsSession as exc:
                     return EnvironmentHealth(False, str(exc))
                 except TSecBenchError as exc:
+                    if self._capacity_exhausted(exc):
+                        return EnvironmentHealth(False, "tsecbench_capacity_exhausted")
                     return EnvironmentHealth(False, str(exc))
             started_scheme = self._default_scheme(project, started)
             started_addresses = self._addresses(started, default_scheme=started_scheme)
@@ -318,33 +386,46 @@ class TSecBenchCompetitionAdapter:
         # again when the phase becomes terminal. Keep it idempotent so a
         # successful release cannot turn into a spurious platform error.
         try:
-            if self._running(meta.get("container_status")) or bool(self._addresses(meta.get("container_addr"))):
+            if self._occupies_capacity(meta) or bool(self._addresses(meta.get("container_addr"))):
                 self.client.close(code)
-        finally:
-            # Platform close failures must still clear the local "available"
-            # state. Otherwise the capacity check keeps counting a released or
-            # dead challenge as occupied and later projects remain blocked.
-            self._codes.pop(project_id, None)
-            meta["container_status"] = "stopped"
-            meta["container_addr"] = []
-            item.competition_meta = meta
-            session.add(item)
-            project = session.get(Project, project_id)
-            if project is not None:
-                old_hosts = {
-                    (urlparse(value).hostname or "").lower().rstrip(".")
-                    for value in self._addresses(project.target_url)
-                }
-                project.target_url = None
-                project.target_verification_status = "UNVERIFIED"
-                project.target_verification_reason = "TSecBench target was released"
-                project.target_verified_at = None
-                project.updated_at = now_utc()
-                session.add(project)
-                scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project_id)).first()
-                if scope is not None and old_hosts:
-                    scope.allowed_hosts = [host for host in scope.allowed_hosts if host not in old_hosts]
-                    session.add(scope)
+        except Exception as exc:
+            if self._already_released(exc):
+                pass
+            else:
+            # A timeout is ambiguous: the platform may still own the scarce
+            # slot. Retain the address and authorization until a retry confirms
+            # release instead of advertising a false local vacancy.
+                meta["container_status"] = "release_failed"
+                item.competition_meta = meta
+                session.add(item)
+                project = session.get(Project, project_id)
+                if project is not None:
+                    project.target_verification_reason = "TSecBench target release is pending confirmation"
+                    project.updated_at = now_utc()
+                    session.add(project)
+                raise
+
+        self._codes.pop(project_id, None)
+        meta["container_status"] = "stopped"
+        meta["container_addr"] = []
+        item.competition_meta = meta
+        session.add(item)
+        project = session.get(Project, project_id)
+        if project is not None:
+            old_hosts = {
+                (urlparse(value).hostname or "").lower().rstrip(".")
+                for value in self._addresses(project.target_url)
+            }
+            project.target_url = None
+            project.target_verification_status = "UNVERIFIED"
+            project.target_verification_reason = "TSecBench target was released"
+            project.target_verified_at = None
+            project.updated_at = now_utc()
+            session.add(project)
+            scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project_id)).first()
+            if scope is not None and old_hosts:
+                scope.allowed_hosts = [host for host in scope.allowed_hosts if host not in old_hosts]
+                session.add(scope)
 
     def fetch_hint(self, session: Session, *, project_id: str) -> str | None:
         item = self._item(session, project_id)

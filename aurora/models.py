@@ -289,6 +289,8 @@ class ChallengeGroupItem(SQLModel, table=True):
     submission_status: str = "NOT_SUBMITTED"
     stop_reason: str | None = None
     started_at: datetime | None = None
+    phase_started_at: datetime | None = None
+    phase_deadline_at: datetime | None = Field(default=None, index=True)
     finished_at: datetime | None = None
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
