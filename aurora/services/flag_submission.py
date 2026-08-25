@@ -342,15 +342,8 @@ class FlagSubmissionService:
                 FlagCandidate.value_hash == value_hash,
             )
         ).first()
-        if candidate is not None:
-            return candidate
-        candidate = FlagCandidate(
-            project_id=project_id,
-            value=normalized,
-            value_hash=value_hash,
-            status="PROPOSED",
-            provenance_kind="DIRECT_SUBMISSION",
-        )
-        session.add(candidate)
-        session.flush()
+        if candidate is None:
+            return None
+        if candidate.status not in {"LOCAL_VERIFIED", "ACCEPTED", "REJECTED", "SUBMITTED", "AWAITING_MANUAL_VALIDATION"}:
+            return None
         return candidate

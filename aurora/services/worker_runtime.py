@@ -893,6 +893,9 @@ class CodexHarnessRuntime:
         config_source = Path.cwd() / "container" / "kali-codex" / "codex-config.toml"
         if config_source.is_file():
             shutil.copy2(config_source, runtime_dir / "codex-config.toml")
+        rules_source = Path.cwd() / ".codex" / "rules"
+        if rules_source.is_dir():
+            shutil.copytree(rules_source, workspace / ".codex" / "rules", dirs_exist_ok=True)
         return prompt_file
 
     def _import_mcp_events(
@@ -1370,6 +1373,12 @@ class CodexHarnessRuntime:
             return "provider_unavailable"
         if "maximum context length" in lowered or "context_length_exceeded" in lowered:
             return "context_length_exceeded"
+        if "reasoning_content must be passed back" in lowered:
+            return "provider_reasoning_error"
+        if "model metadata not found" in lowered:
+            return "provider_model_metadata_missing"
+        if "reasoning_content" in lowered:
+            return "provider_reasoning_error"
         if '"type":"invalid_request_error"' in lowered or "invalid_request_error" in lowered:
             return "provider_invalid_request"
         return None

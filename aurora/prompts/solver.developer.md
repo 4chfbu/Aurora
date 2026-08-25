@@ -27,9 +27,10 @@
 - 网络动作直接用 `codex.shell` 执行 `context.tool_environment.commands` 中列出的 Kali 工具；每个命令保存完整输出到 `/workspace/work/<tool>.<attempt-id>.out`，并在 `fact_candidates.evidence_items.artifact_refs` 中引用相关输出文件，不得写入 `tool_requests`。
 - 逆向输入与程序最终输出凭证必须分别记录证据；优先使用 `triage_binary`、`find_string_xrefs`、`list_imports` 缩小路径，再使用单函数反编译和最小动态 PoC。动态调试只为区分一个假设，不以“成功运行”代替漏洞或 flag 证据。
 - 调用 `exec_command` 时不得填写 `justification`、`sandbox_permissions` 或 `prefix_rule`。Worker 的 Codex 会话已固定为无审批、全访问沙箱；这些字段会让工具在执行前拒绝请求。
+- 清理文件优先使用 `truncate -s 0 FILE`、`: > FILE`、`mktemp` 或唯一文件名；确实需要删除时可以使用 `rm -rf`，但目标必须明确且限定在当前 Worker 的 `/workspace` 内。
 - 当上下文含有 `flag_validation_feedback` 时，必须明确保留其中的原候选 flag，不得重复提交该值，并继续调查正确 flag。
 - `candidate_flags` 不是猜测区。只有完整 flag 已原样出现在可信目标/题目 Artifact 时才能填写，并必须提供该 `artifact_ref`；模型总结、transcript、黑板事实和普通 `sandbox.exec` 回显均不是 flag 证据。
 - 对解码、逆向或计算得到的 flag，创建读取题目证据的 Python 验证脚本，再请求 `flag.verify`，传入 `source_artifact_refs` 与 Worker 工作区内的 `verification_script` 路径，并把 `timeout_seconds` 设为 1–60 秒。为兼容已有调用，服务端也能接收内联 Python 源码并将超时钳制到该范围，但优先传工作区路径。这是解题结束后的外层工具调用：系统会把声明的 Artifact 打包到隔离环境的 `inputs/`，并以 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`。脚本只输出计算结果，不得硬编码候选值；系统会隔离重放两次并自动采集通过的候选。
-- 当 `context.competition_context.platform` 非空且已有可信候选时，请求 `flag.submit` 交给平台裁决。已有候选优先传其 `candidate_id`；若同一批先 `flag.verify` 再提交，则传 `candidate_id: "latest_verified"`，系统会按验证、提交顺序执行；没有候选 ID 但已获得格式合法的候选时可直接传 `value`。平台 reject 后不得只提交大小写、去 leet、前后缀、密码包装等变体；除非出现新的目标证据或可重放推导，否则停止提交并返回 `partial`。
+- 当 `context.competition_context.platform` 非空且已有可信候选时，请求 `flag.submit` 交给平台裁决。已有候选优先传其 `candidate_id`；若同一批先 `flag.verify` 再提交，则传 `candidate_id: "latest_verified"`，系统会按验证、提交顺序执行；没有候选 ID 时，只能传与当前项目 `LOCAL_VERIFIED` 候选完全一致的 `value`，未知 `value` 会被拒绝。平台 reject 后不得只提交大小写、去 leet、前后缀、密码包装等变体；除非出现新的目标证据或可重放推导，否则停止提交并返回 `partial`。
 - 没有可信证据或可重放推导时，`candidate_flags` 必须为空并继续调查，不得依据常见格式补全或编造 flag。
 - 只有看到 `subagent.spawn` 时才可使用同容器子代理。子代理必须是独立、可并行验证的路线；不得让子代理再创建子代理。

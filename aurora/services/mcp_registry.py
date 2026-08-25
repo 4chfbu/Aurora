@@ -45,7 +45,7 @@ BASE_TOOLS = (
         "flag.submit",
         "submission",
         "aurora",
-        "Submit a candidate flag to the current competition platform and return the platform verdict. Prefer candidate_id after flag.verify; raw value is accepted for a plausible candidate the platform should decide.",
+        "Submit a candidate flag to the current competition platform and return the platform verdict. Use candidate_id; a raw value is accepted only when it already matches a LOCAL_VERIFIED candidate in this project.",
         {
             "type": "object",
             "properties": {
@@ -57,7 +57,7 @@ BASE_TOOLS = (
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 500,
-                    "description": "A candidate flag formatted as prefix{payload}; the platform is the final authority and rejections are returned as feedback.",
+                    "description": "A prefix{payload} value that already matches a LOCAL_VERIFIED candidate in this project; unknown values are rejected without creating evidence.",
                 },
             },
             "oneOf": [

@@ -48,6 +48,8 @@ FLAG_PREFIX_BLACKLIST = frozenset({
     "div", "span", "img", "a", "p", "button", "input", "form", "table",
     "tr", "td", "th", "ul", "ol", "li", "section", "header", "footer",
     "nav", "main", "aside", "article", "h1", "h2", "h3", "h4", "h5", "h6",
+    "to", "from", "hover", "active", "focus", "visited", "root", "svg",
+    "path", "keyframes", "transform", "transition", "animation", "media",
 })
 
 DECOY_PAYLOAD_MARKERS = (

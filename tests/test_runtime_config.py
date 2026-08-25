@@ -378,6 +378,44 @@ def test_codex_harness_classifies_context_length_error(monkeypatch, tmp_path) ->
     assert diagnostic["output_file_exists"] is False
 
 
+def test_codex_harness_classifies_reasoning_content_provider_error(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    get_settings.cache_clear()
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    snapshot = SimpleNamespace(sections_json={"current_intent": {"objective": "inspect"}})
+
+    output, _ = runtime._parse_or_synthesize(
+        output_file=tmp_path / "missing.json",
+        stdout="",
+        stderr="reasoning_content must be passed back when using the Responses API",
+        exit_code=1,
+        failure_kind=None,
+        artifact_id="artifact_test",
+        snapshot=snapshot,
+    )
+
+    assert output["failed_attempts"][0]["reason"] == "provider_reasoning_error"
+
+
+def test_codex_harness_classifies_missing_model_metadata(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    get_settings.cache_clear()
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    snapshot = SimpleNamespace(sections_json={"current_intent": {"objective": "inspect"}})
+
+    output, _ = runtime._parse_or_synthesize(
+        output_file=tmp_path / "missing.json",
+        stdout="",
+        stderr="Model metadata not found; falling back to default metadata",
+        exit_code=1,
+        failure_kind=None,
+        artifact_id="artifact_test",
+        snapshot=snapshot,
+    )
+
+    assert output["failed_attempts"][0]["reason"] == "provider_model_metadata_missing"
+
+
 def test_codex_harness_classifies_unavailable_cc_switch(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
     get_settings.cache_clear()
@@ -491,8 +529,11 @@ def test_cc_switch_entrypoint_is_restart_safe() -> None:
     entrypoint = Path("container/cc-switch/entrypoint.sh").read_text(encoding="utf-8")
 
     assert "provider delete" not in entrypoint
-    assert "provider current" in entrypoint
+    assert "model_reasoning_effort = \"none\"" in entrypoint
+    assert "--config-file" in entrypoint
+    assert "--api-format chat" in entrypoint
     assert "provider list" in entrypoint
+    assert "provider switch" in entrypoint
 
 
 def test_codex_attempt_inherits_thread_and_records_progress(monkeypatch, tmp_path) -> None:

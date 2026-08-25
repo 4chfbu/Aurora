@@ -37,6 +37,7 @@ def init_db() -> None:
         _add_sqlite_columns()
     _record_schema_version()
     _backfill_legacy_flag_candidates()
+    _invalidate_stale_flag_candidates()
     _invalidate_legacy_false_targets()
 
 
@@ -161,6 +162,35 @@ def _backfill_legacy_flag_candidates() -> None:
                     artifact_refs=finding.evidence_refs,
                 )
             )
+            changed = True
+        if changed:
+            session.commit()
+
+
+def _invalidate_stale_flag_candidates() -> None:
+    """Repair LOCAL_VERIFIED rows that predate a flag-validator rule change.
+
+    Blacklist and readability rules evolve as false-positive prefixes are
+    observed in real worker logs.  Old rows were already written as
+    ``LOCAL_VERIFIED``, so they would otherwise keep appearing in submission
+    context and candidate lists.  Revalidate them at startup and downgrade
+    stale rows to ``REJECTED`` with an explicit repair reason.
+    """
+    from aurora.models import FlagCandidate, now_utc
+    from aurora.services.flag_validator import FlagValidator
+
+    validator = FlagValidator()
+    with Session(engine) as session:
+        candidates = session.exec(select(FlagCandidate).where(FlagCandidate.status == "LOCAL_VERIFIED")).all()
+        changed = False
+        for candidate in candidates:
+            if validator.is_valid_flag_value(candidate.value):
+                continue
+            candidate.status = "REJECTED"
+            candidate.provenance_kind = "UNVERIFIED"
+            candidate.rejection_reason = "stale_validation_blacklist"
+            candidate.updated_at = now_utc()
+            session.add(candidate)
             changed = True
         if changed:
             session.commit()

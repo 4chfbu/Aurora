@@ -167,17 +167,17 @@ def test_flag_submit_accepts_raw_value_and_records_platform_decisions(monkeypatc
             worker_id=worker_id,
             attempt_id="attempt_submit",
             tool_name="flag.submit",
-            request={"value": "flag{direct_accept}"},
+            request={"value": "flag{submitted}"},
         )
         candidate = session.exec(
             select(FlagCandidate).where(
                 FlagCandidate.project_id == project_id,
-                FlagCandidate.value == "flag{direct_accept}",
+                FlagCandidate.value == "flag{submitted}",
             )
         ).one()
         assert result.success is True
         assert result.metrics["status"] == "accepted"
-        assert adapter.values == ["flag{direct_accept}"]
+        assert adapter.values == ["flag{submitted}"]
         assert candidate.status == "ACCEPTED"
         assert candidate.submission_count == 1
 
@@ -187,11 +187,11 @@ def test_flag_submit_accepts_raw_value_and_records_platform_decisions(monkeypatc
             worker_id=worker_id,
             attempt_id="attempt_submit",
             tool_name="flag.submit",
-            request={"value": "flag{direct_accept}"},
+            request={"value": "flag{submitted}"},
         )
         assert duplicate.success is False
         assert duplicate.metrics["status"] == "duplicate"
-        assert adapter.values == ["flag{direct_accept}"]
+        assert adapter.values == ["flag{submitted}"]
 
 
 def test_flag_submit_raw_value_platform_reject_records_feedback(monkeypatch, tmp_path) -> None:
@@ -205,28 +205,53 @@ def test_flag_submit_raw_value_platform_reject_records_feedback(monkeypatch, tmp
             intent_id="intent_submit",
             attempt_id="attempt_submit",
             tool_name="flag.submit",
-            request={"value": "flag{direct_reject}"},
+            request={"value": "flag{submitted}"},
         )
 
         candidate = session.exec(
             select(FlagCandidate).where(
                 FlagCandidate.project_id == project_id,
-                FlagCandidate.value == "flag{direct_reject}",
+                FlagCandidate.value == "flag{submitted}",
             )
         ).one()
         feedback = session.exec(
             select(Fact).where(
                 Fact.project_id == project_id,
                 Fact.category == "flag_validation_feedback",
-                Fact.statement.contains("flag{direct_reject}"),
+                Fact.statement.contains("flag{submitted}"),
             )
         ).one()
         assert result.success is True
         assert result.metrics["status"] == "rejected"
-        assert adapter.values == ["flag{direct_reject}"]
+        assert adapter.values == ["flag{submitted}"]
         assert candidate.status == "REJECTED"
         assert candidate.submission_count == 1
-        assert "flag{direct_reject}" in feedback.statement
+        assert "flag{submitted}" in feedback.statement
+
+
+def test_flag_submit_rejects_unknown_value_without_creating_candidate(monkeypatch, tmp_path) -> None:
+    gateway, adapter, engine = _setup(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        project_id, worker_id = _verify(gateway, session, tmp_path)
+        result = gateway.execute(
+            session,
+            project_id=project_id,
+            worker_id=worker_id,
+            attempt_id="attempt_submit",
+            tool_name="flag.submit",
+            request={"value": "flag{invented_without_evidence}"},
+        )
+
+        assert result.success is False
+        assert result.metrics["status"] == "invalid_candidate"
+        assert adapter.values == []
+        candidate = session.exec(
+            select(FlagCandidate).where(
+                FlagCandidate.project_id == project_id,
+                FlagCandidate.value == "flag{invented_without_evidence}",
+            )
+        ).first()
+        assert candidate is None
 
 
 def test_flag_submit_raw_value_requires_valid_flag_shape(monkeypatch, tmp_path) -> None:

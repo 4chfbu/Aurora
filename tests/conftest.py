@@ -14,6 +14,7 @@ os.environ["AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT"] = "800000"
 os.environ["AURORA_CODEX_PROXY_BASE_URL"] = "http://test-proxy.invalid/v1"
 
 from aurora.config import get_settings
+from aurora.services.tool_profiles import tool_environment
 from tests.runtime_stub import TestWorkerRuntime
 
 
@@ -29,6 +30,23 @@ def isolated_runtime_for_tests(monkeypatch):
     monkeypatch.setenv("AURORA_WORKER_IMAGE", "aurora-test-image-not-present")
     monkeypatch.setenv("AURORA_CONTAINER_NETWORK", "bridge")
     monkeypatch.setattr("aurora.services.demo.get_worker_runtime", lambda: TestWorkerRuntime())
+
+    def _ready_test_preflight(settings, challenge_type=None):
+        environment = tool_environment(settings, challenge_type)
+        return {
+            "ready": True,
+            "challenge_type": environment["challenge_type"],
+            "profile": environment["profile"],
+            "image": environment["image"],
+            "manifest_sha256": environment["manifest_sha256"],
+            "commands_count": len(environment.get("commands", [])),
+            "python_modules_count": len(environment.get("python_modules", [])),
+            "mcp_servers": sorted(environment.get("mcp_servers", {})),
+            "error": None,
+            "build_command": "./scripts/build-kali-codex.sh",
+        }
+
+    monkeypatch.setattr("aurora.services.demo.worker_preflight", _ready_test_preflight)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

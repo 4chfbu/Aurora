@@ -41,6 +41,10 @@ def test_flag_validator_accepts_printable_payloads(value: str) -> None:
         "return{valid_payload}",
         "function{valid_payload}",
         "window{valid_payload}",
+        "hover{valid_payload}",
+        "to{valid_payload}",
+        "from{valid_payload}",
+        "keyframes{valid_payload}",
     ],
 )
 def test_flag_validator_rejects_javascript_style_prefixes(value: str) -> None:
@@ -182,3 +186,45 @@ def test_platform_rejected_candidate_is_not_revived_by_post_tool_artifact_scan(t
         assert candidate.status == "REJECTED"
         assert project.status == "ACTIVE"
         assert session.exec(select(Finding).where(Finding.project_id == project.id)).all() == []
+
+
+def test_startup_repair_downgrades_stale_local_verified_candidates() -> None:
+    from aurora.db import _invalidate_stale_flag_candidates, engine
+
+    with Session(engine) as session:
+        session.add_all([
+            FlagCandidate(
+                project_id="proj_stale_repair",
+                value="hover{valid_payload}",
+                value_hash=hashlib.sha256(b"hover{valid_payload}").hexdigest(),
+                status="LOCAL_VERIFIED",
+                provenance_kind="OBSERVED",
+            ),
+            FlagCandidate(
+                project_id="proj_stale_repair",
+                value="flag{still_valid}",
+                value_hash=hashlib.sha256(b"flag{still_valid}").hexdigest(),
+                status="LOCAL_VERIFIED",
+                provenance_kind="OBSERVED",
+            ),
+        ])
+        session.commit()
+
+        _invalidate_stale_flag_candidates()
+
+        stale = session.exec(
+            select(FlagCandidate).where(
+                FlagCandidate.project_id == "proj_stale_repair",
+                FlagCandidate.value == "hover{valid_payload}",
+            )
+        ).one()
+        valid = session.exec(
+            select(FlagCandidate).where(
+                FlagCandidate.project_id == "proj_stale_repair",
+                FlagCandidate.value == "flag{still_valid}",
+            )
+        ).one()
+        assert stale.status == "REJECTED"
+        assert stale.provenance_kind == "UNVERIFIED"
+        assert stale.rejection_reason == "stale_validation_blacklist"
+        assert valid.status == "LOCAL_VERIFIED"
