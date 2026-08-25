@@ -2,7 +2,7 @@
 
 This repository starts the Aurora v2 implementation from the design document.
 
-中文使用指南见 [`docs/USAGE.md`](docs/USAGE.md)；配置变量和部署矩阵见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。
+中文使用指南见 [`docs/USAGE.md`](docs/USAGE.md)；配置变量和部署矩阵见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)；Flag 校验与提交链路的开发说明见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
 
 The first milestone implements a minimal Fact-Intent blackboard loop with:
 

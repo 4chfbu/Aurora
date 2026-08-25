@@ -175,6 +175,11 @@ class ContextBuilder:
                 "targets": list((group_item.competition_meta or {}).get("container_addr", [])) if isinstance((group_item.competition_meta or {}).get("container_addr"), list) else ([project.target_url] if project.target_url else []),
                 "hint": group_item.hint_content,
                 "previous_attempts": list(group_item.failure_history),
+                "progress": {
+                    "correct_flag_count": (group_item.competition_meta or {}).get("correct_flag_count", 0),
+                    "total_flag_count": (group_item.competition_meta or {}).get("flag_count"),
+                    "is_completed": (group_item.competition_meta or {}).get("is_completed", False),
+                },
             } if group_item else None,
             "flag_submission": {
                 "eligible_candidates": [

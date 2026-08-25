@@ -23,6 +23,33 @@ FLAG_PATTERNS = [re.compile(rf"(?i)(?<![a-z0-9_-]){FLAG_VALUE_PATTERN}")]
 TRUSTED_FLAG_ORIGINS = {"challenge_input", "target_observation", "operator_observation", "verified_derivation"}
 TRUSTED_LEGACY_FLAG_TYPES = {"imported_attachment", "browser-inspection", "browser-interaction", "flag-verification"}
 
+FLAG_PREFIX_BLACKLIST = frozenset({
+    # JavaScript keywords / reserved words that frequently precede a brace in
+    # minified bundles, source maps, and browser-facing assets.
+    "abstract", "arguments", "async", "await", "boolean", "break", "byte",
+    "case", "catch", "char", "class", "const", "continue", "debugger",
+    "default", "delete", "do", "double", "else", "enum", "eval", "export",
+    "extends", "false", "final", "finally", "float", "for", "function",
+    "goto", "if", "implements", "import", "in", "instanceof", "int",
+    "interface", "let", "long", "native", "new", "null", "package",
+    "private", "protected", "public", "return", "short", "static", "super",
+    "switch", "synchronized", "this", "throw", "throws", "transient",
+    "true", "try", "typeof", "var", "void", "volatile", "while", "with",
+    "yield",
+    # Common JavaScript globals and DOM/browser identifiers seen in logs.
+    "window", "document", "console", "navigator", "location", "history",
+    "screen", "fetch", "json", "math", "object", "array", "string",
+    "number", "promise", "symbol", "map", "set", "weakmap", "weakset",
+    "date", "regexp", "error", "typeerror", "rangeerror", "syntaxerror",
+    "referenceerror", "undefined", "nan", "infinity", "process", "require",
+    "module", "exports", "global", "globalthis",
+    # CSS selectors that produced false-positive candidates in recent logs.
+    "body", "html", "head", "title", "script", "style", "meta", "link",
+    "div", "span", "img", "a", "p", "button", "input", "form", "table",
+    "tr", "td", "th", "ul", "ol", "li", "section", "header", "footer",
+    "nav", "main", "aside", "article", "h1", "h2", "h3", "h4", "h5", "h6",
+})
+
 DECOY_PAYLOAD_MARKERS = (
     "fake",
     "false",
@@ -109,6 +136,8 @@ class FlagValidator:
             return False
         prefix, payload = normalized_value.split("{", 1)
         if not any(character.isalpha() and character.isascii() for character in prefix):
+            return False
+        if prefix.lower() in FLAG_PREFIX_BLACKLIST:
             return False
         payload = payload[:-1]
         if not FlagValidator._is_readable_payload(payload):

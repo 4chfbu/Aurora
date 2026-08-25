@@ -31,6 +31,22 @@ def test_flag_validator_accepts_printable_payloads(value: str) -> None:
     assert FlagValidator.is_valid_flag_value(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "body{color:#000;background:#fff;margin:0}",
+        "h1{border-right:1px solid rgba(0,0,0,.3)}",
+        "const{value:1}",
+        "let{url:t,body:a}",
+        "return{valid_payload}",
+        "function{valid_payload}",
+        "window{valid_payload}",
+    ],
+)
+def test_flag_validator_rejects_javascript_style_prefixes(value: str) -> None:
+    assert not FlagValidator.is_valid_flag_value(value)
+
+
 def test_result_processor_normalizes_model_confidence_labels() -> None:
     processor = ResultProcessor()
 

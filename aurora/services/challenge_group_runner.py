@@ -1106,6 +1106,8 @@ class ChallengeGroupRunner:
                 item.fused_status = "PENDING"
                 item.status = "PENDING"
                 item.phase = 1
+                item.phase_started_at = None
+                item.phase_deadline_at = None
             elif outcome != "NO_FLAG_COMPLETED":
                 item.fused_status = "COMPLETED"
                 item.status = "COMPLETED"
@@ -1141,12 +1143,13 @@ class ChallengeGroupRunner:
         # Target lifetime belongs to the phase, not an individual Worker
         # invocation. At this point the item has left RUNNING and all phase
         # output (including flag submission) has been folded into its state.
-        self._release_managed_environment_after_phase(
-            session,
-            item=item,
-            executed_phase=executed_phase,
-            outcome=outcome,
-        )
+        if outcome != "FLAG_PARTIAL":
+            self._release_managed_environment_after_phase(
+                session,
+                item=item,
+                executed_phase=executed_phase,
+                outcome=outcome,
+            )
         session.commit()
 
     def _submit_pending_flag(self, session: Session, *, item: ChallengeGroupItem) -> bool | None | CompetitionSubmissionResult:
