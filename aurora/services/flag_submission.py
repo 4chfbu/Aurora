@@ -28,6 +28,7 @@ from aurora.services.competition_adapter import (
 )
 from aurora.services.flag_rejection import record_flag_rejection
 from aurora.services.flag_validator import FlagValidator
+from aurora.services.flag_prefix_config import flag_prefixes_for_project
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 
 
@@ -333,7 +334,7 @@ class FlagSubmissionService:
     @staticmethod
     def _candidate_for_value(session: Session, *, project_id: str, value: str) -> FlagCandidate | None:
         normalized = value.strip()
-        if not FlagValidator.is_valid_flag_value(normalized):
+        if not FlagValidator.is_valid_flag_value(normalized, flag_prefixes_for_project(session, project_id)):
             return None
         value_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         candidate = session.exec(

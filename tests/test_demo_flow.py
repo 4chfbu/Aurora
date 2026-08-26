@@ -29,6 +29,20 @@ from aurora.services.scheduler import Scheduler  # noqa: E402
 from aurora.services.worker_runtime import CodexHarnessRuntime  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
 
+import pytest  # noqa: E402
+
+from aurora.config import get_settings  # noqa: E402
+from aurora.services.flag_prefix_config import configure_flag_prefixes  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _demo_flag_prefixes() -> None:
+    settings = get_settings()
+    original = list(settings.flag_prefixes or ["flag"])
+    configure_flag_prefixes(["flag", "ctf", "qwxf", "susctf"])
+    yield
+    configure_flag_prefixes(original)
+
 
 def test_demo_flow_creates_blackboard_and_debug_traces() -> None:
     client = TestClient(create_app())

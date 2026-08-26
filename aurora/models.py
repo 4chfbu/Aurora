@@ -266,6 +266,7 @@ class ChallengeGroup(SQLModel, table=True):
     status: str = Field(default="READY", index=True)
     current_item_id: str | None = Field(default=None, index=True)
     limits: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    flag_prefixes: list[str] | None = Field(default=None, sa_column=Column(JSON))
     deadline_at: datetime | None = Field(default=None, index=True)
     max_concurrent: int = 1
     finished_at: datetime | None = None

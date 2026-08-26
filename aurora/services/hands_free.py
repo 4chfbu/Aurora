@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 from aurora.config import Settings, get_settings
 from aurora.models import Artifact, ChallengeGroup, ChallengeGroupItem, Fact, ImportArtifact, ImportBatch, ImportCandidate, WorkerEvent, now_utc, new_id
 from aurora.services.demo import create_project_with_bootstrap
+from aurora.services.flag_prefix_config import _normalize_prefixes
 from aurora.services.prompt_renderer import PromptRenderer
 from aurora.services.network_proxy import network_proxy_registry
 from aurora.services.tsecbench import TSecBenchClient, TSecBenchNeedsSession, TSecBenchError
@@ -298,7 +299,14 @@ class HandsFreeService:
         candidates = session.exec(select(ImportCandidate).where(ImportCandidate.batch_id == batch_id).order_by(ImportCandidate.created_at)).all()
         return ScanResult(batch=batch, candidates=candidates)
 
-    def confirm(self, session: Session, batch_id: str, candidate_ids: list[str], name_overrides: dict[str, str] | None = None) -> list[dict[str, str]]:
+    def confirm(
+        self,
+        session: Session,
+        batch_id: str,
+        candidate_ids: list[str],
+        name_overrides: dict[str, str] | None = None,
+        flag_prefixes: list[str] | None = None,
+    ) -> list[dict[str, str]]:
         batch = session.get(ImportBatch, batch_id)
         if batch is None:
             raise ValueError("import batch not found")
@@ -314,10 +322,12 @@ class HandsFreeService:
             raise ValueError("one or more candidates do not belong to this import batch")
         candidates_by_id = {candidate.id: candidate for candidate in found_candidates}
         candidates = [candidates_by_id[candidate_id] for candidate_id in requested]
+        normalized_flag_prefixes = _normalize_prefixes(flag_prefixes or []) if flag_prefixes is not None else None
         group = ChallengeGroup(
             import_batch_id=batch_id,
             name=(batch.title or f"Imported batch {batch_id[-8:]}")[:240],
             limits={"max_iterations": 0, "max_minutes": 0, "no_progress_limit": 4, "stop_on_observer_escalate": True},
+            flag_prefixes=normalized_flag_prefixes or None,
             # TSecBench targets are allocated lazily when an item is
             # dispatched.  The platform permits a small bounded pool rather
             # than requiring every imported challenge to own a target.

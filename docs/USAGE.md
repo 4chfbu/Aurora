@@ -41,6 +41,11 @@ AURORA_CODEX_PROXY_BASE_URL=http://aurora-cc-switch:15723/v1
 `/openapi/v1/challenges` 创建导入批次即可读取题目；确认题目后，Runner 会按平台生命周期启动容器、提交 Flag
 并关闭环境。`container_addr` 会写入项目目标，并同步到兼容用的 `AuthorizationScope` 记录。
 
+TSecBench 的 `BENCHMARK_TOKEN` 绑定一个平台跑分任务，该任务有总时限。任务到期后，所有题目的 `start` 会返回
+任务级终态错误（如 `invalid_state` 或 `task ... already finished`）；此时剩余题目无法继续启动环境，不应再当作
+`WAITING_INPUT` 永久等待。Challenges API 对单题的 `start/submit/close` 允许重复执行，因此单题 `close` 不意味着
+该题永久不可重开。
+
 也可以在 Web 左侧打开 `TSecBench`，填写 Base URL 和 Benchmark Token，保存后点击“测试连接”。如果列表中存在
 状态为 `available` 的容器，界面会同时检测其 SSLVPN 地址是否可达。网页 Token 仅在当前 API 进程内有效；长期配置仍应写入 `.env`。
 
@@ -213,12 +218,12 @@ curl -sS -X POST http://localhost:8000/api/projects/$PROJECT_ID/intents \
 
 对解码、逆向或计算得到的 flag，Solver 应请求 `flag.verify`：
 
-- `source_artifact_refs` 必须引用当前项目的原始题目证据；
+- `source_artifact_refs` 必须传当前项目上下文里给出的 `Artifact ID`，不是 `/workspace/...` 文件路径；
 - `verification_script` 优先填写 Worker 工作区中的 Python 文件路径。服务端把声明的 Artifact 打包到隔离目录，并将 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 路径；
 - 脚本必须只输出一个由输入计算出的 flag，不能硬编码候选值。系统在无网络隔离环境中重放两次，两个结果一致才形成 `LOCAL_VERIFIED` 候选；
 - `timeout_seconds` 有效范围为 1–60 秒。内联 Python 源码仅作为兼容形式保留。
 
-候选通过本地校验后形成 Finding 并进入 `FLAG_READY`。比赛题可用 `flag.submit` 自主提交：提交已有候选时传真实 `candidate_id`；同一批工具请求先验证、后提交时传 `candidate_id: "latest_verified"`。服务端拒绝原始 flag 字段、跨项目/跨 Attempt 回退和同一候选重复提交。平台拒绝的值与原因会进入下一轮上下文；平台不可用时进入 `AWAITING_MANUAL_VALIDATION`。平台接受后才完成项目并取消剩余 Intent；多 Flag 题只接受部分答案时保持运行，继续寻找其余答案。没有比赛适配器时，仍通过人工 validation API 接受或拒绝候选。
+候选通过本地校验后形成 Finding 并进入 `FLAG_READY`。比赛题可用 `flag.submit` 自主提交：提交已有候选时传真实 `candidate_id`；只有在同一批工具请求中 `flag.verify` 已成功创建 `LOCAL_VERIFIED` 候选后，才使用 `candidate_id: "latest_verified"`。没有本地验证候选时不要使用 `latest_verified`。服务端拒绝原始 flag 字段、跨项目/跨 Attempt 回退和同一候选重复提交。平台拒绝的值与原因会进入下一轮上下文；平台不可用时进入 `AWAITING_MANUAL_VALIDATION`。平台接受后才完成项目并取消剩余 Intent；多 Flag 题只接受部分答案时保持运行，继续寻找其余答案。没有比赛适配器时，仍通过人工 validation API 接受或拒绝候选。
 
 每个主 Solver 轮次进入 `SUCCESS`、`PARTIAL`、`FAILED` 或 `TIMEOUT` 后，系统都会在 blackboard 中写入一条轮次反思（API 中沿用 `checkpoints` 字段）。反思会整理本轮总结、证据结论、假设、失败路线和下一步，并审核 Solver 的候选建议后创建最多 3 个后续 Intent。Solver 输出的 `suggested_intents` 本身不会绕过反思直接进入调度队列；反思模型不可用时，系统使用确定性 fallback 规则校验这些建议。项目已经完成时仍保留最终反思，但不会再创建 Intent。Subagent 报告由主轮汇总，不单独触发反思。
 
@@ -284,8 +289,8 @@ Observer 是确定性的，不调用 LLM。它会在最近工具请求被工具�
 | `browser.interact` | `url`, `locator`, `wait_seconds` | 必须先为项目设置题目站 Cookie。 |
 | `sandbox.exec` | `command`, `cwd`, `timeout_seconds` | 受命令拒绝规则和工作区路径限制（仅 `openai_direct`/手动 API；原生 Codex 在 Worker 容器内执行 shell）。 |
 | `blackboard.query` | `limit` | 只读查询当前项目事实，并生成 Artifact；仅在 `aurora_blackboard` MCP 不可用时作为原生 Codex 的回退。 |
-| `flag.verify` | `source_artifact_refs`, `verification_script`, `timeout_seconds` | 对派生候选做两次隔离重放；超时限制为 1–60 秒。 |
-| `flag.submit` | `candidate_id` | 只提交当前项目已本地验证的候选；不接受原始 flag。 |
+| `flag.verify` | `source_artifact_refs`, `verification_script`, `timeout_seconds` | 对派生候选做两次隔离重放；`source_artifact_refs` 必须是当前项目的 `Artifact ID`；超时限制为 1–60 秒。 |
+| `flag.submit` | `candidate_id` | 只提交当前项目已本地验证的候选；`latest_verified` 仅在同批 `flag.verify` 成功之后可用；不接受原始 flag。 |
 | `fofa.search` | `query`, `size` | 需配置 FOFA 凭据；当前实现不会按项目目标限制查询内容。 |
 
 直接执行工具的 API 形式：

@@ -268,10 +268,18 @@ def test_hands_free_stages_same_domain_attachments_and_confirms_projects(tmp_pat
         assert len(web.staged_attachments_json) == 1
         assert web.external_attachments_json == [{"url": "https://files.external.example/web-1.zip", "status": "external_review_required"}]
         project_name = f"Renamed Web {result.batch.id}"
-        created = service.confirm(session, result.batch.id, [candidate.id for candidate in result.candidates], {web.id: project_name})
+        created = service.confirm(
+            session,
+            result.batch.id,
+            [candidate.id for candidate in result.candidates],
+            {web.id: project_name},
+            ["DASCTF", "flag"],
+        )
         assert {item["status"] for item in created} == {"created"}
         group_id = created[0]["group_id"]
-        assert session.get(ChallengeGroup, group_id) is not None
+        group = session.get(ChallengeGroup, group_id)
+        assert group is not None
+        assert group.flag_prefixes == ["dasctf", "flag"]
         group_items = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group_id).order_by(ChallengeGroupItem.position)).all()
         assert [item.position for item in group_items] == [1, 2]
         assert [item.project_id for item in group_items] == [created[0]["project_id"], created[1]["project_id"]]

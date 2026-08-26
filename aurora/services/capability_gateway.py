@@ -23,6 +23,7 @@ from aurora.services.policy import PolicyEngine
 from aurora.services.browser_interaction import BrowserInteractionService
 from aurora.config import get_settings
 from aurora.services.flag_validator import FlagValidator
+from aurora.services.flag_prefix_config import flag_prefixes_for_project
 from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.competition_adapter import CompetitionAdapter
 
@@ -293,7 +294,7 @@ class CapabilityGateway:
                 completed = self.verification_runner.run(command="PYTHONDONTWRITEBYTECODE=1 python3 verify.py inputs/manifest.json", cwd=run_dir, timeout=timeout)
                 output = completed.stdout.strip()
                 runs.append({"exit_code": completed.exit_code, "stdout": output, "stderr": completed.stderr[-1000:]})
-                if completed.exit_code != 0 or not FlagValidator.is_valid_flag_value(output):
+                if completed.exit_code != 0 or not FlagValidator.is_valid_flag_value(output, flag_prefixes_for_project(session, project_id)):
                     return self._verification_failure(
                         session, project_id, request, worker_id, intent_id, attempt_id,
                         "verification replay must exit successfully and print exactly one flag",

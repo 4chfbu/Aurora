@@ -26,7 +26,7 @@ def test_flag_validator_rejects_masked_and_unreadable_payloads(value: str) -> No
     assert not FlagValidator.is_valid_flag_value(value)
 
 
-@pytest.mark.parametrize("value", ["flag{readable-value_42?}", "qwxf{\u4e2d\u6587}"])
+@pytest.mark.parametrize("value", ["flag{readable-value_42?}", "flag{\u4e2d\u6587}"])
 def test_flag_validator_accepts_printable_payloads(value: str) -> None:
     assert FlagValidator.is_valid_flag_value(value)
 
@@ -49,6 +49,29 @@ def test_flag_validator_accepts_printable_payloads(value: str) -> None:
 )
 def test_flag_validator_rejects_javascript_style_prefixes(value: str) -> None:
     assert not FlagValidator.is_valid_flag_value(value)
+
+
+def test_flag_validator_enforces_configured_prefix_whitelist(monkeypatch) -> None:
+    from aurora.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "flag_prefixes", ["flag", "dasctf"])
+
+    assert FlagValidator.is_valid_flag_value("flag{default_ok}")
+    assert FlagValidator.is_valid_flag_value("FLAG{upper_ok}")
+    assert FlagValidator.is_valid_flag_value("DASCTF{special_ok}")
+    assert not FlagValidator.is_valid_flag_value("tsec{not_configured}")
+    assert not FlagValidator.is_valid_flag_value("nflag{corrupted}")
+
+
+def test_flag_validator_default_prefix_is_flag(monkeypatch) -> None:
+    from aurora.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "flag_prefixes", ["flag"])
+
+    assert FlagValidator.is_valid_flag_value("flag{ok}")
+    assert not FlagValidator.is_valid_flag_value("DASCTF{ok}")
 
 
 def test_result_processor_normalizes_model_confidence_labels() -> None:

@@ -45,6 +45,7 @@ class Settings(BaseModel):
     worker_runtime: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_RUNTIME", "codex"))
     tool_contract: str = Field(default_factory=lambda: os.getenv("AURORA_TOOL_CONTRACT", "kali_shell"))
     native_allow_blackboard_query: bool = Field(default_factory=lambda: os.getenv("AURORA_NATIVE_ALLOW_BLACKBOARD_QUERY", "true").lower() in {"1", "true", "yes"})
+    flag_prefixes: list[str] = Field(default_factory=lambda: [prefix.strip().lower() for prefix in os.getenv("AURORA_FLAG_PREFIXES", "flag").split(",") if prefix.strip()])
     codex_command_template: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_COMMAND_TEMPLATE", "/workspace/runtime/codex-via-cc-switch.sh {prompt_filename} {output_schema_filename} {last_message_filename}"))
     codex_proxy_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_PROXY_BASE_URL", "http://aurora-cc-switch:15723/v1"))
     codex_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TIMEOUT_SECONDS", "1800")))

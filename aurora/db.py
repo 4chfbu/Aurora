@@ -88,6 +88,7 @@ def _add_sqlite_columns() -> None:
             "deadline_at": "DATETIME",
             "max_concurrent": "INTEGER DEFAULT 1",
             "finished_at": "DATETIME",
+            "flag_prefixes": "JSON",
         },
         "challengegroupitem": {
             "fused_status": "TEXT DEFAULT 'PENDING'",
@@ -178,13 +179,17 @@ def _invalidate_stale_flag_candidates() -> None:
     """
     from aurora.models import FlagCandidate, now_utc
     from aurora.services.flag_validator import FlagValidator
+    from aurora.services.flag_prefix_config import flag_prefixes_for_project
 
     validator = FlagValidator()
     with Session(engine) as session:
         candidates = session.exec(select(FlagCandidate).where(FlagCandidate.status == "LOCAL_VERIFIED")).all()
         changed = False
+        allowed_by_project: dict[str, tuple[str, ...]] = {}
         for candidate in candidates:
-            if validator.is_valid_flag_value(candidate.value):
+            if candidate.project_id not in allowed_by_project:
+                allowed_by_project[candidate.project_id] = flag_prefixes_for_project(session, candidate.project_id)
+            if validator.is_valid_flag_value(candidate.value, allowed_by_project[candidate.project_id]):
                 continue
             candidate.status = "REJECTED"
             candidate.provenance_kind = "UNVERIFIED"

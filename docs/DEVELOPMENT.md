@@ -246,3 +246,87 @@ uv run --extra dev pytest -q tests/test_flag_verification.py
 - 释放靶机、恢复租约、删除项目这类操作要幂等，并在失败时记录事件而不是静默忽略。
 - 修改数据库模型后，`db.init_db` 只做增量列/索引回填；真正的破坏性 schema 变更应提升 `SCHEMA_VERSION`。
 - 模型输出字段由 `OUTPUT_SCHEMA` 严格控制，避免新增非声明字段进入 `ContextSnapshot`。
+
+## 15. 2026-08 评测复盘与待修复项
+
+### 15.1 TSecBench 平台任务终态
+
+- TSecBench 的 `BENCHMARK_TOKEN` 对应一个平台跑分任务，`unique_code` 才是单题标识。
+- 平台任务有总时限；任务到期后，剩余题目的 `POST /openapi/v1/challenges/start` 会返回任务级终态错误，
+  Aurora 目前只把该错误记录为 `WAITING_INPUT`，导致剩余 item 永久等待。
+- 修复方向：将 `invalid_state` / `already finished` 识别为不可恢复终态，把剩余 item 标记为 `FAILED`
+  或组级终态，而不是 `WAITING_INPUT`。
+- 这不是单题 `close` 后无法 `start` 的问题；Challenges API 允许 `start/submit/close` 对单题重复执行。
+
+### 15.2 phase 环境释放过早
+
+- 当前 `ChallengeGroupRunner._resolve_phase` 除 `FLAG_PARTIAL` 外都会释放环境，导致可重试 phase 失败后
+  下一 phase 还要重新 `start`，增加平台状态抖动和调度延迟。
+- 修复方向：只在题目真正终态时释放环境；`FAILED/TIMEOUT/CRASHED` 且仍有下一 phase 时保留环境。
+
+### 15.3 `flag.verify` 入参契约
+
+- 最新评测中大量 `flag.verify` 失败原因是模型把 `/workspace/work/...` 路径当成 `source_artifact_refs`，
+  而服务端只接受当前项目的 `Artifact ID`。
+- 修复方向：在工具描述和上下文里明确要求 `Artifact ID`；网关可增加 workspace 路径到 Artifact 的兼容解析，
+  但兼容层不得放宽“仅当前项目可信 Artifact”这一门禁。
+
+### 15.4 `flag.submit("latest_verified")` 门禁误杀
+
+- `latest_verified` 当前只匹配同一 Attempt 内的 `LOCAL_VERIFIED` 候选。模型在 `flag.verify` 失败后仍调用
+  `flag.submit("latest_verified")` 时，会得到 `execution_error`。
+- 修复方向：没有 `LOCAL_VERIFIED` 候选时不要暴露 `latest_verified`；或让 `latest_verified` 回退到项目内最近
+  一条 `LOCAL_VERIFIED` 候选，并返回明确的可用 `candidate_id`。
+
+### 15.5 拒绝候选后的无进展空转
+
+- 单一候选被平台拒绝且没有新候选时，`AutoRunnerService` 会继续派发新 Attempt，直到 phase 超时。
+- 修复方向：检测“已拒绝且无新本地候选/无新证据”的阻塞态，提前结束当前 phase，释放并发槽位。
+
+### 15.6 Resume manifest 完整性
+
+- `codex_state_complete` 会因子目录中存在 SQLite WAL/SHM、锁文件等非续跑文件而误判为 false；
+  `work_state_complete` 会因文件数超过 `AURORA_RESUME_MAX_FILES` 而拒绝恢复。
+- 修复方向：`_is_resumable_codex_state` 排除临时/锁/WAL/SHM 文件；工作文件超限时允许恢复已保存文件，
+  而不是整体拒绝 manifest。
+
+## 16. Flag 前缀白名单配置与 API
+
+`v1.6.2` 新增 flag 前缀白名单，用于过滤非目标前缀的伪 Flag。所有校验统一走
+`aurora/services/flag_prefix_config.py`，不要再在调用点单独复制前缀判断。
+
+### 16.1 环境变量
+
+- `AURORA_FLAG_PREFIXES`：全局允许的 flag 前缀，逗号分隔；默认 `flag`。
+- 启动时读取并写入 `Settings.flag_prefixes`，每个前缀会被去空格并转为小写。
+- 匹配始终不区分大小写；提交时保留解出的原始大小写格式。
+- 运行时可修改全局白名单，但环境变量设置会在下次启动时重新覆盖运行时修改。
+
+### 16.2 全局前缀 API
+
+- `GET /api/settings/flag-prefixes`
+  - 返回 `prefixes`、`case_insensitive`、`submit_preserves_case`、`default`、`source`。
+  - `source` 为 `environment`、`runtime` 或 `default`。
+- `PUT /api/settings/flag-prefixes`
+  - 请求体：`{"prefixes": ["flag", "DASCTF"]}`。
+  - 更新 `Settings.flag_prefixes`，返回与 GET 相同结构。
+  - 空列表或非法前缀（含空格、花括号，或以非字母/数字开头）返回 400。
+
+### 16.3 题目组覆盖 API
+
+- `GET /api/challenge-groups/{group_id}/flag-prefixes`
+  - 返回该组的有效前缀、`overridden`、`override` 和 `global`。
+  - 组不存在返回 404。
+- `PUT /api/challenge-groups/{group_id}/flag-prefixes`
+  - 请求体：`{"prefixes": ["DASCTF", "flag"]}`，写入 `ChallengeGroup.flag_prefixes`。
+  - 传空列表 `[]` 会清除覆盖，恢复继承全局白名单。
+  - 非法前缀返回 400，组不存在返回 400（组级查询 404）。
+
+### 16.4 生效优先级
+
+1. 项目属于某个 `ChallengeGroupItem` 且该组 `flag_prefixes` 非空：使用组级覆盖。
+2. 否则使用 `Settings.flag_prefixes` 的全局白名单。
+3. 全局白名单为空或未设置时，回退到默认 `["flag"]`。
+
+Hands-free 导入确认时，前端会把用户输入的逗号分隔前缀写入 `HandsFreeConfirmRequest.flag_prefixes`，
+`HandsFreeService.confirm` 归一化后保存到新建的 `ChallengeGroup.flag_prefixes`。

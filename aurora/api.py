@@ -65,6 +65,12 @@ from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_a
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry, recover_legacy_target_blocked_groups
 from aurora.services.concurrency import configure_concurrency, public_concurrency_config
+from aurora.services.flag_prefix_config import (
+    configure_flag_prefixes,
+    configure_group_flag_prefixes,
+    public_flag_prefix_config,
+    public_group_flag_prefix_config,
+)
 from aurora.services.project_deletion import ProjectDeletionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.target_verification import TargetVerificationService
@@ -181,6 +187,7 @@ class HandsFreeContinueRequest(BaseModel):
 class HandsFreeConfirmRequest(BaseModel):
     candidate_ids: list[str] = Field(default_factory=list)
     name_overrides: dict[str, str] = Field(default_factory=dict)
+    flag_prefixes: list[str] = Field(default_factory=list)
 
 
 class ManualTargetRequest(BaseModel):
@@ -224,6 +231,10 @@ class SlabMatchConfigRequest(BaseModel):
 
 class ConcurrencyConfigRequest(BaseModel):
     max_agents: int = Field(default=2, ge=1, le=8)
+
+
+class FlagPrefixesRequest(BaseModel):
+    prefixes: list[str] = Field(min_length=1, max_length=64)
 
 
 class CreateEvaluationSuiteRequest(BaseModel):
@@ -510,6 +521,17 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/settings/flag-prefixes")
+    def get_flag_prefixes() -> dict[str, Any]:
+        return public_flag_prefix_config()
+
+    @app.put("/api/settings/flag-prefixes")
+    def update_flag_prefixes(payload: FlagPrefixesRequest) -> dict[str, Any]:
+        try:
+            return configure_flag_prefixes(payload.prefixes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/slab-match/import")
     def import_slab_match_directly(session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
@@ -696,7 +718,13 @@ def create_app() -> FastAPI:
     @app.post("/api/hands-free/imports/{batch_id}/confirm")
     def confirm_hands_free_import(batch_id: str, payload: HandsFreeConfirmRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
-            projects = HandsFreeService().confirm(session, batch_id, payload.candidate_ids, payload.name_overrides)
+            projects = HandsFreeService().confirm(
+                session,
+                batch_id,
+                payload.candidate_ids,
+                payload.name_overrides,
+                payload.flag_prefixes,
+            )
             browser_session_registry.bind_batch_project_sources(
                 batch_id=batch_id,
                 project_sources={project["project_id"]: project["challenge_url"] for project in projects if project.get("challenge_url")},
@@ -774,6 +802,20 @@ def create_app() -> FastAPI:
             if candidate.status in {"LOCAL_VERIFIED", "SUBMITTED", "ACCEPTED", "AWAITING_MANUAL_VALIDATION"}
         }
         return {"group": group, "items": items, "projects": projects, "candidate_flags": candidate_flags, "flag_candidates": group_candidates, "events": events, "background": challenge_group_registry.status(group_id)}
+
+    @app.get("/api/challenge-groups/{group_id}/flag-prefixes")
+    def get_group_flag_prefixes(group_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return public_group_flag_prefix_config(session, group_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/challenge-groups/{group_id}/flag-prefixes")
+    def update_group_flag_prefixes(group_id: str, payload: FlagPrefixesRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return configure_group_flag_prefixes(session, group_id, payload.prefixes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/challenge-groups/{group_id}/items/{item_id}/flag-validation")
     def validate_group_flag_manually(

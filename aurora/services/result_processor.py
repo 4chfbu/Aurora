@@ -10,6 +10,7 @@ from aurora.models import Artifact, Attempt, Finding, FlagCandidate, LLMTrace, P
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.flag_rejection import record_flag_rejection
 from aurora.services.flag_validator import FlagValidator
+from aurora.services.flag_prefix_config import flag_prefixes_for_project
 
 
 class ResultProcessor:
@@ -21,9 +22,10 @@ class ResultProcessor:
         artifact_refs = sorted(set(artifact_refs))
 
         validator = FlagValidator()
+        allowed_prefixes = flag_prefixes_for_project(session, attempt.project_id)
         proposed_flags = output.get("candidate_flags", [])
         normalized_flags = self._flag_values(proposed_flags)
-        decoy_flags = [value for value in normalized_flags if validator.is_decoy_flag_value(value)]
+        decoy_flags = [value for value in normalized_flags if validator.is_decoy_flag_value(value, allowed_prefixes)]
         evidence_verified_values = {
             str(candidate.get("value")).strip()
             for candidate in proposed_flags
@@ -78,7 +80,7 @@ class ResultProcessor:
                 project_id=attempt.project_id,
                 refs=[artifact_ref] if artifact_ref else artifact_refs,
             )
-            if validator.is_decoy_flag_value(value):
+            if validator.is_decoy_flag_value(value, allowed_prefixes):
                 reason = "its brace payload explicitly identifies it as a fake/decoy flag"
                 self._upsert_flag_candidate(
                     session,
@@ -104,7 +106,7 @@ class ResultProcessor:
                 decoy_feedback.append(feedback)
                 continue
 
-            syntactically_valid = validator.is_valid_flag_value(value)
+            syntactically_valid = validator.is_valid_flag_value(value, allowed_prefixes)
             directly_verified = bool(
                 artifact_ref and validator.is_verified_candidate(session, value=value, artifact_ref=artifact_ref, project_id=attempt.project_id)
             )

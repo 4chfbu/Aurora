@@ -7,6 +7,7 @@ from sqlmodel import Session
 
 from aurora.models import Artifact
 from aurora.services.artifact_store import ArtifactStore
+from aurora.services.flag_prefix_config import current_flag_prefixes, flag_prefixes_for_project
 
 
 # CTF flags frequently use an event-specific prefix which does not contain
@@ -17,7 +18,7 @@ from aurora.services.artifact_store import ArtifactStore
 # The payload is narrowed here as a first-pass scan filter.  The semantic
 # readability checks in ``is_valid_flag_value`` remain the source of truth for
 # values supplied directly by a Worker.
-FLAG_VALUE_PATTERN = r"[a-z0-9][a-z0-9_-]{1,63}\{[^\s{}*]{1,200}\}"
+FLAG_VALUE_PATTERN = r"[a-z0-9][a-z0-9_-]{1,63}\{[^\s{}*/]{1,200}\}"
 FLAG_PATTERNS = [re.compile(rf"(?i)(?<![a-z0-9_-]){FLAG_VALUE_PATTERN}")]
 
 TRUSTED_FLAG_ORIGINS = {"challenge_input", "target_observation", "operator_observation", "verified_derivation"}
@@ -87,6 +88,7 @@ class FlagValidator:
     def extract_candidate_flags(self, session: Session, *, artifact_refs: list[str], project_id: str | None = None) -> list[dict[str, str]]:
         candidates: list[dict[str, str]] = []
         seen: set[str] = set()
+        allowed_prefixes = flag_prefixes_for_project(session, project_id)
         for artifact_id in artifact_refs:
             artifact = session.get(Artifact, artifact_id)
             if artifact is not None and project_id is not None and artifact.project_id != project_id:
@@ -100,7 +102,7 @@ class FlagValidator:
             for pattern in FLAG_PATTERNS:
                 for match in pattern.finditer(content):
                     value = match.group(0)
-                    if not self.is_valid_flag_value(value):
+                    if not self.is_valid_flag_value(value, allowed_prefixes):
                         continue
                     key = value.lower()
                     if key in seen:
@@ -115,7 +117,8 @@ class FlagValidator:
 
     def is_verified_candidate(self, session: Session, *, value: str, artifact_ref: str | None, project_id: str | None = None) -> bool:
         """Return whether a proposed flag is present in trusted artifact evidence."""
-        if not artifact_ref or not self.is_valid_flag_value(value):
+        allowed_prefixes = flag_prefixes_for_project(session, project_id)
+        if not artifact_ref or not self.is_valid_flag_value(value, allowed_prefixes):
             return False
         artifact = session.get(Artifact, artifact_ref)
         if artifact is None or (project_id is not None and artifact.project_id != project_id):
@@ -131,7 +134,7 @@ class FlagValidator:
         return bool(artifact and (project_id is None or artifact.project_id == project_id) and self.is_trusted_evidence_artifact(artifact))
 
     @staticmethod
-    def is_valid_flag_value(value: str) -> bool:
+    def is_valid_flag_value(value: str, allowed_prefixes: tuple[str, ...] | list[str] | None = None) -> bool:
         normalized_value = value.strip()
         match = re.fullmatch(rf"(?i){FLAG_VALUE_PATTERN}", normalized_value)
         if match is None:
@@ -140,6 +143,9 @@ class FlagValidator:
         if not any(character.isalpha() and character.isascii() for character in prefix):
             return False
         if prefix.lower() in FLAG_PREFIX_BLACKLIST:
+            return False
+        active_prefixes = tuple(allowed_prefixes) if allowed_prefixes is not None else current_flag_prefixes()
+        if prefix.lower() not in active_prefixes:
             return False
         payload = payload[:-1]
         if not FlagValidator._is_readable_payload(payload):
@@ -164,7 +170,7 @@ class FlagValidator:
         return bool(payload) and all(
             character.isprintable()
             and not character.isspace()
-            and character not in "{}*"
+            and character not in "{}*/"
             and character != "\ufffd"
             and not unicodedata.category(character).startswith("C")
             and not is_noncharacter(character)
@@ -172,9 +178,9 @@ class FlagValidator:
         )
 
     @staticmethod
-    def is_decoy_flag_value(value: str) -> bool:
+    def is_decoy_flag_value(value: str, allowed_prefixes: tuple[str, ...] | list[str] | None = None) -> bool:
         """Return whether the brace payload explicitly labels itself a fake."""
-        if not FlagValidator.is_valid_flag_value(value):
+        if not FlagValidator.is_valid_flag_value(value, allowed_prefixes):
             return False
         payload = value.strip().split("{", 1)[1][:-1].lower()
         compact = re.sub(r"[\s_-]+", "", payload)
@@ -194,5 +200,24 @@ class FlagValidator:
     def _scannable_content(self, artifact: Artifact, content: str) -> str:
         if "[stdout]" in content:
             after_stdout = content.split("[stdout]", 1)[1]
-            return after_stdout.split("[stderr]", 1)[0]
-        return content
+            content = after_stdout.split("[stderr]", 1)[0]
+        return self._unescape_terminal_content(content)
+
+    @staticmethod
+    def _unescape_terminal_content(content: str) -> str:
+        """Resolve literal backslash escapes in captured terminal output.
+
+        Harness/JSON-captured stdout stores newlines as the two characters
+        ``\\n``.  Left literal, the scanner glues the ``n`` onto a following
+        flag (``\\nflag{...}`` -> ``nflag{...}``) while the clean value is
+        blocked by the left word-boundary check.  Unescaping restores the real
+        separator so ``flag{...}`` is extracted instead.
+        """
+        return (
+            content.replace("\\\\", "\x00")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+            .replace("\x00", "\\")
+        )
