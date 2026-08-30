@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, Attempt, ContextSnapshot, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.models import Artifact, Attempt, ContextSnapshot, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.llm_http import LLMRequestError, chat_completion
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.blackboard_repository import route_fingerprint
@@ -31,6 +31,16 @@ class RuntimeOutput:
     summary: str
     structured_output: dict[str, Any]
     llm_trace: LLMTrace
+
+
+@dataclass
+class ConcludeFallbackOutcome:
+    attempted: bool
+    recovered: bool
+    diagnostic: dict[str, Any]
+    structured_output: dict[str, Any] | None = None
+    command_result: CommandResult | None = None
+    artifact: Artifact | None = None
 
 
 class WorkerRuntime(Protocol):
@@ -50,6 +60,15 @@ EXECUTABLE_TOOLS = [
     "flag.submit",
     "sandbox.exec",
 ]
+
+VALID_STRUCTURED_OUTPUT_SOURCES = frozenset({"last_message_file", "stdout_fallback", "stderr_fallback"})
+CONCLUDE_FALLBACK_FATAL_FAILURES = frozenset({
+    "provider_unavailable",
+    "provider_model_metadata_missing",
+    "provider_invalid_request",
+    "provider_reasoning_error",
+    "resource_terminated",
+})
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -326,28 +345,16 @@ class CodexHarnessRuntime:
                 attempt.codex_control_token_hash = None
                 session.add(attempt)
                 session.commit()
-        elapsed_ms = round((time.monotonic() - started) * 1000)
         transcript = self._bounded_transcript(self._transcript(command, completed))
         artifact = self.artifact_store.write_text(
             session,
             project_id=snapshot.project_id,
+            source_attempt_id=attempt.id if attempt else None,
             content=transcript,
             summary=f"Codex harness transcript {completed.backend} exit={completed.exit_code}",
             artifact_type="codex-transcript",
             origin_kind="model_output",
         )
-        mcp_import = self._import_mcp_events(
-            session,
-            worker=worker,
-            snapshot=snapshot,
-            workspace=prompt_file.parent,
-        )
-        resume_manifest = self._persist_resume_manifest(
-            session,
-            attempt=attempt,
-            workspace=prompt_file.parent,
-        ) if attempt is not None else None
-
         output_file = prompt_file.parent / "aurora-last-message.json"
         structured, output_diagnostic = self._parse_or_synthesize(
             output_file=output_file,
@@ -361,9 +368,71 @@ class CodexHarnessRuntime:
             worker=worker,
             attempt=attempt,
         )
+        try:
+            conclude_fallback = self._try_conclude_fallback(
+                session,
+                worker=worker,
+                attempt=attempt,
+                snapshot=snapshot,
+                workspace=prompt_file.parent,
+                model=model,
+                runner=runner,
+                primary_completed=completed,
+                primary_diagnostic=output_diagnostic,
+            )
+        except Exception as exc:
+            # Conclude is a recovery path. Its own control-plane or storage
+            # failure must never discard the primary transcript and failure
+            # result that were already captured.
+            session.rollback()
+            conclude_fallback = ConcludeFallbackOutcome(
+                attempted=True,
+                recovered=False,
+                diagnostic={
+                    "attempted": True,
+                    "recovered": False,
+                    "error": f"unexpected conclude fallback failure: {str(exc)[:500]}",
+                },
+            )
+            if attempt is not None:
+                try:
+                    session.add(
+                        WorkerEvent(
+                            project_id=worker.project_id,
+                            worker_id=worker.id,
+                            intent_id=worker.intent_id,
+                            attempt_id=attempt.id,
+                            event_type="attempt.conclude_fallback_failed",
+                            payload_json=conclude_fallback.diagnostic,
+                        )
+                    )
+                    session.commit()
+                except Exception:
+                    session.rollback()
+        output_diagnostic["conclude_fallback"] = conclude_fallback.diagnostic
+        if conclude_fallback.recovered and conclude_fallback.structured_output is not None:
+            structured = conclude_fallback.structured_output
         structured.setdefault("artifact_refs", [])
         if artifact.id not in structured["artifact_refs"]:
             structured["artifact_refs"].append(artifact.id)
+        if conclude_fallback.artifact is not None and conclude_fallback.artifact.id not in structured["artifact_refs"]:
+            structured["artifact_refs"].append(conclude_fallback.artifact.id)
+
+        # Persist runtime side effects only after the optional resumed turn so
+        # future attempts restore the newest Codex state and MCP audit log.
+        mcp_import = self._import_mcp_events(
+            session,
+            worker=worker,
+            snapshot=snapshot,
+            workspace=prompt_file.parent,
+        )
+        resume_manifest = self._persist_resume_manifest(
+            session,
+            attempt=attempt,
+            workspace=prompt_file.parent,
+        ) if attempt is not None else None
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
         output_json = json.dumps(structured, ensure_ascii=False, sort_keys=True)
         prompt_text = prompt_file.read_text(encoding="utf-8")
         decision_summary = structured.get("decision_summary") or {}
@@ -397,6 +466,12 @@ class CodexHarnessRuntime:
                 "model_metadata_source": "explicit" if self.settings.codex_require_explicit_model_metadata else "configured_default",
                 "model_metadata_warning": self._has_model_metadata_warning(f"{completed.stdout}\n{completed.stderr}"),
                 "output": output_diagnostic,
+                "conclude_fallback": {
+                    **conclude_fallback.diagnostic,
+                    "artifact_id": conclude_fallback.artifact.id if conclude_fallback.artifact else None,
+                    "exit_code": conclude_fallback.command_result.exit_code if conclude_fallback.command_result else None,
+                    "failure_kind": conclude_fallback.command_result.failure_kind if conclude_fallback.command_result else None,
+                },
                 "mcp": mcp_import,
                 "resume_manifest_artifact_id": resume_manifest.id if resume_manifest else None,
             },
@@ -933,6 +1008,225 @@ class CodexHarnessRuntime:
             shutil.copytree(rules_source, workspace / ".codex" / "rules", dirs_exist_ok=True)
         return prompt_file
 
+    def _try_conclude_fallback(
+        self,
+        session: Session,
+        *,
+        worker: Worker,
+        attempt: Attempt | None,
+        snapshot: ContextSnapshot,
+        workspace: Path,
+        model: str,
+        runner: CommandRunner,
+        primary_completed: CommandResult,
+        primary_diagnostic: dict[str, Any],
+    ) -> ConcludeFallbackOutcome:
+        seconds = self.settings.codex_conclude_fallback_seconds
+        diagnostic: dict[str, Any] = {
+            "attempted": False,
+            "recovered": False,
+            "timeout_seconds": seconds,
+        }
+        if primary_diagnostic.get("source") in VALID_STRUCTURED_OUTPUT_SOURCES:
+            diagnostic["skip_reason"] = "primary_output_valid"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+        if seconds <= 0:
+            diagnostic["skip_reason"] = "disabled"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+        if attempt is None:
+            diagnostic["skip_reason"] = "attempt_missing"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+
+        session.refresh(attempt)
+        session.refresh(worker)
+        thread_id = attempt.codex_thread_id
+        if not thread_id:
+            diagnostic["skip_reason"] = "thread_id_missing"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+        failure_kind = self._provider_failure_kind(
+            f"{primary_completed.stdout}\n{primary_completed.stderr}"
+        ) or primary_completed.failure_kind
+        if failure_kind in CONCLUDE_FALLBACK_FATAL_FAILURES:
+            diagnostic.update({"skip_reason": "non_recoverable_failure", "primary_failure_kind": failure_kind})
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+
+        project = session.get(Project, worker.project_id)
+        intent = session.get(Intent, worker.intent_id)
+        if project is None or project.status not in {"ACTIVE", "WORKING"}:
+            diagnostic["skip_reason"] = "project_inactive"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+        if (
+            worker.status != "RUNNING"
+            or intent is None
+            or intent.status != "RUNNING"
+            or intent.lease_owner != worker.id
+            or intent.lease_generation != worker.lease_generation
+        ):
+            diagnostic["skip_reason"] = "lease_inactive"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+        if attempt.status not in {"RUNNING", "FINALIZING"}:
+            diagnostic["skip_reason"] = "attempt_inactive"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
+
+        prompt_file = self._write_conclude_prompt(snapshot, workspace)
+        output_file = workspace / "aurora-conclude-last-message.json"
+        if output_file.exists():
+            output_file.unlink()
+        command = self._render_command(
+            prompt_file,
+            model=model,
+            last_message_filename=output_file.name,
+        )
+        command = f"AURORA_CODEX_RESUME_THREAD_ID={shlex.quote(thread_id)} {command}"
+        diagnostic.update({"attempted": True, "primary_failure_kind": failure_kind})
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type="attempt.conclude_fallback_started",
+                payload_json={"timeout_seconds": seconds, "primary_failure_kind": failure_kind},
+            )
+        )
+        session.commit()
+
+        started = time.monotonic()
+        try:
+            completed = self._run_command(
+                command,
+                workspace,
+                timeout_seconds=seconds,
+                finalize_grace_seconds=min(5, max(1, seconds // 5)),
+                runner=runner,
+                on_output=lambda stream, line: self._record_codex_event(
+                    session,
+                    worker=worker,
+                    attempt=attempt,
+                    stream=stream,
+                    line=line,
+                    artifact_store=self.artifact_store,
+                ),
+            )
+        except Exception as exc:
+            diagnostic.update({"error": str(exc)[:500], "duration_ms": round((time.monotonic() - started) * 1000)})
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    attempt_id=attempt.id,
+                    event_type="attempt.conclude_fallback_failed",
+                    payload_json=diagnostic,
+                )
+            )
+            session.commit()
+            return ConcludeFallbackOutcome(True, False, diagnostic)
+
+        diagnostic["duration_ms"] = round((time.monotonic() - started) * 1000)
+        try:
+            transcript = self._bounded_transcript(self._transcript(command, completed))
+            artifact = self.artifact_store.write_text(
+                session,
+                project_id=snapshot.project_id,
+                source_attempt_id=attempt.id,
+                content=transcript,
+                summary=f"Codex conclude fallback transcript {completed.backend} exit={completed.exit_code}",
+                artifact_type="codex-conclude-transcript",
+                origin_kind="model_output",
+            )
+            structured, fallback_diagnostic = self._parse_or_synthesize(
+                output_file=output_file,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                exit_code=completed.exit_code,
+                failure_kind=completed.failure_kind,
+                artifact_id=artifact.id,
+                snapshot=snapshot,
+                session=session,
+                worker=worker,
+                attempt=attempt,
+            )
+        except Exception as exc:
+            session.rollback()
+            diagnostic.update({
+                "error": f"failed to persist or parse conclude output: {str(exc)[:500]}",
+                "exit_code": completed.exit_code,
+                "failure_kind": completed.failure_kind,
+            })
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    attempt_id=attempt.id,
+                    event_type="attempt.conclude_fallback_failed",
+                    payload_json=diagnostic,
+                )
+            )
+            session.commit()
+            return ConcludeFallbackOutcome(
+                attempted=True,
+                recovered=False,
+                diagnostic=diagnostic,
+                command_result=completed,
+            )
+        recovered = fallback_diagnostic.get("source") in VALID_STRUCTURED_OUTPUT_SOURCES
+        diagnostic.update({
+            "recovered": recovered,
+            "output": fallback_diagnostic,
+            "exit_code": completed.exit_code,
+            "failure_kind": completed.failure_kind,
+        })
+        if recovered:
+            dropped_requests = len(structured.get("tool_requests") or [])
+            structured["tool_requests"] = []
+            if dropped_requests:
+                diagnostic["dropped_tool_requests"] = dropped_requests
+            event_type = "attempt.conclude_fallback_completed"
+        else:
+            event_type = "attempt.conclude_fallback_failed"
+        session.add(
+            WorkerEvent(
+                project_id=worker.project_id,
+                worker_id=worker.id,
+                intent_id=worker.intent_id,
+                attempt_id=attempt.id,
+                event_type=event_type,
+                payload_json={**diagnostic, "artifact_id": artifact.id},
+            )
+        )
+        session.commit()
+        return ConcludeFallbackOutcome(
+            attempted=True,
+            recovered=recovered,
+            diagnostic=diagnostic,
+            structured_output=structured if recovered else None,
+            command_result=completed,
+            artifact=artifact,
+        )
+
+    @staticmethod
+    def _write_conclude_prompt(snapshot: ContextSnapshot, workspace: Path) -> Path:
+        objective = str(snapshot.sections_json.get("current_intent", {}).get("objective") or "current intent")
+        prompt_file = workspace / "aurora-conclude.md"
+        prompt_file.write_text(
+            "# Conclude fallback\n\n"
+            "The previous solver turn ended without a schema-valid final response. Stop investigating now. "
+            "Use only evidence and observations already present in this same Codex thread.\n\n"
+            "Rules:\n"
+            "- Do not run commands, call tools or MCP servers, browse, inspect new files, wait, or start subagents.\n"
+            "- Do not claim facts or flags that were not already confirmed.\n"
+            "- Return one raw JSON object matching the supplied output schema and nothing else.\n"
+            "- Set tool_requests and subagent_reports to empty arrays.\n"
+            "- If the intent is unfinished, use status=partial and provide one concrete suggested_intent with "
+            "an expected_observation, or a blocker with a concrete next_step.\n"
+            "- Reference only Artifact IDs already known in the thread.\n\n"
+            f"Current intent: {objective}\n",
+            encoding="utf-8",
+        )
+        return prompt_file
+
     def _import_mcp_events(
         self,
         session: Session,
@@ -1256,7 +1550,14 @@ class CodexHarnessRuntime:
         schema["required"] = list(schema["properties"])
         return schema
 
-    def _render_command(self, prompt_file: Path, *, model: str | None = None) -> str:
+    def _render_command(
+        self,
+        prompt_file: Path,
+        *,
+        model: str | None = None,
+        output_schema_filename: str = "aurora-output-schema.json",
+        last_message_filename: str = "aurora-last-message.json",
+    ) -> str:
         model = model or self.settings.llm_model
         workspace = Path.cwd().resolve()
         relative_prompt = prompt_file.resolve().relative_to(workspace)
@@ -1264,10 +1565,10 @@ class CodexHarnessRuntime:
         return self.settings.codex_command_template.format(
             prompt_file=prompt_file.name,
             prompt_filename=prompt_file.name,
-            output_schema_file="aurora-output-schema.json",
-            output_schema_filename="aurora-output-schema.json",
-            last_message_file="aurora-last-message.json",
-            last_message_filename="aurora-last-message.json",
+            output_schema_file=output_schema_filename,
+            output_schema_filename=output_schema_filename,
+            last_message_file=last_message_filename,
+            last_message_filename=last_message_filename,
             prompt_path=str(relative_prompt),
             host_prompt_file=str(prompt_file),
             container_prompt_file=str(container_prompt),

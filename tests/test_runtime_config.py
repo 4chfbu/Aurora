@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from aurora.config import get_settings
 from aurora.services.command_runner import CommandResult, CommandRunner, KaliContainerRunner
 from aurora.services.artifact_store import ArtifactStore
-from aurora.models import Artifact, Attempt, SQLModel, ToolTrace, Worker, WorkerEvent
+from aurora.models import Artifact, Attempt, ContextSnapshot, Intent, Project, SQLModel, ToolTrace, Worker, WorkerEvent
 from sqlmodel import Session, create_engine, select
 import pytest
 
@@ -830,6 +830,348 @@ class NoopRunner(CommandRunner):
             exit_code=0,
             backend="test",
         )
+
+
+class ConcludeFallbackRunner(CommandRunner):
+    def __init__(self, payload: dict | None) -> None:
+        self.payload = payload
+        self.commands: list[str] = []
+
+    def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
+        raise AssertionError("conclude fallback should use streaming execution")
+
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
+        self.commands.append(command)
+        if self.payload is not None:
+            cwd.joinpath("aurora-conclude-last-message.json").write_text(
+                json.dumps(self.payload),
+                encoding="utf-8",
+            )
+        return CommandResult(
+            command=command,
+            executed_command=command,
+            cwd=str(cwd),
+            stdout="" if self.payload is not None else "not-json",
+            stderr="",
+            exit_code=0,
+            backend="test",
+        )
+
+
+class ExecuteWithFallbackRunner(CommandRunner):
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def run(self, *, command: str, cwd: Path, timeout: int | None) -> CommandResult:
+        raise AssertionError("Codex execute should use streaming execution")
+
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
+        self.calls += 1
+        if self.calls == 1:
+            on_output("stdout", json.dumps({"type": "thread.started", "thread_id": "thread_execute"}))
+            return CommandResult(
+                command=command,
+                executed_command=command,
+                cwd=str(cwd),
+                stdout="",
+                stderr="primary timed out",
+                exit_code=124,
+                backend="test",
+                failure_kind="command_timed_out",
+                finalization_reason="soft_timeout",
+            )
+        cwd.joinpath("aurora-conclude-last-message.json").write_text(json.dumps(self.payload), encoding="utf-8")
+        return CommandResult(command, command, str(cwd), "", "", 0, "test")
+
+
+def _conclude_fallback_state(engine, *, thread_id: str | None = "thread_current"):
+    project_id = "proj_conclude"
+    project = Project(id=project_id, name="conclude", goal="preserve evidence")
+    intent = Intent(
+        id="intent_conclude",
+        project_id=project.id,
+        objective="Recover confirmed evidence",
+        status="RUNNING",
+        lease_owner="worker_conclude",
+        lease_generation=3,
+    )
+    worker = Worker(
+        id="worker_conclude",
+        project_id=project.id,
+        intent_id=intent.id,
+        status="RUNNING",
+        lease_generation=3,
+    )
+    attempt = Attempt(
+        id="attempt_conclude",
+        project_id=project.id,
+        intent_id=intent.id,
+        worker_id=worker.id,
+        status="FINALIZING",
+        codex_thread_id=thread_id,
+    )
+    with Session(engine) as session:
+        session.add_all([project, intent, worker, attempt])
+        session.commit()
+    return project_id
+
+
+def test_codex_conclude_fallback_recovers_same_thread_output(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    project_id = _conclude_fallback_state(engine)
+    payload = {
+        "status": "partial",
+        "summary": "Recovered the confirmed endpoint from the interrupted turn.",
+        "suggested_intents": [{
+            "objective": "Verify the retained endpoint response",
+            "expected_observation": "The response confirms or rejects the active hypothesis",
+            "capabilities": ["codex.shell"],
+            "priority": 1.0,
+            "risk_level": "low",
+        }],
+        "decision_summary": {
+            "selected_intent": "Recover confirmed evidence",
+            "reason_summary": "The prior thread already contained the endpoint observation.",
+            "next_tool_plan": [],
+        },
+        "tool_requests": [{"tool_name": "sandbox.exec", "request": {"command": "should-not-run"}}],
+    }
+    runner = ConcludeFallbackRunner(payload)
+    runtime = CodexHarnessRuntime(
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        command_runner=runner,
+    )
+    workspace = tmp_path / "codex-workspaces" / project_id / "worker_conclude"
+    workspace.mkdir(parents=True)
+    snapshot = SimpleNamespace(
+        project_id=project_id,
+        sections_json={"current_intent": {"objective": "Recover confirmed evidence"}},
+        visible_tools_json=[{"name": "sandbox.exec"}],
+    )
+    primary = CommandResult(
+        command="primary",
+        executed_command="primary",
+        cwd=str(workspace),
+        stdout="",
+        stderr="timed out",
+        exit_code=124,
+        backend="test",
+        failure_kind="command_timed_out",
+    )
+
+    with Session(engine) as session:
+        worker = session.get(Worker, "worker_conclude")
+        attempt = session.get(Attempt, "attempt_conclude")
+        assert worker is not None and attempt is not None
+        outcome = runtime._try_conclude_fallback(
+            session,
+            worker=worker,
+            attempt=attempt,
+            snapshot=snapshot,
+            workspace=workspace,
+            model="test-model",
+            runner=runner,
+            primary_completed=primary,
+            primary_diagnostic={"source": None},
+        )
+        events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
+        artifacts = session.exec(select(Artifact).where(Artifact.project_id == project_id)).all()
+
+    assert outcome.attempted is True
+    assert outcome.recovered is True
+    assert outcome.structured_output is not None
+    assert outcome.structured_output["summary"].startswith("Recovered")
+    assert outcome.structured_output["tool_requests"] == []
+    assert outcome.diagnostic["dropped_tool_requests"] == 1
+    assert "AURORA_CODEX_RESUME_THREAD_ID=thread_current" in runner.commands[0]
+    assert "aurora-conclude-last-message.json" in runner.commands[0]
+    assert "Do not run commands" in workspace.joinpath("aurora-conclude.md").read_text(encoding="utf-8")
+    assert [event.event_type for event in events] == [
+        "attempt.conclude_fallback_started",
+        "attempt.conclude_fallback_completed",
+    ]
+    assert [artifact.type for artifact in artifacts] == ["codex-conclude-transcript"]
+    get_settings.cache_clear()
+
+
+def test_codex_conclude_fallback_skips_without_thread(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    project_id = _conclude_fallback_state(engine, thread_id=None)
+    runner = ConcludeFallbackRunner(None)
+    runtime = CodexHarnessRuntime(artifact_store=ArtifactStore(tmp_path / "artifacts"), command_runner=runner)
+    workspace = tmp_path / "codex-workspaces" / project_id / "worker_conclude"
+    workspace.mkdir(parents=True)
+    snapshot = SimpleNamespace(project_id=project_id, sections_json={"current_intent": {"objective": "recover"}})
+    primary = CommandResult("primary", "primary", str(workspace), "", "", 124, "test", "command_timed_out")
+
+    with Session(engine) as session:
+        outcome = runtime._try_conclude_fallback(
+            session,
+            worker=session.get(Worker, "worker_conclude"),
+            attempt=session.get(Attempt, "attempt_conclude"),
+            snapshot=snapshot,
+            workspace=workspace,
+            model="test-model",
+            runner=runner,
+            primary_completed=primary,
+            primary_diagnostic={"source": None},
+        )
+
+    assert outcome.attempted is False
+    assert outcome.diagnostic["skip_reason"] == "thread_id_missing"
+    assert runner.commands == []
+    get_settings.cache_clear()
+
+
+def test_codex_conclude_fallback_failure_keeps_primary_result(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    project_id = _conclude_fallback_state(engine)
+    runner = ConcludeFallbackRunner(None)
+    runtime = CodexHarnessRuntime(artifact_store=ArtifactStore(tmp_path / "artifacts"), command_runner=runner)
+    workspace = tmp_path / "codex-workspaces" / project_id / "worker_conclude"
+    workspace.mkdir(parents=True)
+    snapshot = SimpleNamespace(
+        project_id=project_id,
+        sections_json={"current_intent": {"objective": "recover"}},
+        visible_tools_json=[],
+    )
+    primary = CommandResult("primary", "primary", str(workspace), "", "", 124, "test", "command_timed_out")
+
+    with Session(engine) as session:
+        attempt = session.get(Attempt, "attempt_conclude")
+        outcome = runtime._try_conclude_fallback(
+            session,
+            worker=session.get(Worker, "worker_conclude"),
+            attempt=attempt,
+            snapshot=snapshot,
+            workspace=workspace,
+            model="test-model",
+            runner=runner,
+            primary_completed=primary,
+            primary_diagnostic={"source": None},
+        )
+        events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
+
+    assert outcome.attempted is True
+    assert outcome.recovered is False
+    assert outcome.structured_output is None
+    assert outcome.artifact is not None
+    assert [event.event_type for event in events] == [
+        "attempt.conclude_fallback_started",
+        "attempt.conclude_fallback_failed",
+    ]
+    get_settings.cache_clear()
+
+
+def test_codex_execute_uses_recovered_conclude_result(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AURORA_CODEX_WORKSPACE_DIR", "./codex-workspaces")
+    monkeypatch.setenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")
+    monkeypatch.setenv("AURORA_CODEX_COMMAND_TEMPLATE", "run {prompt_filename} {output_schema_filename} {last_message_filename}")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    payload = {
+        "status": "partial",
+        "summary": "The same thread preserved its confirmed evidence.",
+        "suggested_intents": [{
+            "objective": "Continue from the retained evidence",
+            "expected_observation": "One test discriminates the remaining hypothesis",
+            "capabilities": ["codex.shell"],
+            "priority": 1.0,
+            "risk_level": "low",
+        }],
+        "decision_summary": {
+            "selected_intent": "Preserve progress",
+            "reason_summary": "Conclude fallback summarized the interrupted turn.",
+            "next_tool_plan": [],
+        },
+    }
+    runner = ExecuteWithFallbackRunner(payload)
+    runtime = CodexHarnessRuntime(
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        command_runner=runner,
+    )
+    project = Project(id="proj_execute_conclude", name="execute", goal="preserve")
+    intent = Intent(
+        id="intent_execute_conclude",
+        project_id=project.id,
+        objective="Preserve progress",
+        status="RUNNING",
+        lease_owner="worker_execute_conclude",
+        lease_generation=1,
+    )
+    worker = Worker(
+        id="worker_execute_conclude",
+        project_id=project.id,
+        intent_id=intent.id,
+        status="RUNNING",
+        lease_generation=1,
+        budgets={"model_role": "solver", "hard_timeout_seconds": 60, "soft_timeout_seconds": 30},
+    )
+    attempt = Attempt(
+        id="attempt_execute_conclude",
+        project_id=project.id,
+        intent_id=intent.id,
+        worker_id=worker.id,
+    )
+    snapshot = ContextSnapshot(
+        id="ctx_execute_conclude",
+        project_id=project.id,
+        intent_id=intent.id,
+        worker_id=worker.id,
+        sections_json={"project_goal": project.goal, "current_intent": {"objective": intent.objective}},
+        visible_tools_json=[],
+        output_schema_json=runtime._json_schema(),
+    )
+
+    with Session(engine) as session:
+        session.add_all([project, intent, worker, attempt, snapshot])
+        session.commit()
+        output = runtime.execute(session, worker=worker, snapshot=snapshot)
+        artifacts = session.exec(select(Artifact).where(Artifact.project_id == project.id)).all()
+
+    assert runner.calls == 2
+    assert output.summary == "The same thread preserved its confirmed evidence."
+    assert output.llm_trace.provider_usage_json["conclude_fallback"]["recovered"] is True
+    assert {artifact.type for artifact in artifacts} >= {
+        "codex-transcript",
+        "codex-conclude-transcript",
+        "resume-manifest",
+    }
+    assert len(output.structured_output["artifact_refs"]) >= 2
+    get_settings.cache_clear()
 
 
 def test_codex_runtime_imports_local_mcp_events(tmp_path) -> None:

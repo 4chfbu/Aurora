@@ -148,6 +148,7 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT` | `800000` | 达到此 token 数后触发 Codex 自动压缩，为最终结构化输出保留空间。 |
 | `AURORA_CODEX_REQUIRE_EXPLICIT_MODEL_METADATA` | `true` | 要求显式设置上面两个模型预算变量；缺失时启动失败，禁止静默使用未知模型 fallback。 |
 | `AURORA_CODEX_TRANSCRIPT_MAX_BYTES` | `2097152` | 单份 Harness transcript 的存储上限；超限时保留头尾并写入截断标记。 |
+| `AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS` | `45` | 主执行未返回合法结构化 JSON 时，恢复同一 Codex thread 做只读收尾的最大秒数；设为 `0` 禁用。 |
 
 ### LLM 与角色路由
 

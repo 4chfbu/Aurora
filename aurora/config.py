@@ -49,6 +49,10 @@ class Settings(BaseModel):
     codex_command_template: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_COMMAND_TEMPLATE", "/workspace/runtime/codex-via-cc-switch.sh {prompt_filename} {output_schema_filename} {last_message_filename}"))
     codex_proxy_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_CODEX_PROXY_BASE_URL", "http://aurora-cc-switch:15723/v1"))
     codex_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TIMEOUT_SECONDS", "1800")))
+    codex_conclude_fallback_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")),
+        ge=0,
+    )
     codex_model_context_window: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_MODEL_CONTEXT_WINDOW", "1000000")))
     codex_auto_compact_token_limit: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT", "800000")))
     codex_transcript_max_bytes: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TRANSCRIPT_MAX_BYTES", str(2 * 1024 * 1024))))
