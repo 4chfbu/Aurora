@@ -8,7 +8,7 @@ from sqlmodel import Session, select
 
 from aurora.models import Artifact, Attempt, Finding, FlagCandidate, LLMTrace, Project, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import BlackboardRepository
-from aurora.services.flag_rejection import record_flag_rejection
+from aurora.services.flag_rejection import is_authoritative_flag_rejection, record_flag_rejection
 from aurora.services.flag_validator import FlagValidator
 from aurora.services.flag_prefix_config import flag_prefixes_for_project
 
@@ -86,7 +86,7 @@ class ResultProcessor:
                     session,
                     attempt=attempt,
                     value=value,
-                    status="REJECTED",
+                    status="PROPOSED",
                     provenance_kind="UNVERIFIED",
                     evidence_refs=evidence_refs,
                     rejection_reason=reason,
@@ -124,24 +124,29 @@ class ResultProcessor:
                     session,
                     attempt=attempt,
                     value=value,
-                    status="REJECTED",
+                    status="PROPOSED",
                     provenance_kind="UNVERIFIED",
                     evidence_refs=evidence_refs,
                     rejection_reason=reason,
                 )
-                record_flag_rejection(
-                    session,
-                    project_id=attempt.project_id,
-                    value=value,
-                    reason=reason,
-                    evidence_refs=evidence_refs,
-                    worker_id=attempt.worker_id,
-                    intent_id=attempt.intent_id,
-                    attempt_id=attempt.id,
-                )
-                decoy_feedback.append(
-                    f"Candidate flag {value} was rejected: {reason}. Do not submit it again; continue investigating for the correct flag."
-                )
+                if not syntactically_valid:
+                    record_flag_rejection(
+                        session,
+                        project_id=attempt.project_id,
+                        value=value,
+                        reason=reason,
+                        evidence_refs=evidence_refs,
+                        worker_id=attempt.worker_id,
+                        intent_id=attempt.intent_id,
+                        attempt_id=attempt.id,
+                    )
+                    decoy_feedback.append(
+                        f"Candidate flag {value} was rejected: {reason}. Do not submit it again; continue investigating for the correct flag."
+                    )
+                else:
+                    decoy_feedback.append(
+                        f"Candidate flag {value} is not submission-eligible: {reason}. Continue investigating or verify it with trusted evidence."
+                    )
                 continue
             evidence_artifact = session.get(Artifact, artifact_ref)
             provenance_kind = "DERIVED_REPLAY" if evidence_artifact and evidence_artifact.origin_kind == "verified_derivation" else "OBSERVED"
@@ -255,7 +260,7 @@ class ResultProcessor:
         if candidate is None:
             candidate = FlagCandidate(project_id=attempt.project_id, value=normalized, value_hash=value_hash)
         # Trusted evidence may rehabilitate a previously unverified proposal.
-        platform_decided = candidate.submission_count > 0 and candidate.status in {"ACCEPTED", "REJECTED", "AWAITING_MANUAL_VALIDATION"}
+        platform_decided = candidate.status in {"ACCEPTED", "AWAITING_MANUAL_VALIDATION"} or is_authoritative_flag_rejection(candidate)
         if not platform_decided and candidate.status != "ACCEPTED" and (status == "LOCAL_VERIFIED" or candidate.status != "LOCAL_VERIFIED"):
             candidate.status = status
             candidate.provenance_kind = provenance_kind

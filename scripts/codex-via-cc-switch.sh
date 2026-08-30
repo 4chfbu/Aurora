@@ -6,6 +6,7 @@ SCHEMA_FILE="${2:-aurora-output-schema.json}"
 LAST_MESSAGE_FILE="${3:-aurora-last-message.json}"
 PROXY_BASE_URL="${OPENAI_BASE_URL:-http://aurora-cc-switch:15723/v1}"
 MODEL="${OPENAI_MODEL:-gpt-4.1-mini}"
+MODEL_REASONING_EFFORT="${AURORA_CODEX_MODEL_REASONING_EFFORT:-none}"
 MODEL_CONTEXT_WINDOW="${AURORA_CODEX_MODEL_CONTEXT_WINDOW:-1000000}"
 AUTO_COMPACT_TOKEN_LIMIT="${AURORA_CODEX_AUTO_COMPACT_TOKEN_LIMIT:-800000}"
 RESUME_THREAD_ID="${AURORA_CODEX_RESUME_THREAD_ID:-}"
@@ -28,12 +29,13 @@ curl --fail --silent --show-error --max-time 10 "${PROXY_ORIGIN}/health" >/dev/n
 }
 
 # Child Solver processes reuse the same network-local CC Switch proxy.
-export AURORA_SUBAGENT_CODEX_COMMAND="codex exec -m $(printf '%q' "${MODEL}") -c 'model_provider=\"aurora\"' -c $(printf '%q' "${PROVIDER_CONFIG}") -c model_context_window=${MODEL_CONTEXT_WINDOW} -c model_auto_compact_token_limit=${AUTO_COMPACT_TOKEN_LIMIT} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --output-schema {schema_filename} --output-last-message {last_message_filename} - < {prompt_filename}"
+export AURORA_SUBAGENT_CODEX_COMMAND="codex exec -m $(printf '%q' "${MODEL}") -c 'model_provider=\"aurora\"' -c $(printf '%q' "${PROVIDER_CONFIG}") -c $(printf '%q' "model_reasoning_effort=\"${MODEL_REASONING_EFFORT}\"") -c model_context_window=${MODEL_CONTEXT_WINDOW} -c model_auto_compact_token_limit=${AUTO_COMPACT_TOKEN_LIMIT} --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --output-schema {schema_filename} --output-last-message {last_message_filename} - < {prompt_filename}"
 
 common_args=(
   -m "${MODEL}"
   -c 'model_provider="aurora"'
   -c "${PROVIDER_CONFIG}"
+  -c "model_reasoning_effort=\"${MODEL_REASONING_EFFORT}\""
   -c "model_context_window=${MODEL_CONTEXT_WINDOW}"
   -c "model_auto_compact_token_limit=${AUTO_COMPACT_TOKEN_LIMIT}"
   --skip-git-repo-check

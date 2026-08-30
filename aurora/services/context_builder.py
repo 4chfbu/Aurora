@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 
 from aurora.config import get_settings
 from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, FlagCandidate, Intent, Project, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
+from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.tool_contract import tools_for_runtime
 from aurora.services.tool_profiles import tool_environment
@@ -105,6 +106,17 @@ class ContextBuilder:
         checkpoints = session.exec(
             select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at.desc()).limit(3)
         ).all()
+        handoff_artifact_refs = list(dict.fromkeys(
+            artifact_ref
+            for checkpoint in checkpoints
+            for artifact_ref in checkpoint.artifact_refs
+            if isinstance(artifact_ref, str)
+        ))
+        handoff_artifacts: list[Artifact] = []
+        for artifact_ref in handoff_artifact_refs:
+            artifact = session.get(Artifact, artifact_ref)
+            if artifact is not None and artifact.project_id == project_id:
+                handoff_artifacts.append(artifact)
         group_item = session.exec(
             select(ChallengeGroupItem)
             .where(ChallengeGroupItem.project_id == project_id, ChallengeGroupItem.fused_status != "COMPLETED")
@@ -131,8 +143,9 @@ class ContextBuilder:
             select(FlagCandidate)
             .where(FlagCandidate.project_id == project_id, FlagCandidate.status == "REJECTED")
             .order_by(FlagCandidate.updated_at.desc())
-            .limit(10)
+            .limit(50)
         ).all()
+        rejected_candidates = [candidate for candidate in rejected_candidates if is_authoritative_flag_rejection(candidate)][:10]
         verified_candidates = session.exec(
             select(FlagCandidate)
             .where(FlagCandidate.project_id == project_id, FlagCandidate.status == "LOCAL_VERIFIED")
@@ -220,6 +233,10 @@ class ContextBuilder:
             "artifact_summaries": [
                 {"id": artifact.id, "type": artifact.type, "summary": artifact.summary, "sensitivity": artifact.sensitivity}
                 for artifact in artifacts
+            ],
+            "handoff_artifacts": [
+                {"id": artifact.id, "type": artifact.type, "summary": artifact.summary, "sensitivity": artifact.sensitivity}
+                for artifact in handoff_artifacts
             ],
             "recent_checkpoints": [
                 {

@@ -70,6 +70,30 @@ def _lease_seconds_for_intent(intent: object) -> int:
     return max(600, hard_timeout + 120)
 
 
+def _select_parent_attempt(session: Session, *, project_id: str, intent: Intent) -> Attempt | None:
+    """Select the newest resumable project state, preferring the explicit parent."""
+    terminal_statuses = ["SUCCESS", "COMPLETED", "PARTIAL", "FAILED", "TIMEOUT"]
+    resumable = (
+        Attempt.project_id == project_id,
+        Attempt.codex_thread_id.is_not(None),
+        Attempt.resume_manifest_artifact_id.is_not(None),
+        Attempt.status.in_(terminal_statuses),
+    )
+    if intent.parent_intent_id:
+        parent = session.exec(
+            select(Attempt)
+            .where(*resumable, Attempt.intent_id == intent.parent_intent_id)
+            .order_by(Attempt.started_at.desc())
+        ).first()
+        if parent is not None:
+            return parent
+    return session.exec(
+        select(Attempt)
+        .where(*resumable, Attempt.intent_id != intent.id)
+        .order_by(Attempt.started_at.desc())
+    ).first()
+
+
 class _WorkerLeaseHeartbeat:
     """Renew a worker lease while its synchronous Harness call is blocking."""
 
@@ -216,9 +240,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     )
     session.commit()
 
-    parent_attempt = session.exec(
-        select(Attempt).where(Attempt.intent_id == intent.parent_intent_id).order_by(Attempt.started_at.desc())
-    ).first() if intent.parent_intent_id else None
+    parent_attempt = _select_parent_attempt(session, project_id=project_id, intent=intent)
     attempt = Attempt(
         project_id=project_id,
         intent_id=intent.id,
@@ -229,6 +251,22 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     session.add(attempt)
     session.commit()
     session.refresh(attempt)
+    if parent_attempt is not None and parent_attempt.intent_id != intent.parent_intent_id:
+        session.add(
+            WorkerEvent(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                event_type="attempt.parent_fallback_selected",
+                payload_json={
+                    "parent_attempt_id": parent_attempt.id,
+                    "parent_intent_id": parent_attempt.intent_id,
+                    "requested_parent_intent_id": intent.parent_intent_id,
+                },
+            )
+        )
+        session.commit()
 
     snapshot = ContextBuilder().build(session, project_id=project_id, intent_id=intent.id, worker_id=worker.id)
     session.add(

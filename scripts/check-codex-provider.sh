@@ -53,3 +53,48 @@ print({"endpoint": "/v1/responses", "status": status, "ok": 200 <= status < 300,
 if not 200 <= status < 300:
     raise SystemExit("CC Switch did not convert the Responses request successfully.")
 PY
+
+# A single non-streaming response does not exercise the failure mode that
+# matters to Solver Workers. Run the production Codex client through one shell
+# action and require it to complete the follow-up turn; DeepSeek-style
+# reasoning_content incompatibilities surface only on that continuation.
+model="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${container_id}" | sed -n 's/^AURORA_LLM_MODEL=//p' | head -n 1)"
+worker_image="${AURORA_WORKER_IMAGE:-aurora-kali-codex:core}"
+runtime_network="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "${container_id}" | head -n 1)"
+
+set +e
+multiturn_output="$({
+  printf '%s\n' 'Use the shell tool once to run: printf provider-multiturn-ok. Then reply exactly ok.'
+} | docker run --rm -i \
+  --network "${runtime_network}" \
+  --cpus 1 \
+  --memory 1g \
+  --user 1000:1000 \
+  -e HOME=/tmp/aurora-home \
+  -e CODEX_HOME=/tmp/aurora-codex-home \
+  -e OPENAI_API_KEY=aurora-health-check \
+  -e OPENAI_BASE_URL=http://aurora-cc-switch:15723/v1 \
+  -e OPENAI_MODEL="${model}" \
+  "${worker_image}" bash -lc '
+    mkdir -p "$HOME" "$CODEX_HOME"
+    provider="model_providers.aurora={ name=\"Aurora CC Switch\", base_url=\"${OPENAI_BASE_URL}\", wire_api=\"responses\", requires_openai_auth=true, supports_websockets=false }"
+    codex exec -m "$OPENAI_MODEL" \
+      -c '\''model_provider="aurora"'\'' \
+      -c "$provider" \
+      -c '\''model_reasoning_effort="none"'\'' \
+      --skip-git-repo-check \
+      --dangerously-bypass-approvals-and-sandbox \
+      --json \
+      --output-last-message /tmp/aurora-final-message.txt \
+      -
+  ' 2>&1)"
+multiturn_status=$?
+set -e
+printf '%s\n' "${multiturn_output}"
+
+if [[ ${multiturn_status} -ne 0 ]] \
+  || grep -q 'reasoning_content.*must be passed back' <<<"${multiturn_output}" \
+  || ! grep -q '"type":"turn.completed"' <<<"${multiturn_output}"; then
+  printf 'CC Switch multi-turn Codex preflight failed.\n' >&2
+  exit 1
+fi

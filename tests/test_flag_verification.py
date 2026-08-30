@@ -62,6 +62,101 @@ def test_flag_verify_replays_derivation_twice(monkeypatch, tmp_path) -> None:
         assert trace.exit_code == 0
 
 
+def test_flag_verify_rehabilitates_legacy_local_rejection(monkeypatch, tmp_path) -> None:
+    gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspaces" / project_id / worker_id
+    workspace.mkdir(parents=True)
+    workspace.joinpath("solve.py").write_text(
+        "import codecs, json, pathlib, sys\n"
+        "manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        "raw = pathlib.Path(manifest[0]['path']).read_text().strip()\n"
+        "print(codecs.decode(raw, 'rot_13'))\n",
+        encoding="utf-8",
+    )
+
+    with Session(engine) as session:
+        session.add_all([Project(id=project_id, name="verify", goal="derive"), AuthorizationScope(project_id=project_id)])
+        candidate = FlagCandidate(
+            project_id=project_id,
+            value="flag{local_retry}",
+            value_hash=hashlib.sha256(b"flag{local_retry}").hexdigest(),
+            status="REJECTED",
+            provenance_kind="UNVERIFIED",
+            rejection_reason="candidate was not present in trusted evidence",
+        )
+        session.add(candidate)
+        session.commit()
+        source = ArtifactStore(tmp_path / "artifacts").write_text(
+            session,
+            project_id=project_id,
+            content="synt{ybpny_ergel}",
+            summary="encoded challenge input",
+            artifact_type="imported_attachment",
+            origin_kind="challenge_input",
+        )
+
+        result = gateway.execute(
+            session,
+            project_id=project_id,
+            worker_id=worker_id,
+            tool_name="flag.verify",
+            request={"source_artifact_refs": [source.id], "verification_script": "solve.py"},
+        )
+
+        session.refresh(candidate)
+        assert result.success is True
+        assert candidate.status == "LOCAL_VERIFIED"
+        assert candidate.rejection_reason is None
+
+
+def test_flag_verify_preserves_platform_rejection(monkeypatch, tmp_path) -> None:
+    gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspaces" / project_id / worker_id
+    workspace.mkdir(parents=True)
+    workspace.joinpath("solve.py").write_text(
+        "import codecs, json, pathlib, sys\n"
+        "manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        "raw = pathlib.Path(manifest[0]['path']).read_text().strip()\n"
+        "print(codecs.decode(raw, 'rot_13'))\n",
+        encoding="utf-8",
+    )
+
+    with Session(engine) as session:
+        session.add_all([Project(id=project_id, name="verify", goal="derive"), AuthorizationScope(project_id=project_id)])
+        candidate = FlagCandidate(
+            project_id=project_id,
+            value="flag{wrong}",
+            value_hash=hashlib.sha256(b"flag{wrong}").hexdigest(),
+            status="REJECTED",
+            provenance_kind="DERIVED_REPLAY",
+            submission_count=1,
+            rejection_reason="competition platform rejected the candidate flag",
+        )
+        session.add(candidate)
+        session.commit()
+        source = ArtifactStore(tmp_path / "artifacts").write_text(
+            session,
+            project_id=project_id,
+            content="synt{jebat}",
+            summary="encoded challenge input",
+            artifact_type="imported_attachment",
+            origin_kind="challenge_input",
+        )
+
+        result = gateway.execute(
+            session,
+            project_id=project_id,
+            worker_id=worker_id,
+            tool_name="flag.verify",
+            request={"source_artifact_refs": [source.id], "verification_script": "solve.py"},
+        )
+
+        session.refresh(candidate)
+        assert result.success is False
+        assert "previously rejected" in result.summary
+        assert candidate.status == "REJECTED"
+
+
 def test_flag_verify_rejects_hardcoded_candidate(monkeypatch, tmp_path) -> None:
     gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
     workspace = tmp_path / "workspaces" / project_id / worker_id

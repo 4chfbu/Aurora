@@ -9,12 +9,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlmodel import Session, select
 
 from aurora.db import engine
 from aurora.config import get_settings
-from aurora.models import Attempt, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
+from aurora.models import Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
 from aurora.services.competition_adapter import (
     CompetitionAdapter,
@@ -29,6 +30,7 @@ from aurora.services.container_control import stop_project_containers
 from aurora.services.harvester_runner import AutoRunnerHarvester, HarvesterRunner
 from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
+from aurora.services.suspend_guard import SuspendGapDetector
 
 
 @dataclass
@@ -228,10 +230,14 @@ class ChallengeGroupRunner:
                     deadline_at=limits.deadline_at,
                 )
                 environment_warning: str | None = None
+                environment_disposition: str | None = None
+                environment_detail: str | None = None
                 try:
                     health = self._competition_for(item).ensure_environment(session, project_id=project.id)
                     if not health.available:
                         environment_warning = health.reason or "environment_unavailable"
+                        environment_disposition = getattr(health, "disposition", None)
+                        environment_detail = getattr(health, "detail", None)
                 except Exception as exc:
                     environment_warning = str(exc)[:1000] or type(exc).__name__
                     self._release_managed_environment_after_failed_start(session, item=item)
@@ -241,11 +247,17 @@ class ChallengeGroupRunner:
                         group_id,
                         item.id,
                         "group.item.environment_unavailable",
-                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "solver_continues": not self._is_managed_platform_item(item)},
+                        {"project_id": project.id, "phase": item.phase, "warning": environment_warning, "detail": environment_detail, "solver_continues": not self._is_managed_platform_item(item)},
                     )
                 if environment_warning and self._is_managed_platform_item(item):
+                    if environment_disposition == "task_terminal":
+                        self._finish_platform_task(session, group=group, reason=environment_warning, detail=environment_detail)
+                        continue
+                    if environment_disposition == "item_terminal":
+                        self._finish_platform_item(session, group=group, item=item, project=project, reason=environment_warning, detail=environment_detail)
+                        continue
                     platform = competition_platform(item)
-                    waiting_for_capacity = self._is_capacity_exhausted(environment_warning)
+                    waiting_for_capacity = environment_disposition == "wait_resource" or self._is_capacity_exhausted(environment_warning)
                     wait_status = "WAITING_RESOURCE" if waiting_for_capacity else "WAITING_INPUT"
                     item.fused_status = wait_status
                     item.status = wait_status
@@ -308,6 +320,11 @@ class ChallengeGroupRunner:
         max_workers = self._max_workers(session, group)
         capacity_waiters: set[str] = set()
         stop_requested = False
+        stop_reason = "manual_stop"
+        suspend_detector = SuspendGapDetector()
+
+        def run_should_stop() -> bool:
+            return stop_requested or bool(should_stop and should_stop())
 
         def run_item(item_id: str) -> tuple[str, str, str]:
             with Session(engine) as worker_session:
@@ -348,16 +365,26 @@ class ChallengeGroupRunner:
                         deadline_at=limits.deadline_at,
                     )
                     warning = None
+                    environment_disposition: str | None = None
+                    environment_detail: str | None = None
                     try:
                         health = self._competition_for(current).ensure_environment(worker_session, project_id=project.id)
                         if not health.available:
                             warning = health.reason or "environment_unavailable"
+                            environment_disposition = getattr(health, "disposition", None)
+                            environment_detail = getattr(health, "detail", None)
                     except Exception as exc:
                         warning = str(exc)[:1000]
                         self._release_managed_environment_after_failed_start(worker_session, item=current)
                     if warning and self._is_managed_platform_item(current):
+                        if environment_disposition == "task_terminal":
+                            self._finish_platform_task(worker_session, group=current_group, reason=warning, detail=environment_detail)
+                            return item_id, "TASK_TERMINAL", warning
+                        if environment_disposition == "item_terminal":
+                            self._finish_platform_item(worker_session, group=current_group, item=current, project=project, reason=warning, detail=environment_detail)
+                            return item_id, "ITEM_TERMINAL", warning
                         platform = competition_platform(current)
-                        waiting_for_capacity = self._is_capacity_exhausted(warning)
+                        waiting_for_capacity = environment_disposition == "wait_resource" or self._is_capacity_exhausted(warning)
                         wait_status = "WAITING_RESOURCE" if waiting_for_capacity else "WAITING_INPUT"
                         current.fused_status = wait_status
                         current.status = wait_status
@@ -375,11 +402,18 @@ class ChallengeGroupRunner:
                     self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
                     worker_session.commit()
                     attempts_before = self._attempt_count(worker_session, project.id)
-                    result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=limits, should_stop=should_stop)
+                    result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=limits, should_stop=run_should_stop)
+                    # A manual stop or detected host suspend invalidates the
+                    # in-flight phase. Leave it untouched for audit/restart;
+                    # advancing it would turn infrastructure downtime into a
+                    # solver failure.
+                    if run_should_stop():
+                        return item_id, "STOPPED", stop_reason
                     project = worker_session.get(Project, project.id)
                     outcome, reason = (("COMPLETED" if project and project.status == "COMPLETED" else "CANDIDATE_READY", result.reason) if project and project.status in {"COMPLETED", "FLAG_READY"} else (self._failure_outcome(result.status), result.reason))
                 current_group = worker_session.get(ChallengeGroup, group_id)
                 current = worker_session.get(ChallengeGroupItem, item_id)
+                worker_session.refresh(current)
                 if attempts_before is not None:
                     self._record_phase_attempts(worker_session, item=current, attempts_before=attempts_before)
                 self._resolve_phase(worker_session, group=current_group, item=current, project=project, outcome=outcome, reason=reason)
@@ -388,7 +422,25 @@ class ChallengeGroupRunner:
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"aurora-group-{group_id}") as pool:
             futures: dict[Future[tuple[str, str, str]], str] = {}
             while True:
-                stop_requested = stop_requested or bool(should_stop and should_stop())
+                if not stop_requested and should_stop and should_stop():
+                    stop_requested = True
+                    stop_reason = "manual_stop"
+                suspend_gap = suspend_detector.poll()
+                if not stop_requested and suspend_gap is not None:
+                    stop_requested = True
+                    stop_reason = "host_suspend_detected"
+                    for active_item_id in futures.values():
+                        active_item = session.get(ChallengeGroupItem, active_item_id)
+                        if active_item is not None:
+                            stop_project_containers(active_item.project_id)
+                    self._event(
+                        session,
+                        group_id,
+                        None,
+                        "group.invalidated",
+                        {"reason": stop_reason, "suspend_gap_seconds": round(suspend_gap, 3)},
+                    )
+                    session.commit()
                 session.expire_all()
                 group = session.get(ChallengeGroup, group_id)
                 if group is None:
@@ -400,7 +452,7 @@ class ChallengeGroupRunner:
                     group.current_item_id = None
                     group.updated_at = now_utc()
                     session.add(group)
-                    self._event(session, group_id, None, "group.stopped", {"reason": "manual_stop"})
+                    self._event(session, group_id, None, "group.stopped", {"reason": stop_reason})
                     session.commit()
                     return
 
@@ -452,7 +504,11 @@ class ChallengeGroupRunner:
                             futures[future] = item_id
 
                 if futures:
-                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    # Poll periodically so a host suspend/resume jump can
+                    # invalidate the run before stale leases advance phases.
+                    completed, _ = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                    if not completed:
+                        continue
                     released_or_finished = False
                     for future in completed:
                         item_id = futures.pop(future)
@@ -784,6 +840,97 @@ class ChallengeGroupRunner:
         detail = str(exc).strip() or type(exc).__name__
         return f"solver_runtime_exception: {type(exc).__name__}: {detail}"[:1000]
 
+    def _finish_platform_item(
+        self,
+        session: Session,
+        *,
+        group: ChallengeGroup,
+        item: ChallengeGroupItem,
+        project: Project | None,
+        reason: str,
+        detail: str | None = None,
+    ) -> None:
+        item.status = "FAILED"
+        item.fused_status = "FAILED"
+        item.stop_reason = reason
+        item.finished_at = now_utc()
+        item.updated_at = now_utc()
+        if project is not None and project.status != "COMPLETED":
+            project.status = "FAILED"
+            project.updated_at = now_utc()
+            session.add(project)
+        group.current_item_id = None
+        group.updated_at = now_utc()
+        session.add(item)
+        session.add(group)
+        self._event(
+            session,
+            group.id,
+            item.id,
+            "group.item.platform_terminal",
+            {"project_id": item.project_id, "reason": reason, "detail": detail},
+        )
+        session.commit()
+
+    def _finish_platform_task(self, session: Session, *, group: ChallengeGroup, reason: str, detail: str | None = None) -> None:
+        items = session.exec(
+            select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group.id)
+        ).all()
+        finished_at = now_utc()
+        affected = 0
+        for item in items:
+            if competition_platform(item) != "tsecbench" or item.fused_status in {"COMPLETED", "FAILED"}:
+                continue
+            affected += 1
+            stop_project_containers(item.project_id)
+            meta = dict(item.competition_meta or {})
+            meta["container_status"] = "stopped"
+            meta["container_addr"] = []
+            meta["task_terminal_reason"] = reason
+            meta["task_terminal_detail"] = detail
+            item.competition_meta = meta
+            item.status = "FAILED"
+            item.fused_status = "FAILED"
+            item.stop_reason = reason
+            item.finished_at = finished_at
+            item.updated_at = finished_at
+            project = session.get(Project, item.project_id)
+            if project is not None and project.status != "COMPLETED":
+                old_host = (urlparse(project.target_url).hostname or "").lower().rstrip(".") if project.target_url else ""
+                project.status = "FAILED"
+                project.target_url = None
+                project.target_verification_status = "UNVERIFIED"
+                project.target_verification_reason = "TSecBench task is terminal"
+                project.target_verified_at = None
+                project.updated_at = finished_at
+                session.add(project)
+                if old_host:
+                    scope = session.exec(
+                        select(AuthorizationScope).where(AuthorizationScope.project_id == project.id)
+                    ).first()
+                    if scope is not None:
+                        scope.allowed_hosts = [host for host in scope.allowed_hosts if host != old_host]
+                        session.add(scope)
+            session.add(item)
+            self._event(
+                session,
+                group.id,
+                item.id,
+                "group.item.platform_task_finished",
+                {"project_id": item.project_id, "reason": reason, "detail": detail},
+            )
+        group.current_item_id = None
+        group.updated_at = finished_at
+        session.add(group)
+        self._event(
+            session,
+            group.id,
+            None,
+            "group.platform_task_finished",
+            {"reason": reason, "detail": detail, "failed_items": affected},
+        )
+        session.commit()
+
     @staticmethod
     def _interrupt_project_execution(session: Session, *, project_id: str, reason: str) -> None:
         """Make a crashed Solver attempt safely resumable."""
@@ -1056,6 +1203,17 @@ class ChallengeGroupRunner:
         }
 
     def _resolve_phase(self, session: Session, *, group: ChallengeGroup, item: ChallengeGroupItem, project: Project | None, outcome: str, reason: str) -> None:
+        if item.fused_status == "FAILED" and (item.competition_meta or {}).get("task_terminal_reason"):
+            if project is not None and project.status != "COMPLETED":
+                project.status = "FAILED"
+                project.target_url = None
+                project.target_verification_status = "UNVERIFIED"
+                project.target_verification_reason = "TSecBench task is terminal"
+                project.target_verified_at = None
+                project.updated_at = now_utc()
+                session.add(project)
+                session.commit()
+            return
         executed_phase = item.phase
         terminal = outcome in {"COMPLETED", "CANDIDATE_READY", "NO_FLAG_COMPLETED"}
         if outcome == "PROJECT_TERMINAL_FAILED":

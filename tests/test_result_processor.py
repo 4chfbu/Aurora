@@ -103,7 +103,7 @@ def _attempt(session: Session, project: Project) -> tuple[Attempt, LLMTrace]:
     return attempt, trace
 
 
-def test_model_only_flag_is_rejected_without_completing_project(tmp_path) -> None:
+def test_model_only_flag_stays_unverified_without_completing_project(tmp_path) -> None:
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
@@ -122,7 +122,7 @@ def test_model_only_flag_is_rejected_without_completing_project(tmp_path) -> Non
         session.refresh(project)
         candidate = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project.id)).one()
         assert project.status == "ACTIVE"
-        assert candidate.status == "REJECTED"
+        assert candidate.status == "PROPOSED"
         assert session.exec(select(Finding).where(Finding.project_id == project.id)).all() == []
 
 
@@ -247,7 +247,7 @@ def test_startup_repair_downgrades_stale_local_verified_candidates() -> None:
                 FlagCandidate.value == "flag{still_valid}",
             )
         ).one()
-        assert stale.status == "REJECTED"
+        assert stale.status == "PROPOSED"
         assert stale.provenance_kind == "UNVERIFIED"
         assert stale.rejection_reason == "stale_validation_blacklist"
         assert valid.status == "LOCAL_VERIFIED"

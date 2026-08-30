@@ -1,4 +1,5 @@
 import hashlib
+import time
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from aurora.api import create_app
 from aurora.config import Settings, get_settings
 from aurora.models import Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, FlagCandidate, Intent, Project, Worker, now_utc
 from aurora.services.challenge_group_runner import ChallengeGroupRunner
-from aurora.services.competition_adapter import CompetitionSubmissionResult, TSecBenchCompetitionAdapter
+from aurora.services.competition_adapter import CompetitionSubmissionResult, EnvironmentHealth, TSecBenchCompetitionAdapter
 from aurora.services.harvester_runner import HarvesterResult
 from aurora.services.hands_free import HandsFreeService
 from aurora.services.tsecbench import TSecBenchChallenge, TSecBenchClient, TSecBenchError, TSecBenchNeedsSession, configure_tsecbench, public_tsecbench_config
@@ -706,6 +707,70 @@ def test_capacity_waiter_is_requeued_after_a_target_is_released(tmp_path: Path, 
         assert allocated_projects == {project.id for project in projects}
 
 
+def test_host_suspend_invalidates_concurrent_group_without_advancing_phase(tmp_path: Path, monkeypatch) -> None:
+    class Detector:
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return 120.0 if self.polls >= 2 else None
+
+    class Adapter:
+        def ensure_environment(self, session, *, project_id):
+            return SimpleNamespace(available=True, reason=None)
+
+        def close_environment(self, *, project_id, session=None):
+            return None
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    class BlockingHarvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            while not should_stop():
+                time.sleep(0.01)
+            return HarvesterResult(status="FAILED", reason="stopped")
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'suspend-invalidates.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.SuspendGapDetector", Detector)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.stop_project_containers", lambda project_id: None)
+
+    with Session(test_engine) as session:
+        group = ChallengeGroup(name="suspend-invalidates", max_concurrent=2)
+        project = Project(name="one", goal="solve")
+        session.add_all([group, project])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "one"},
+        )
+        session.add(item)
+        session.commit()
+
+        ChallengeGroupRunner(harvester=BlockingHarvester(), competition=Adapter()).run(
+            session,
+            group_id=group.id,
+        )
+
+        session.refresh(group)
+        session.refresh(item)
+        assert group.status == "STOPPED"
+        assert item.phase == 1
+        events = session.exec(
+            select(ChallengeGroupEvent).where(ChallengeGroupEvent.group_id == group.id)
+        ).all()
+        assert any(event.event_type == "group.invalidated" for event in events)
+        assert not any(event.event_type == "group.item.phase_finished" for event in events)
+
+
 def test_capacity_only_blocker_uses_waiting_resource(tmp_path: Path, monkeypatch) -> None:
     class Adapter:
         def ensure_environment(self, session, *, project_id):
@@ -773,6 +838,7 @@ def test_tsecbench_capacity_is_checked_before_start(tmp_path: Path) -> None:
         health = TSecBenchCompetitionAdapter(settings, Client()).ensure_environment(session, project_id=fourth.id)
         assert health.available is False
         assert health.reason == "tsecbench_capacity_exhausted"
+        assert health.disposition == "wait_resource"
 
 
 def test_tsecbench_platform_capacity_message_is_normalized(tmp_path: Path) -> None:
@@ -805,6 +871,212 @@ def test_tsecbench_platform_capacity_message_is_normalized(tmp_path: Path) -> No
 
         assert health.available is False
         assert health.reason == "tsecbench_capacity_exhausted"
+
+
+def test_start_invalid_state_is_capacity_when_task_list_is_available(tmp_path: Path) -> None:
+    class Client:
+        def start(self, code):
+            raise TSecBenchError("invalid state", status=409, code="invalid_state")
+
+        def list_challenges(self):
+            return []
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="waiting", goal="solve")
+        group = ChallengeGroup(name="group")
+        session.add_all([project, group])
+        session.commit()
+        session.add(ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "u-wait", "container_status": "stopped"},
+        ))
+        session.commit()
+
+        health = TSecBenchCompetitionAdapter(_settings(tmp_path), Client()).ensure_environment(
+            session,
+            project_id=project.id,
+        )
+
+        assert health.available is False
+        assert health.reason == "tsecbench_capacity_exhausted"
+        assert health.disposition == "wait_resource"
+
+
+def test_start_invalid_state_is_task_terminal_when_list_is_terminal(tmp_path: Path) -> None:
+    class Client:
+        def start(self, code):
+            raise TSecBenchError("invalid state", status=409, code="invalid_state")
+
+        def list_challenges(self):
+            raise TSecBenchError("task already finished", status=409, code="invalid_state")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="expired", goal="solve")
+        group = ChallengeGroup(name="group")
+        session.add_all([project, group])
+        session.commit()
+        session.add(ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "u-expired", "container_status": "stopped"},
+        ))
+        session.commit()
+
+        health = TSecBenchCompetitionAdapter(_settings(tmp_path), Client()).ensure_environment(
+            session,
+            project_id=project.id,
+        )
+
+        assert health.available is False
+        assert health.reason == "tsecbench_task_finished"
+        assert health.disposition == "task_terminal"
+
+
+def test_challenge_not_found_is_an_item_terminal_error(tmp_path: Path) -> None:
+    class Client:
+        def start(self, code):
+            raise TSecBenchError("challenge does not exist", status=404, code="challenge_not_found")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="missing", goal="solve")
+        group = ChallengeGroup(name="group")
+        session.add_all([project, group])
+        session.commit()
+        session.add(ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "u-missing", "container_status": "stopped"},
+        ))
+        session.commit()
+
+        health = TSecBenchCompetitionAdapter(_settings(tmp_path), Client()).ensure_environment(
+            session,
+            project_id=project.id,
+        )
+
+        assert health.reason == "tsecbench_challenge_not_found"
+        assert health.disposition == "item_terminal"
+
+
+def test_task_terminal_fails_all_unfinished_items_without_running_solver() -> None:
+    class Adapter:
+        def ensure_environment(self, session, *, project_id):
+            return EnvironmentHealth(False, "tsecbench_task_finished", "task_terminal", "task already finished")
+
+        def close_environment(self, *, project_id, session=None):
+            return None
+
+        def fetch_hint(self, session, *, project_id):
+            return None
+
+    class Harvester:
+        def run(self, session, *, project_id, task, limits, should_stop):
+            raise AssertionError("a terminal benchmark task must not dispatch a solver")
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="expired-task", max_concurrent=1)
+        completed = Project(name="done", goal="done", status="COMPLETED")
+        pending = Project(name="pending", goal="solve")
+        waiting = Project(name="waiting", goal="solve", status="WAITING_INPUT")
+        session.add_all([group, completed, pending, waiting])
+        session.commit()
+        session.add_all([
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=completed.id,
+                position=1,
+                status="COMPLETED",
+                fused_status="COMPLETED",
+                competition_meta={"platform": "tsecbench", "unique_code": "done"},
+            ),
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=pending.id,
+                position=2,
+                competition_meta={"platform": "tsecbench", "unique_code": "pending"},
+            ),
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=waiting.id,
+                position=3,
+                status="WAITING_INPUT",
+                fused_status="WAITING_INPUT",
+                competition_meta={"platform": "tsecbench", "unique_code": "waiting"},
+            ),
+        ])
+        session.commit()
+
+        ChallengeGroupRunner(harvester=Harvester(), competition=Adapter()).run(session, group_id=group.id)
+
+        session.refresh(group)
+        items = session.exec(
+            select(ChallengeGroupItem).where(ChallengeGroupItem.group_id == group.id).order_by(ChallengeGroupItem.position)
+        ).all()
+        assert group.status == "COMPLETED"
+        assert items[0].fused_status == "COMPLETED"
+        assert [item.fused_status for item in items[1:]] == ["FAILED", "FAILED"]
+        assert all(item.stop_reason == "tsecbench_task_finished" for item in items[1:])
+        events = session.exec(
+            select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == group.id,
+                ChallengeGroupEvent.event_type == "group.platform_task_finished",
+            )
+        ).all()
+        assert len(events) == 1
+        assert events[0].payload_json["failed_items"] == 2
+        assert events[0].payload_json["detail"] == "task already finished"
+
+
+def test_late_solver_result_cannot_reopen_a_task_terminal_item() -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="expired-task", status="RUNNING")
+        project = Project(name="late-result", goal="solve", status="FLAG_READY", target_url="http://stale.example:80", target_verification_status="VERIFIED")
+        session.add_all([group, project])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            status="FAILED",
+            fused_status="FAILED",
+            stop_reason="tsecbench_task_finished",
+            competition_meta={
+                "platform": "tsecbench",
+                "unique_code": "late-result",
+                "task_terminal_reason": "tsecbench_task_finished",
+            },
+        )
+        session.add(item)
+        session.commit()
+
+        ChallengeGroupRunner()._resolve_phase(
+            session,
+            group=group,
+            item=item,
+            project=project,
+            outcome="CANDIDATE_READY",
+            reason="late solver result",
+        )
+
+        session.refresh(item)
+        session.refresh(project)
+        assert item.fused_status == "FAILED"
+        assert project.status == "FAILED"
+        assert project.target_url is None
 
 
 def test_runner_materializes_runnable_intent_before_allocating_target() -> None:

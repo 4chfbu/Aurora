@@ -411,19 +411,34 @@ class CodexHarnessRuntime:
     def _prepare_attempt(self, session: Session, *, worker: Worker, attempt: Attempt | None, control_token: str, workspace: Path | None = None) -> str | None:
         if attempt is None:
             return None
-        parent = session.get(Attempt, attempt.parent_attempt_id) if attempt.parent_attempt_id else None
-        resume_thread_id = parent.codex_thread_id if parent and parent.codex_thread_id else None
+        requested_parent = session.get(Attempt, attempt.parent_attempt_id) if attempt.parent_attempt_id else None
+        candidates = [requested_parent] if requested_parent is not None and requested_parent.codex_thread_id else []
+        fallback_candidates = session.exec(
+            select(Attempt)
+            .where(
+                Attempt.project_id == attempt.project_id,
+                Attempt.id != attempt.id,
+                Attempt.codex_thread_id.is_not(None),
+                Attempt.resume_manifest_artifact_id.is_not(None),
+                Attempt.status.in_(["SUCCESS", "COMPLETED", "PARTIAL", "FAILED", "TIMEOUT"]),
+            )
+            .order_by(Attempt.started_at.desc())
+        ).all()
+        candidates.extend(candidate for candidate in fallback_candidates if all(candidate.id != current.id for current in candidates))
         attempt.codex_control_token_hash = hashlib.sha256(control_token.encode("utf-8")).hexdigest()
         attempt.last_event_at = now_utc()
-        if resume_thread_id:
+        parent: Attempt | None = None
+        resume_thread_id: str | None = None
+        for candidate in candidates:
+            valid = True
+            diagnostic: dict[str, Any] = {}
             if workspace is not None:
                 valid, diagnostic = self._restore_resume_manifest(
                     session,
-                    parent=parent,
+                    parent=candidate,
                     workspace=workspace,
                 )
                 if not valid:
-                    resume_thread_id = None
                     session.add(
                         WorkerEvent(
                             project_id=worker.project_id,
@@ -434,19 +449,38 @@ class CodexHarnessRuntime:
                             payload_json=diagnostic,
                         )
                     )
-            attempt.codex_thread_id = resume_thread_id
-            if resume_thread_id:
-                attempt.resume_count = parent.resume_count + 1
+                    continue
+            parent = candidate
+            resume_thread_id = candidate.codex_thread_id
+            break
+        attempt.codex_thread_id = resume_thread_id
+        if parent is not None and resume_thread_id:
+            if requested_parent is None or parent.id != requested_parent.id:
                 session.add(
                     WorkerEvent(
                         project_id=worker.project_id,
                         worker_id=worker.id,
                         intent_id=worker.intent_id,
                         attempt_id=attempt.id,
-                        event_type="codex.resume_scheduled",
-                        payload_json={"thread_id": resume_thread_id, "resume_count": attempt.resume_count, "parent_attempt_id": parent.id},
+                        event_type="codex.resume_fallback_selected",
+                        payload_json={
+                            "parent_attempt_id": parent.id,
+                            "requested_parent_attempt_id": requested_parent.id if requested_parent else None,
+                        },
                     )
                 )
+            attempt.parent_attempt_id = parent.id
+            attempt.resume_count = parent.resume_count + 1
+            session.add(
+                WorkerEvent(
+                    project_id=worker.project_id,
+                    worker_id=worker.id,
+                    intent_id=worker.intent_id,
+                    attempt_id=attempt.id,
+                    event_type="codex.resume_scheduled",
+                    payload_json={"thread_id": resume_thread_id, "resume_count": attempt.resume_count, "parent_attempt_id": parent.id},
+                )
+            )
         session.add(attempt)
         session.commit()
         return resume_thread_id
@@ -544,6 +578,7 @@ class CodexHarnessRuntime:
                 errors.append({"path": extra, "reason": "unexpected_codex_state_file"})
         if errors:
             shutil.rmtree(target_home, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
             return False, {
                 "reason": "resume_integrity_failed",
                 "parent_attempt_id": parent.id,
@@ -1362,7 +1397,11 @@ class CodexHarnessRuntime:
             return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
         except (json.JSONDecodeError, ValueError) as exc:
             diagnostic.setdefault("stderr_error", str(exc)[:300])
-        failure_kind = failure_kind or self._provider_failure_kind(stderr)
+        # Codex emits structured provider failures (including DeepSeek's
+        # reasoning_content contract error) on stdout when --json is enabled.
+        # Inspect both streams so the real provider failure is not flattened
+        # into the generic output_missing fallback.
+        failure_kind = failure_kind or self._provider_failure_kind(f"{stdout}\n{stderr}")
         failure_kind = failure_kind or ("command_timed_out" if exit_code == 124 else "resource_terminated" if exit_code == 137 else "output_missing" if not output_file.exists() else "output_invalid_json")
         return self._failure_output(failure_kind, stderr, artifact_id, snapshot), diagnostic
 

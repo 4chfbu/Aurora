@@ -4,8 +4,20 @@ import hashlib
 
 from sqlmodel import Session
 
-from aurora.models import WorkerEvent
+from aurora.models import FlagCandidate, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
+
+
+def is_authoritative_flag_rejection(candidate: FlagCandidate) -> bool:
+    """Return whether a rejection came from a platform or explicit human decision."""
+    if candidate.status != "REJECTED":
+        return False
+    reason = (candidate.rejection_reason or "").lower()
+    return bool(
+        candidate.submission_count > 0
+        or "competition platform rejected" in reason
+        or "manual validation rejected" in reason
+    )
 
 
 def record_flag_rejection(

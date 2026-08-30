@@ -397,6 +397,30 @@ def test_codex_harness_classifies_reasoning_content_provider_error(monkeypatch, 
     assert output["failed_attempts"][0]["reason"] == "provider_reasoning_error"
 
 
+def test_codex_harness_classifies_reasoning_content_provider_error_from_json_stdout(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    get_settings.cache_clear()
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    snapshot = SimpleNamespace(sections_json={"current_intent": {"objective": "inspect"}})
+    stdout = (
+        '{"type":"error","message":"The reasoning_content in the thinking mode '
+        'must be passed back to the API."}\n'
+        '{"type":"turn.failed"}\n'
+    )
+
+    output, _ = runtime._parse_or_synthesize(
+        output_file=tmp_path / "missing.json",
+        stdout=stdout,
+        stderr="",
+        exit_code=1,
+        failure_kind=None,
+        artifact_id="artifact_test",
+        snapshot=snapshot,
+    )
+
+    assert output["failed_attempts"][0]["reason"] == "provider_reasoning_error"
+
+
 def test_codex_harness_classifies_missing_model_metadata(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
     get_settings.cache_clear()
@@ -523,6 +547,8 @@ def test_codex_wrapper_streams_json_and_can_resume() -> None:
     assert "--json" in wrapper
     assert "codex exec resume" in wrapper
     assert "AURORA_CODEX_RESUME_THREAD_ID" in wrapper
+    assert 'AURORA_CODEX_MODEL_REASONING_EFFORT:-none' in wrapper
+    assert 'model_reasoning_effort=' in wrapper
 
 
 def test_cc_switch_entrypoint_is_restart_safe() -> None:
@@ -534,6 +560,15 @@ def test_cc_switch_entrypoint_is_restart_safe() -> None:
     assert "--api-format chat" in entrypoint
     assert "provider list" in entrypoint
     assert "provider switch" in entrypoint
+
+
+def test_codex_provider_preflight_exercises_a_tool_continuation() -> None:
+    preflight = Path("scripts/check-codex-provider.sh").read_text(encoding="utf-8")
+
+    assert "provider-multiturn-ok" in preflight
+    assert 'model_reasoning_effort="none"' in preflight
+    assert '"type":"turn.completed"' in preflight
+    assert "reasoning_content.*must be passed back" in preflight
 
 
 def test_codex_attempt_inherits_thread_and_records_progress(monkeypatch, tmp_path) -> None:
@@ -599,6 +634,73 @@ def test_codex_resume_without_manifest_starts_new_thread(tmp_path) -> None:
     assert thread_id is None
     assert [event.event_type for event in events] == ["codex.resume_rejected"]
     assert events[0].payload_json["reason"] == "resume_manifest_missing"
+
+
+def test_codex_resume_falls_back_after_invalid_parent_manifest(tmp_path) -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    runtime.settings.codex_workspace_dir = tmp_path
+
+    with Session(engine) as session:
+        valid_worker = Worker(id="worker_valid_fallback", project_id="proj_resume_fallback", intent_id="intent_valid", status="COMPLETED")
+        valid_parent = Attempt(
+            id="attempt_valid_fallback",
+            project_id=valid_worker.project_id,
+            intent_id=valid_worker.intent_id,
+            worker_id=valid_worker.id,
+            status="PARTIAL",
+            codex_thread_id="thread_valid_fallback",
+            resume_count=2,
+        )
+        invalid_parent = Attempt(
+            id="attempt_invalid_parent",
+            project_id=valid_worker.project_id,
+            intent_id="intent_invalid",
+            worker_id="worker_invalid",
+            status="FAILED",
+            codex_thread_id="thread_invalid",
+        )
+        worker = Worker(id="worker_fallback_child", project_id=valid_worker.project_id, intent_id="intent_child", status="RUNNING")
+        attempt = Attempt(
+            id="attempt_fallback_child",
+            project_id=worker.project_id,
+            intent_id=worker.intent_id,
+            worker_id=worker.id,
+            parent_attempt_id=invalid_parent.id,
+        )
+        session.add_all([valid_worker, valid_parent, invalid_parent, worker, attempt])
+        session.commit()
+
+        valid_workspace = tmp_path / valid_parent.project_id / valid_worker.id
+        valid_workspace.joinpath("inputs").mkdir(parents=True)
+        valid_workspace.joinpath("inputs", "manifest.json").write_text("[]", encoding="utf-8")
+        valid_workspace.joinpath("work").mkdir()
+        valid_workspace.joinpath("runtime", "codex-home").mkdir(parents=True)
+        valid_workspace.joinpath("runtime", "codex-home", "session.jsonl").write_text("persisted", encoding="utf-8")
+        runtime._persist_resume_manifest(session, attempt=valid_parent, workspace=valid_workspace)
+
+        child_workspace = tmp_path / worker.project_id / worker.id
+        thread_id = runtime._prepare_attempt(
+            session,
+            worker=worker,
+            attempt=attempt,
+            control_token="secret",
+            workspace=child_workspace,
+        )
+        events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
+        selected_parent_attempt_id = attempt.parent_attempt_id
+        valid_parent_id = valid_parent.id
+        resume_count = attempt.resume_count
+
+    assert thread_id == "thread_valid_fallback"
+    assert selected_parent_attempt_id == valid_parent_id
+    assert resume_count == 3
+    assert [event.event_type for event in events] == [
+        "codex.resume_rejected",
+        "codex.resume_fallback_selected",
+        "codex.resume_scheduled",
+    ]
 
 
 def test_codex_action_budget_enters_finalizing_state() -> None:

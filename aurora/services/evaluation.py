@@ -23,6 +23,7 @@ from aurora.models import (
     now_utc,
 )
 from aurora.services.demo import create_project_with_bootstrap
+from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.tsecbench import TSecBenchClient
 from aurora.services.tool_profiles import manifest_sha256
 
@@ -251,7 +252,7 @@ class EvaluationService:
                 "shell_actions": sum(trace.tool_name == "codex.shell" for trace in traces),
                 "repeated_requests": self._repeated_requests(traces),
                 "flag_verify_calls": sum(trace.tool_name == "flag.verify" for trace in traces),
-                "wrong_candidates": sum(candidate.status == "REJECTED" for candidate in candidates),
+                "wrong_candidates": sum(is_authoritative_flag_rejection(candidate) for candidate in candidates),
                 "wrong_submissions": int(submission_status in {"REJECTED", "MANUALLY_REJECTED"}),
                 "derived_candidates": sum(
                     candidate.provenance_kind.upper() in {"DERIVED_REPLAY", "VERIFIED_REPLAY"}

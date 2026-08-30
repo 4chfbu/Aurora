@@ -18,6 +18,8 @@ from aurora.services.tsecbench import TSecBenchClient, TSecBenchError, TSecBench
 class EnvironmentHealth:
     available: bool
     reason: str | None = None
+    disposition: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -232,11 +234,51 @@ class TSecBenchCompetitionAdapter:
         )
 
     @staticmethod
+    def _task_finished(exc: TSecBenchError) -> bool:
+        detail = " ".join(
+            str(value or "")
+            for value in (exc.code, exc.status, exc, exc.detail)
+        ).strip().lower()
+        return any(
+            marker in detail
+            for marker in (
+                "already finished",
+                "task finished",
+                "task has finished",
+                "task ended",
+                "task has ended",
+                "task expired",
+                "task has expired",
+                "task manually stopped",
+            )
+        )
+
+    def _classify_start_error(self, exc: TSecBenchError) -> EnvironmentHealth:
+        detail = str(exc).strip() or str(exc.code or "TSecBench environment start failed")
+        if self._task_finished(exc):
+            return EnvironmentHealth(False, "tsecbench_task_finished", "task_terminal", detail)
+        if exc.code == "challenge_not_found":
+            return EnvironmentHealth(False, "tsecbench_challenge_not_found", "item_terminal", detail)
+        if self._capacity_exhausted(exc):
+            return EnvironmentHealth(False, "tsecbench_capacity_exhausted", "wait_resource", detail)
+        if exc.code == "invalid_state":
+            try:
+                self.client.list_challenges()
+            except TSecBenchNeedsSession as confirm_exc:
+                return EnvironmentHealth(False, "tsecbench_session_required", "wait_input", str(confirm_exc))
+            except TSecBenchError as confirm_exc:
+                if confirm_exc.code == "invalid_state" or self._task_finished(confirm_exc):
+                    return EnvironmentHealth(False, "tsecbench_task_finished", "task_terminal", str(confirm_exc))
+                return EnvironmentHealth(False, "tsecbench_control_plane_unavailable", "wait_resource", str(confirm_exc))
+            return EnvironmentHealth(False, "tsecbench_capacity_exhausted", "wait_resource", detail)
+        return EnvironmentHealth(False, "tsecbench_control_plane_unavailable", "wait_resource", detail)
+
+    @staticmethod
     def _already_released(exc: Exception) -> bool:
         """Return whether a close failure confirms that no live task remains."""
         code = str(getattr(exc, "code", "") or "").strip().lower()
         message = str(exc).strip().lower()
-        return code in {"task_not_found", "challenge_not_found"} or any(
+        return code in {"task_not_found", "challenge_not_found", "invalid_state"} or any(
             marker in message
             for marker in (
                 "already finished",
@@ -300,15 +342,13 @@ class TSecBenchCompetitionAdapter:
                     and str((current.competition_meta or {}).get("platform") or "").lower() == "tsecbench"
                 }
                 if project_id not in active_projects and len(active_projects) >= max(1, int(self.settings.tsecbench_max_concurrent or 1)):
-                    return EnvironmentHealth(False, "tsecbench_capacity_exhausted")
+                    return EnvironmentHealth(False, "tsecbench_capacity_exhausted", "wait_resource")
                 try:
                     started = self.client.start(code)
                 except TSecBenchNeedsSession as exc:
-                    return EnvironmentHealth(False, str(exc))
+                    return EnvironmentHealth(False, "tsecbench_session_required", "wait_input", str(exc))
                 except TSecBenchError as exc:
-                    if self._capacity_exhausted(exc):
-                        return EnvironmentHealth(False, "tsecbench_capacity_exhausted")
-                    return EnvironmentHealth(False, str(exc))
+                    return self._classify_start_error(exc)
             started_scheme = self._default_scheme(project, started)
             started_addresses = self._addresses(started, default_scheme=started_scheme)
             addresses = started_addresses or addresses

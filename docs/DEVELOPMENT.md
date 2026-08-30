@@ -253,9 +253,9 @@ uv run --extra dev pytest -q tests/test_flag_verification.py
 
 - TSecBench 的 `BENCHMARK_TOKEN` 对应一个平台跑分任务，`unique_code` 才是单题标识。
 - 平台任务有总时限；任务到期后，剩余题目的 `POST /openapi/v1/challenges/start` 会返回任务级终态错误，
-  Aurora 目前只把该错误记录为 `WAITING_INPUT`，导致剩余 item 永久等待。
-- 修复方向：将 `invalid_state` / `already finished` 识别为不可恢复终态，把剩余 item 标记为 `FAILED`
-  或组级终态，而不是 `WAITING_INPUT`。
+  Aurora 会将剩余 item 收敛为 `FAILED`，清除失效目标并停止继续派发。
+- `start` 的 `invalid_state` 也可能表示三个实例额度已满，因此适配器会再调用题目列表确认：列表正常时进入
+  `WAITING_RESOURCE`，列表同样返回任务终态时才结束整个任务。
 - 这不是单题 `close` 后无法 `start` 的问题；Challenges API 允许 `start/submit/close` 对单题重复执行。
 
 ### 15.2 phase 环境释放过早

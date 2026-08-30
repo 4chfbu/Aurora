@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from aurora.models import Attempt, AttemptCheckpoint, FlagCandidate, Intent, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import route_fingerprint
+from aurora.services.flag_rejection import is_authoritative_flag_rejection
 
 
 TERMINAL_ATTEMPT_STATUSES = {"SUCCESS", "PARTIAL", "FAILED", "TIMEOUT"}
@@ -70,7 +71,7 @@ class ReliabilityService:
             if candidate.provenance_kind.upper() in {"DERIVED_REPLAY", "VERIFIED_REPLAY"}
         ]
         verified_derived = [candidate for candidate in derived_candidates if candidate.verification_artifact_ref]
-        rejected_candidates = [candidate for candidate in candidates if candidate.status == "REJECTED"]
+        rejected_candidates = [candidate for candidate in candidates if is_authoritative_flag_rejection(candidate)]
         verify_calls = [trace for trace in tool_traces if trace.tool_name == "flag.verify"]
         dropped_non_privileged = sum(event.event_type == "tool.skipped.non_privileged" for event in events)
         mcp_server_events = [event for event in events if event.event_type == "mcp.server.observed"]

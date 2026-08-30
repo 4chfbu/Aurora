@@ -862,6 +862,8 @@ def create_app() -> FastAPI:
         group = session.get(ChallengeGroup, group_id)
         if group is None:
             raise HTTPException(status_code=404, detail="challenge group not found")
+        if bool((group.limits or {}).get("invalidated")):
+            raise HTTPException(status_code=409, detail="challenge group is invalidated and cannot be restarted")
         if group.status == "COMPLETED":
             raise HTTPException(status_code=409, detail="challenge group is completed")
         if group.status == "AWAITING_MANUAL_VALIDATION":

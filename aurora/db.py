@@ -169,29 +169,41 @@ def _backfill_legacy_flag_candidates() -> None:
 
 
 def _invalidate_stale_flag_candidates() -> None:
-    """Repair LOCAL_VERIFIED rows that predate a flag-validator rule change.
+    """Repair stale validation state without fabricating platform rejections.
 
     Blacklist and readability rules evolve as false-positive prefixes are
     observed in real worker logs.  Old rows were already written as
     ``LOCAL_VERIFIED``, so they would otherwise keep appearing in submission
-    context and candidate lists.  Revalidate them at startup and downgrade
-    stale rows to ``REJECTED`` with an explicit repair reason.
+    context and candidate lists. Revalidate them at startup and downgrade
+    stale rows to ``PROPOSED``. Also rehabilitate legacy local rejections;
+    only platform and explicit manual decisions remain durable rejections.
     """
     from aurora.models import FlagCandidate, now_utc
     from aurora.services.flag_validator import FlagValidator
     from aurora.services.flag_prefix_config import flag_prefixes_for_project
+    from aurora.services.flag_rejection import is_authoritative_flag_rejection
 
     validator = FlagValidator()
     with Session(engine) as session:
-        candidates = session.exec(select(FlagCandidate).where(FlagCandidate.status == "LOCAL_VERIFIED")).all()
+        candidates = session.exec(
+            select(FlagCandidate).where(FlagCandidate.status.in_(["LOCAL_VERIFIED", "REJECTED"]))
+        ).all()
         changed = False
         allowed_by_project: dict[str, tuple[str, ...]] = {}
         for candidate in candidates:
+            if candidate.status == "REJECTED":
+                if is_authoritative_flag_rejection(candidate):
+                    continue
+                candidate.status = "PROPOSED"
+                candidate.updated_at = now_utc()
+                session.add(candidate)
+                changed = True
+                continue
             if candidate.project_id not in allowed_by_project:
                 allowed_by_project[candidate.project_id] = flag_prefixes_for_project(session, candidate.project_id)
             if validator.is_valid_flag_value(candidate.value, allowed_by_project[candidate.project_id]):
                 continue
-            candidate.status = "REJECTED"
+            candidate.status = "PROPOSED"
             candidate.provenance_kind = "UNVERIFIED"
             candidate.rejection_reason = "stale_validation_blacklist"
             candidate.updated_at = now_utc()

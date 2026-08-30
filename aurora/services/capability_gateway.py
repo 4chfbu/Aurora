@@ -24,6 +24,7 @@ from aurora.services.browser_interaction import BrowserInteractionService
 from aurora.config import get_settings
 from aurora.services.flag_validator import FlagValidator
 from aurora.services.flag_prefix_config import flag_prefixes_for_project
+from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.competition_adapter import CompetitionAdapter
 
@@ -304,14 +305,13 @@ class CapabilityGateway:
             if runs[1]["stdout"] != value:
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification replay produced inconsistent results", runs=runs)
             value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
-            rejected = session.exec(
+            existing_candidate = session.exec(
                 select(FlagCandidate).where(
                     FlagCandidate.project_id == project_id,
                     FlagCandidate.value_hash == value_hash,
-                    FlagCandidate.status == "REJECTED",
                 )
             ).first()
-            if rejected is not None:
+            if existing_candidate is not None and is_authoritative_flag_rejection(existing_candidate):
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification produced a previously rejected candidate", runs=runs)
             request_text = json.dumps(request, ensure_ascii=False, sort_keys=True)
             script_text = script_bytes.decode("utf-8", errors="replace")
