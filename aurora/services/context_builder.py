@@ -7,7 +7,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, FlagCandidate, Intent, Project, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
+from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, FlagCandidate, Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.tool_contract import tools_for_runtime
@@ -94,6 +94,19 @@ class ContextBuilder:
         scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project_id)).first()
         policy = session.exec(select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)).first()
         worker = session.get(Worker, worker_id) if worker_id else None
+        coordination = session.exec(
+            select(ProjectCoordinationState).where(ProjectCoordinationState.project_id == project_id)
+        ).first()
+        open_intents = session.exec(
+            select(Intent)
+            .where(Intent.project_id == project_id, Intent.status.in_(["PENDING", "RUNNING", "CONCLUDING"]))
+            .order_by(Intent.priority.desc(), Intent.created_at)
+        ).all()
+        active_workers = session.exec(
+            select(Worker)
+            .where(Worker.project_id == project_id, Worker.status.in_(["STARTING", "RUNNING", "CONCLUDING"]))
+            .order_by(Worker.created_at)
+        ).all()
         allow_subagents = bool(
             settings.subagents_enabled
             and settings.worker_runtime.strip().lower() in {"codex", "codex_harness", "harness"}
@@ -217,6 +230,28 @@ class ContextBuilder:
                 # scheduler. Expose them so the solver can honor the soft
                 # finalization deadline even when the Intent omitted limits.
                 "budget": {**(intent.budget or {}), **(worker.budgets if worker else {})},
+            },
+            "exploration_graph": {
+                "multi_agent_enabled": bool(policy and policy.multi_agent_exploration_enabled),
+                "graph_version": coordination.graph_version if coordination else 0,
+                "last_reasoned_version": coordination.last_reasoned_version if coordination else 0,
+                "open_intents": [
+                    {
+                        "id": item.id,
+                        "objective": item.objective,
+                        "status": item.status,
+                        "priority": item.priority,
+                        "parent_intent_id": item.parent_intent_id,
+                        "dependency_fact_ids": item.dependency_fact_ids,
+                        "claimed_by": item.lease_owner,
+                    }
+                    for item in open_intents
+                ],
+                "active_workers": [
+                    {"id": item.id, "intent_id": item.intent_id, "status": item.status}
+                    for item in active_workers
+                ],
+                "coordination": "Peers coordinate only through committed facts, artifacts, checkpoints, and intents.",
             },
             "authorization_scope": scope.model_dump(mode="json") if scope else None,
             "facts": [

@@ -8,11 +8,12 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
-from aurora.services.demo import run_one_demo_step
+from aurora.services.multi_agent import run_project_exploration_step
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.manager import ManagerDecision, ManagerService
 from aurora.services.observer import ObserverService
 from aurora.services.project_run_control import project_run_control
+from aurora.services.project_reasoner import ProjectReasoner
 
 
 @dataclass
@@ -125,6 +126,7 @@ class AutoRunnerService:
                 events.append(payload)
                 return AutoRunResult("blocked", "observer_escalate", iteration - 1, project_id, events)
 
+            reason_decision = ProjectReasoner().run(session, project_id=project_id)
             manager_decision = None
             if not self._has_pending_intent(session, project_id):
                 manager_decision = ManagerService().run_project(session, project_id=project_id)
@@ -152,7 +154,7 @@ class AutoRunnerService:
 
             before = self._counts(session, project_id)
             self._event(session, project_id, "autorun.iteration.started", {"iteration": iteration})
-            run_result = run_one_demo_step(session, project_id=project_id, run_id=run_id)
+            run_result = run_project_exploration_step(session, project_id=project_id, run_id=run_id)
             after = self._counts(session, project_id)
             progress = self._progress(before, after)
             if progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"]:
@@ -164,6 +166,7 @@ class AutoRunnerService:
                 "iteration": iteration,
                 "observer": {"decision": "DEFERRED", "reason": "The Solver owns route selection inside this turn."},
                 "manager": manager_decision.__dict__ if manager_decision is not None else {"status": "SKIPPED", "reason": "A runnable Solver intent already exists.", "proposed_intents": []},
+                "reason": reason_decision,
                 "run_result": run_result,
                 "progress": progress,
                 "no_progress_count": no_progress_count,
@@ -206,8 +209,9 @@ class AutoRunnerService:
             self._event(session, project_id, "autorun.blocked", payload)
             return payload
         manager_decision = ManagerService().run_project(session, project_id=project_id)
-        run_result = run_one_demo_step(session, project_id=project_id, run_id=run_id)
-        payload = {"status": "stepped", "observer": observer_decision.__dict__, "manager": manager_decision.__dict__, "run_result": run_result}
+        reason_decision = ProjectReasoner().run(session, project_id=project_id)
+        run_result = run_project_exploration_step(session, project_id=project_id, run_id=run_id)
+        payload = {"status": "stepped", "observer": observer_decision.__dict__, "manager": manager_decision.__dict__, "reason": reason_decision, "run_result": run_result}
         self._event(session, project_id, "autorun.iteration.completed", payload)
         return payload
 

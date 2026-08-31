@@ -6,7 +6,7 @@ import threading
 from sqlmodel import Session, select
 
 from aurora.db import engine
-from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
+from aurora.models import Attempt, AuthorizationScope, Hint, Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, ToolTrace, WorkerEvent, now_utc
 from aurora.config import get_settings
 from aurora.services.blackboard_repository import BlackboardRepository, route_fingerprint
 from aurora.services.browser_sessions import browser_session_registry
@@ -79,6 +79,20 @@ def _select_parent_attempt(session: Session, *, project_id: str, intent: Intent)
         Attempt.resume_manifest_artifact_id.is_not(None),
         Attempt.status.in_(terminal_statuses),
     )
+    retry = session.exec(
+        select(Attempt)
+        .where(*resumable, Attempt.intent_id == intent.id)
+        .order_by(Attempt.started_at.desc())
+    ).first()
+    if retry is not None:
+        return retry
+    policy = session.exec(
+        select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)
+    ).first()
+    if policy is not None and policy.multi_agent_exploration_enabled:
+        # Peer branches share facts and artifacts, never another branch's
+        # conversational state or worker-local filesystem assumptions.
+        return None
     if intent.parent_intent_id:
         parent = session.exec(
             select(Attempt)
@@ -142,6 +156,8 @@ def create_project_with_bootstrap(
     allowed_hosts: list[str] | None = None,
     hint: str | None = None,
     subagents_enabled: bool = False,
+    multi_agent_exploration_enabled: bool = False,
+    max_parallel_explorers: int | None = None,
 ) -> Project:
     project = Project(name=name, goal=goal, challenge_type=challenge_type)
     session.add(project)
@@ -157,13 +173,28 @@ def create_project_with_bootstrap(
             subagents_enabled=bool(subagents_enabled and settings.subagents_enabled),
             max_subagents_per_worker=settings.subagents_max_per_worker,
             max_subagents_concurrent=settings.subagents_max_concurrent,
+            multi_agent_exploration_enabled=bool(
+                multi_agent_exploration_enabled and settings.multi_agent_exploration_enabled
+            ),
+            max_parallel_explorers=min(
+                max_parallel_explorers or settings.multi_agent_max_project_workers,
+                settings.multi_agent_max_global_workers,
+            ),
+            max_reason_intents=settings.multi_agent_max_reason_intents,
+            max_pending_intents=settings.multi_agent_max_pending_intents,
         )
     )
+    session.add(ProjectCoordinationState(project_id=project.id))
     session.commit()
     project.authorization_scope_id = scope.id
     session.add(project)
     if hint:
         session.add(Hint(project_id=project.id, content=hint))
+        coordination = session.exec(
+            select(ProjectCoordinationState).where(ProjectCoordinationState.project_id == project.id)
+        ).one()
+        coordination.graph_version += 1
+        session.add(coordination)
     BlackboardRepository().upsert_intent(
         session,
         project_id=project.id,
@@ -228,6 +259,15 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     intent, worker = claimed
     worker.budgets = _execution_budget(intent)
     worker.agent_profile_id = f"{worker.budgets['model_role']}.general"
+    runtime_policy = session.exec(
+        select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)
+    ).first()
+    if (
+        runtime_policy is not None
+        and runtime_policy.multi_agent_exploration_enabled
+        and not intent.objective.startswith("Bootstrap the project")
+    ):
+        worker.execution_kind = "explorer"
     session.add(worker)
     session.add(
         WorkerEvent(
@@ -235,7 +275,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
             worker_id=worker.id,
             intent_id=intent.id,
             event_type="worker.started",
-            payload_json={"image": preflight["image"], "profile": preflight["profile"], "runtime": get_settings().worker_runtime},
+            payload_json={"image": preflight["image"], "profile": preflight["profile"], "runtime": get_settings().worker_runtime, "execution_kind": worker.execution_kind},
         )
     )
     session.commit()
@@ -589,6 +629,10 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
         # Intent. A second model pass here used to rewrite that plan between
         # turns and made the outer loop part of the solving process.
         skip_planner=True,
+        # Cairn-style peer Explorers report facts only. The fenced Reason pass
+        # owns graph expansion, preventing every branch from recursively
+        # multiplying its own suggestions.
+        author_intents=worker.execution_kind != "explorer",
     )
     estimated_tokens = runtime_output.llm_trace.estimated_input_tokens + runtime_output.llm_trace.estimated_output_tokens
     token_budget = worker.budgets.get("token_budget")

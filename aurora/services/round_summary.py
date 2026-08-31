@@ -9,7 +9,7 @@ from aurora.config import get_settings
 from aurora.services.llm_http import LLMRequestError, chat_completion
 from pydantic import ValidationError
 
-from aurora.models import Attempt, AttemptCheckpoint, Fact, Intent, Project, WorkerEvent
+from aurora.models import Attempt, AttemptCheckpoint, Fact, Intent, Project, ProjectRuntimePolicy, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.intent_dsl import IntentDSL
 from aurora.services.mcp_registry import visible_mcp_tools
@@ -18,7 +18,16 @@ from aurora.services.mcp_registry import visible_mcp_tools
 class RoundReflectionService:
     """Reflect on a primary solver round and author its follow-up intents."""
 
-    def create(self, session: Session, *, attempt: Attempt, output: dict[str, Any], budget: dict[str, Any], skip_planner: bool = False) -> AttemptCheckpoint:
+    def create(
+        self,
+        session: Session,
+        *,
+        attempt: Attempt,
+        output: dict[str, Any],
+        budget: dict[str, Any],
+        skip_planner: bool = False,
+        author_intents: bool = True,
+    ) -> AttemptCheckpoint:
         existing = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.attempt_id == attempt.id)).first()
         if existing is not None:
             return existing
@@ -33,11 +42,11 @@ class RoundReflectionService:
         data = planned or fallback
         # Timeout recovery is operational control data. Preserve it when the
         # reflection model returns prose without a runnable continuation.
-        if not data.get("intents") and fallback.get("intents"):
+        if author_intents and not data.get("intents") and fallback.get("intents"):
             data["intents"] = fallback["intents"]
         if not data.get("next_steps") and fallback.get("next_steps"):
             data["next_steps"] = fallback["next_steps"]
-        if not data.get("intents") and data.get("next_steps") and attempt.status in {"PARTIAL", "FAILED", "TIMEOUT"}:
+        if author_intents and not data.get("intents") and data.get("next_steps") and attempt.status in {"PARTIAL", "FAILED", "TIMEOUT"}:
             current_intent = session.get(Intent, attempt.intent_id)
             next_step = str(data["next_steps"][0]).strip()
             if next_step:
@@ -52,10 +61,10 @@ class RoundReflectionService:
                     "risk_level": "low",
                     "budget": {"model_role": "reviewer" if next_phase == 4 else "solver", "phase": next_phase},
                 }]
-        generated_intent_ids = self._create_intents(
-            session,
-            attempt=attempt,
-            candidates=data.get("intents", []),
+        generated_intent_ids = (
+            self._create_intents(session, attempt=attempt, candidates=data.get("intents", []))
+            if author_intents
+            else []
         )
         checkpoint = AttemptCheckpoint(
             project_id=attempt.project_id,
@@ -239,7 +248,22 @@ class RoundReflectionService:
         fact_ids = set(session.exec(select(Fact.id).where(Fact.project_id == attempt.project_id, Fact.status == "ACTIVE")).all())
         repository = BlackboardRepository()
         generated: list[str] = []
-        for candidate in candidates[:3]:
+        policy = session.exec(
+            select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == attempt.project_id)
+        ).first()
+        multi_agent_enabled = bool(policy and policy.multi_agent_exploration_enabled)
+        max_reason_intents = policy.max_reason_intents if multi_agent_enabled else 3
+        if multi_agent_enabled:
+            active_count = len(session.exec(
+                select(Intent).where(
+                    Intent.project_id == attempt.project_id,
+                    Intent.status.in_(["PENDING", "RUNNING", "CONCLUDING"]),
+                )
+            ).all())
+            available = max(0, policy.max_pending_intents - active_count)
+        else:
+            available = 3
+        for candidate in candidates[:min(max_reason_intents, available)]:
             if not isinstance(candidate, dict):
                 continue
             raw_budget = candidate.get("budget") if isinstance(candidate.get("budget"), dict) else {}

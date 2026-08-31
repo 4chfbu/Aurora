@@ -6,7 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from aurora.config import get_settings
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 settings = get_settings()
@@ -36,6 +36,7 @@ def init_db() -> None:
     if settings.database_url.startswith("sqlite"):
         _add_sqlite_columns()
     _record_schema_version()
+    _backfill_coordination_states()
     _backfill_legacy_flag_candidates()
     _invalidate_stale_flag_candidates()
     _invalidate_legacy_false_targets()
@@ -68,6 +69,12 @@ def _add_sqlite_columns() -> None:
             "lease_generation": "INTEGER DEFAULT 0",
         },
         "intent": {"lease_generation": "INTEGER DEFAULT 0"},
+        "projectruntimepolicy": {
+            "multi_agent_exploration_enabled": "BOOLEAN DEFAULT 0",
+            "max_parallel_explorers": "INTEGER DEFAULT 2",
+            "max_reason_intents": "INTEGER DEFAULT 3",
+            "max_pending_intents": "INTEGER DEFAULT 8",
+        },
         "importbatch": {
             "auth_method": "TEXT",
             "login_domain": "TEXT",
@@ -128,6 +135,17 @@ def _record_schema_version() -> None:
             version.version = SCHEMA_VERSION
             version.updated_at = now_utc()
         session.add(version)
+        session.commit()
+
+
+def _backfill_coordination_states() -> None:
+    from aurora.models import Project, ProjectCoordinationState
+
+    with Session(engine) as session:
+        existing = set(session.exec(select(ProjectCoordinationState.project_id)).all())
+        for project_id in session.exec(select(Project.id)).all():
+            if project_id not in existing:
+                session.add(ProjectCoordinationState(project_id=project_id))
         session.commit()
 
 

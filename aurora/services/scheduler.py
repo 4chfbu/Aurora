@@ -15,31 +15,42 @@ class Scheduler:
         project = session.get(Project, project_id)
         if project is None or project.status in {"COMPLETED", "CANCELLED", "FAILED", "FLAG_READY", "AWAITING_MANUAL_VALIDATION"}:
             return None
-        intent = session.exec(
-            select(Intent)
-            .where(Intent.project_id == project_id, Intent.status == "PENDING")
-            .order_by(Intent.priority.desc(), Intent.created_at)
-        ).first()
-        if intent is None:
-            return None
-
-        worker_id = new_id("worker")
-        lease_generation = intent.lease_generation + 1
-        lease_expires_at = now_utc() + timedelta(seconds=lease_seconds)
-        claimed = session.exec(
-            update(Intent)
-            .where(Intent.id == intent.id, Intent.status == "PENDING")
-            .values(
-                status="RUNNING",
-                lease_owner=worker_id,
-                lease_expires_at=lease_expires_at,
-                lease_generation=lease_generation,
-                updated_at=now_utc(),
+        # Concurrent project explorers may observe the same highest-priority
+        # row. The loser retries after the compare-and-swap instead of leaving
+        # an otherwise available project slot idle.
+        intent = None
+        worker_id = ""
+        lease_generation = 0
+        lease_expires_at = now_utc()
+        for _ in range(8):
+            intent = session.exec(
+                select(Intent)
+                .where(Intent.project_id == project_id, Intent.status == "PENDING")
+                .order_by(Intent.priority.desc(), Intent.created_at)
+            ).first()
+            if intent is None:
+                return None
+            worker_id = new_id("worker")
+            lease_generation = intent.lease_generation + 1
+            lease_expires_at = now_utc() + timedelta(seconds=lease_seconds)
+            claimed = session.exec(
+                update(Intent)
+                .where(Intent.id == intent.id, Intent.status == "PENDING")
+                .values(
+                    status="RUNNING",
+                    lease_owner=worker_id,
+                    lease_expires_at=lease_expires_at,
+                    lease_generation=lease_generation,
+                    updated_at=now_utc(),
+                )
             )
-        )
-        if claimed.rowcount != 1:
+            if claimed.rowcount == 1:
+                break
             session.rollback()
+            session.expire_all()
+        else:
             return None
+        assert intent is not None
         worker = Worker(
             id=worker_id,
             project_id=project_id,

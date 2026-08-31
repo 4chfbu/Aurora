@@ -163,6 +163,24 @@ An enabled Solver may start a non-recursive child through the local `subagent.sp
 
 The bundled `codex-via-cc-switch.sh` wrapper makes children reuse the private CC Switch proxy. With another wrapper, set `AURORA_SUBAGENT_CODEX_COMMAND` to an equivalent command template containing `{prompt_filename}`, `{schema_filename}`, and `{last_message_filename}`.
 
+## Multi-Agent Exploration
+
+Aurora also supports Cairn-style peer exploration. Unlike `subagent.spawn`, peer Explorers are independent project-level Workers: each atomically claims a different Intent, runs in an isolated Worker container/workspace, and coordinates only through the project Fact/Intent/Artifact blackboard. A single fenced Reason pass reacts to each new graph version and may add bounded, non-overlapping Intents.
+
+Enable the global guard, then opt in when creating a project:
+
+```bash
+AURORA_MULTI_AGENT_EXPLORATION_ENABLED=true
+AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS=4
+AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS=2
+```
+
+```json
+{"name":"parallel","goal":"...","multi_agent_exploration_enabled":true,"max_parallel_explorers":2}
+```
+
+The feature is off by default. Existing serial projects and same-container subagents retain their current behavior.
+
 ## Prompt Assets and Intent DSL
 
 Prompt templates live in `aurora/prompts/`; the `solver.general` profile renders them at runtime and records the resulting prompt hash. `aurora.services.intent_dsl.IntentDSL` is the typed, declarative contract for an Intent. It validates objectives, capabilities, dependencies, risk and tool request data; it is not executable code.

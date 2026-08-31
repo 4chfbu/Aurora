@@ -64,7 +64,24 @@ class ProjectRuntimePolicy(SQLModel, table=True):
     subagents_enabled: bool = False
     max_subagents_per_worker: int = 2
     max_subagents_concurrent: int = 2
+    multi_agent_exploration_enabled: bool = False
+    max_parallel_explorers: int = 2
+    max_reason_intents: int = 3
+    max_pending_intents: int = 8
     created_at: datetime = Field(default_factory=now_utc)
+
+
+class ProjectCoordinationState(SQLModel, table=True):
+    """Persistent project graph watermark used by the multi-agent reason loop."""
+
+    id: str = Field(default_factory=lambda: new_id("coord"), primary_key=True)
+    project_id: str = Field(index=True, unique=True)
+    graph_version: int = 0
+    last_reasoned_version: int = 0
+    reason_lease_owner: str | None = Field(default=None, index=True)
+    reason_lease_expires_at: datetime | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=now_utc)
+    updated_at: datetime = Field(default_factory=now_utc)
 
 
 class AuthorizationScope(SQLModel, table=True):

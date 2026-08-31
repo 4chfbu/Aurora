@@ -107,6 +107,11 @@ class Settings(BaseModel):
     subagents_enabled: bool = Field(default_factory=lambda: os.getenv("AURORA_SUBAGENTS_ENABLED", "false").lower() in {"1", "true", "yes"})
     subagents_max_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_CONCURRENT", "2")))
     subagents_max_per_worker: int = Field(default_factory=lambda: int(os.getenv("AURORA_SUBAGENTS_MAX_PER_WORKER", "2")))
+    multi_agent_exploration_enabled: bool = Field(default_factory=lambda: os.getenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "false").lower() in {"1", "true", "yes"})
+    multi_agent_max_global_workers: int = Field(default_factory=lambda: int(os.getenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "4")))
+    multi_agent_max_project_workers: int = Field(default_factory=lambda: int(os.getenv("AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS", "2")))
+    multi_agent_max_reason_intents: int = Field(default_factory=lambda: int(os.getenv("AURORA_MULTI_AGENT_MAX_REASON_INTENTS", "3")))
+    multi_agent_max_pending_intents: int = Field(default_factory=lambda: int(os.getenv("AURORA_MULTI_AGENT_MAX_PENDING_INTENTS", "8")))
     max_challenge_group_concurrent: int = Field(default_factory=lambda: int(os.getenv("AURORA_MAX_CHALLENGE_GROUP_CONCURRENT", "2")))
     tsecbench_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_TSECBENCH_BASE_URL") or os.getenv("BENCHMARK_BASE_URL") or "https://tsecbench.zc.tencent.com")
     tsecbench_token: str | None = Field(default_factory=lambda: os.getenv("AURORA_TSECBENCH_TOKEN") or os.getenv("BENCHMARK_TOKEN") or None)
@@ -147,6 +152,15 @@ class Settings(BaseModel):
             raise ValueError("resume manifest limits must be positive")
         if self.slab_match_notice_poll_seconds <= 0:
             raise ValueError("AURORA_SLAB_MATCH_NOTICE_POLL_SECONDS must be positive")
+        if min(
+            self.multi_agent_max_global_workers,
+            self.multi_agent_max_project_workers,
+            self.multi_agent_max_reason_intents,
+            self.multi_agent_max_pending_intents,
+        ) <= 0:
+            raise ValueError("multi-agent exploration limits must be positive")
+        if self.multi_agent_max_project_workers > self.multi_agent_max_global_workers:
+            raise ValueError("AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS cannot exceed AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS")
         return self
 
     @property

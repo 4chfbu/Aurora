@@ -402,6 +402,21 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=2
 
 子 Agent 与父 Worker 共享容器和 `/workspace`，不会递归创建子 Agent；每个子 Agent 的结果和 transcript 都会写入独立的 Worker、Attempt、Trace 和 Artifact 记录。
 
+### 多 Agent 探索
+
+先设置 `AURORA_MULTI_AGENT_EXPLORATION_ENABLED=true`，创建项目时再传入：
+
+```json
+{
+  "name": "parallel exploration",
+  "goal": "解决当前授权任务",
+  "multi_agent_exploration_enabled": true,
+  "max_parallel_explorers": 2
+}
+```
+
+首次 Bootstrap 仍保持单 Worker。产生首个 Fact 后，Reason 会按图版本提出有限数量的非重叠 Intent，随后多个同级 Explore Worker 并行认领。Web 新建项目区域也提供对应开关和并发数输入。
+
 ## 10. 冻结评测
 
 Evaluation 目前只支持 TSecBench。先调用 `POST /api/evaluations/suites` 冻结题目元数据，再通过

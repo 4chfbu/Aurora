@@ -43,9 +43,11 @@ from aurora.models import (
     Worker,
     WorkerEvent,
     ProjectRuntimePolicy,
+    ProjectCoordinationState,
     now_utc,
 )
-from aurora.services.demo import create_project_with_bootstrap, run_one_demo_step
+from aurora.services.demo import create_project_with_bootstrap
+from aurora.services.multi_agent import run_project_exploration_once
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.scheduler import Scheduler
@@ -61,6 +63,7 @@ from aurora.services.hands_free import HandsFreeService
 from aurora.services.project_rethink import rethink_project
 from aurora.services.project_rethink_registry import project_rethink_registry
 from aurora.services.project_run_control import project_run_control
+from aurora.services.project_coordination import ProjectCoordinationService
 from aurora.services.runtime_warnings import acknowledge_runtime_warning, list_active_runtime_warnings
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.challenge_group_runner import ChallengeGroupRunner, challenge_group_registry, recover_legacy_target_blocked_groups
@@ -96,6 +99,8 @@ class CreateProjectRequest(BaseModel):
     allowed_hosts: list[str] = Field(default_factory=list)
     hint: str | None = None
     subagents_enabled: bool = False
+    multi_agent_exploration_enabled: bool = False
+    max_parallel_explorers: int | None = Field(default=None, ge=1, le=8)
 
 
 class SolveProjectRequest(CreateProjectRequest):
@@ -631,6 +636,8 @@ def create_app() -> FastAPI:
             allowed_hosts=payload.allowed_hosts,
             hint=payload.hint,
             subagents_enabled=payload.subagents_enabled,
+            multi_agent_exploration_enabled=payload.multi_agent_exploration_enabled,
+            max_parallel_explorers=payload.max_parallel_explorers,
         )
 
     @app.post("/api/hands-free/imports")
@@ -773,6 +780,8 @@ def create_app() -> FastAPI:
             allowed_hosts=payload.allowed_hosts,
             hint=payload.hint or payload.goal,
             subagents_enabled=payload.subagents_enabled,
+            multi_agent_exploration_enabled=payload.multi_agent_exploration_enabled,
+            max_parallel_explorers=payload.max_parallel_explorers,
         )
         result = AutoRunnerService().run_until_stop(session, project_id=project.id, limits=_autorun_limits(payload))
         return {"project": project, "autorun": result.__dict__, "summary": get_project_summary(project.id, session)}
@@ -973,6 +982,7 @@ def create_app() -> FastAPI:
         session.add(hint)
         session.commit()
         session.refresh(hint)
+        ProjectCoordinationService().record_graph_change(session, project_id=project_id)
         session.add(
             WorkerEvent(
                 project_id=project_id,
@@ -1026,7 +1036,9 @@ def create_app() -> FastAPI:
     @app.post("/api/projects/{project_id}/rethink")
     def rethink(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        running_workers = session.exec(select(Worker).where(Worker.project_id == project_id, Worker.status == "RUNNING")).all()
+        running_workers = session.exec(
+            select(Worker).where(Worker.project_id == project_id, Worker.status.in_(["STARTING", "RUNNING", "CONCLUDING"]))
+        ).all()
         background_autorun = autorun_registry.status(project_id)
         autorun_active = bool(
             (background_autorun and background_autorun.get("status") in {"running", "stopping"})
@@ -1053,7 +1065,7 @@ def create_app() -> FastAPI:
     @app.post("/api/projects/{project_id}/run-demo")
     def run_demo(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        result = run_one_demo_step(session, project_id=project_id)
+        result = run_project_exploration_once(session, project_id=project_id)
         if result.get("status") == "busy":
             raise HTTPException(status_code=409, detail="project already has an active run")
         return result
@@ -1061,7 +1073,7 @@ def create_app() -> FastAPI:
     @app.post("/api/projects/{project_id}/scheduler/run-next")
     def run_next_intent(project_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         _require_project(session, project_id)
-        result = run_one_demo_step(session, project_id=project_id)
+        result = run_project_exploration_once(session, project_id=project_id)
         if result.get("status") == "busy":
             raise HTTPException(status_code=409, detail="project already has an active run")
         return result
@@ -1184,6 +1196,8 @@ def create_app() -> FastAPI:
             "flag_candidates": session.exec(select(FlagCandidate).where(FlagCandidate.project_id == project_id).order_by(FlagCandidate.created_at)).all(),
             "workers": session.exec(select(Worker).where(Worker.project_id == project_id).order_by(Worker.created_at)).all(),
             "checkpoints": session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at)).all(),
+            "runtime_policy": session.exec(select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)).first(),
+            "coordination": session.exec(select(ProjectCoordinationState).where(ProjectCoordinationState.project_id == project_id)).first(),
         }
 
     @app.get("/api/projects/{project_id}/summary")

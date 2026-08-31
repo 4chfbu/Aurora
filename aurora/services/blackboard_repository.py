@@ -8,6 +8,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.models import Fact, Intent, WorkerEvent, now_utc
+from aurora.services.project_coordination import ProjectCoordinationService
 
 
 def normalize_text(value: str) -> str:
@@ -133,6 +134,7 @@ class BlackboardRepository:
         )
         session.commit()
         session.refresh(fact)
+        ProjectCoordinationService().record_graph_change(session, project_id=project_id)
         return UpsertResult(fact, created=True)
 
     def upsert_intent(

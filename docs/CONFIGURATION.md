@@ -306,6 +306,20 @@ Subagents 需要同时满足全局开关、创建项目时的 `subagents_enabled
 | `AURORA_SUBAGENTS_MAX_PER_WORKER` | `2` | 每个 Worker 的子 Agent 总数上限。 |
 | `AURORA_SUBAGENT_CODEX_COMMAND` | 未设置 | 子 Agent 使用的 Codex 命令模板；应包含 `{prompt_filename}`、`{schema_filename}`、`{last_message_filename}`。默认 wrapper 会自动注入。 |
 
+### 多 Agent 并行探索
+
+多 Agent 探索与同容器 Subagent 是两套独立机制。前者在项目级运行多个同级 Explore Worker，通过 Blackboard 协作；后者仍是单个主 Worker 启动的临时子进程。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `AURORA_MULTI_AGENT_EXPLORATION_ENABLED` | `false` | 全局安全开关；项目还需设置 `multi_agent_exploration_enabled=true`。 |
+| `AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS` | `4` | 所有项目合计的并行 Explore Worker 上限。 |
+| `AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS` | `2` | 新项目默认的项目内并行上限。 |
+| `AURORA_MULTI_AGENT_MAX_REASON_INTENTS` | `3` | 每次 Reason 最多提出的独立探索方向。 |
+| `AURORA_MULTI_AGENT_MAX_PENDING_INTENTS` | `8` | 单项目未完成 Intent 的硬上限，防止分支爆炸。 |
+
+每个 Explore Worker 使用独立容器和 workspace；共享内容只通过已提交的 Fact、Artifact、Checkpoint 和 Intent 传播。Reason 使用项目级 lease，同一图版本只运行一次。项目停止及租约过期仍使用现有 fencing，迟到输出不会写回。
+
 ### Evaluation 运行约束
 
 Evaluation 没有单独环境变量，使用 TSecBench 配置和角色模型配置。`POST /api/evaluations/suites` 会冻结当时的题目元数据和输入版本，

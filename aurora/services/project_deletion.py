@@ -25,6 +25,7 @@ from aurora.models import (
     Intent,
     LLMTrace,
     Project,
+    ProjectCoordinationState,
     ProjectRuntimePolicy,
     ToolTrace,
     Worker,
@@ -66,7 +67,9 @@ class ProjectDeletionService:
             if not challenge_group_registry.wait_for_stop(group_id, timeout_seconds=3):
                 raise RuntimeError("active challenge group did not stop; retry after it has stopped")
 
-        running_workers = session.exec(select(Worker).where(Worker.project_id == project_id, Worker.status == "RUNNING")).all()
+        running_workers = session.exec(
+            select(Worker).where(Worker.project_id == project_id, Worker.status.in_(["STARTING", "RUNNING", "CONCLUDING"]))
+        ).all()
         if running_workers:
             raise RuntimeError("active workers did not stop; retry after they have stopped")
 
@@ -130,6 +133,7 @@ class ProjectDeletionService:
         for artifact in artifacts:
             session.delete(artifact)
         for model in (
+            ProjectCoordinationState,
             ProjectRuntimePolicy,
             AuthorizationScope,
             DiscoveredTarget,
