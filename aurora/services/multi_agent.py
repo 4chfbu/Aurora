@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from threading import Condition
+from time import monotonic
 from typing import Any
 
 from sqlmodel import Session, select
@@ -15,18 +17,32 @@ from aurora.services.project_run_control import project_run_control
 
 class _GlobalExplorerCapacity:
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._condition = Condition()
         self._active = 0
+        self._waiters: deque[object] = deque()
 
-    def reserve(self, requested: int, limit: int) -> int:
-        with self._lock:
+    def reserve(self, requested: int, limit: int, *, timeout_seconds: float = 0.5) -> int:
+        waiter = object()
+        deadline = monotonic() + max(0.0, timeout_seconds)
+        with self._condition:
+            self._waiters.append(waiter)
+            while self._waiters[0] is not waiter or self._active >= limit:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    self._waiters.remove(waiter)
+                    self._condition.notify_all()
+                    return 0
+                self._condition.wait(remaining)
             granted = max(0, min(requested, limit - self._active))
             self._active += granted
+            self._waiters.popleft()
+            self._condition.notify_all()
             return granted
 
     def release(self, count: int) -> None:
-        with self._lock:
+        with self._condition:
             self._active = max(0, self._active - count)
+            self._condition.notify_all()
 
 
 _global_explorer_capacity = _GlobalExplorerCapacity()
@@ -50,6 +66,8 @@ def run_project_exploration_once(session: Session, *, project_id: str) -> dict[s
 
 
 def run_project_exploration_step(session: Session, *, project_id: str, run_id: str) -> dict[str, Any]:
+    if not project_run_control.owns(project_id=project_id, run_id=run_id):
+        return {"status": "busy", "message": "project_run_active"}
     settings = get_settings()
     policy = session.exec(
         select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)

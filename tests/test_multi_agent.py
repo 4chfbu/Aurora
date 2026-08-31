@@ -8,11 +8,12 @@ from sqlmodel import Session, select
 from aurora.api import create_app
 from aurora.config import get_settings
 from aurora.db import engine
-from aurora.models import Intent, ProjectCoordinationState, ProjectRuntimePolicy
+from aurora.models import Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.multi_agent import run_project_exploration_step
 from aurora.services.project_coordination import ProjectCoordinationService
 from aurora.services.project_reasoner import ProjectReasoner
+from aurora.services.project_run_control import project_run_control
 from aurora.services.scheduler import Scheduler
 
 
@@ -87,13 +88,35 @@ def test_parallel_explorers_claim_distinct_intents_and_overlap(monkeypatch) -> N
         return {"status": "completed", "intent_id": intent.id, "worker_id": worker.id}
 
     monkeypatch.setattr("aurora.services.multi_agent._run_one_demo_step_claimed", fake_execute)
-    with Session(engine) as session:
-        result = run_project_exploration_step(session, project_id=project_id, run_id="run_test")
+    claim = project_run_control.acquire(project_id=project_id, owner="test")
+    assert claim is not None
+    try:
+        with Session(engine) as session:
+            result = run_project_exploration_step(session, project_id=project_id, run_id=claim.run_id)
+    finally:
+        project_run_control.release(project_id=project_id, run_id=claim.run_id)
 
     assert result["status"] == "multi_agent_batch"
     assert result["worker_count"] == 2
     assert peak == 2
     assert len(set(claimed_intents)) == 2
+
+
+def test_multi_agent_step_rejects_unowned_run_id(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    get_settings.cache_clear()
+    with Session(engine) as session:
+        project = Project(name="run-fence", goal="reject stale dispatch")
+        session.add_all([
+            project,
+            ProjectRuntimePolicy(project_id=project.id, multi_agent_exploration_enabled=True),
+            Intent(project_id=project.id, objective="must not run"),
+        ])
+        session.commit()
+
+        result = run_project_exploration_step(session, project_id=project.id, run_id="fabricated")
+
+    assert result == {"status": "busy", "message": "project_run_active"}
 
 
 def test_graph_versions_fence_reason_passes() -> None:

@@ -82,3 +82,37 @@ def test_scheduler_claims_an_intent_only_once_under_concurrency() -> None:
 
     assert sorted(results) == [False, True]
     assert len(workers) == 1
+
+
+def test_expired_scheduler_lease_cannot_publish_or_renew() -> None:
+    project_id = "proj_expired_publish"
+    with Session(engine) as session:
+        project = Project(id=project_id, name="expired", goal="reject late output")
+        intent = Intent(
+            id="intent_expired_publish",
+            project_id=project_id,
+            objective="late result",
+            status="RUNNING",
+            lease_owner="worker_expired_publish",
+            lease_generation=1,
+            lease_expires_at=now_utc() - timedelta(seconds=1),
+        )
+        worker = Worker(
+            id="worker_expired_publish",
+            project_id=project_id,
+            intent_id=intent.id,
+            status="RUNNING",
+            lease_generation=1,
+        )
+        session.add_all([project, intent, worker])
+        session.commit()
+
+        scheduler = Scheduler()
+        assert scheduler.owns_active_lease(session, intent=intent, worker=worker) is False
+        assert scheduler.begin_conclusion(session, intent=intent, worker=worker) is False
+        assert scheduler.heartbeat(session, worker_id=worker.id, lease_seconds=60) is None
+
+        session.refresh(intent)
+        session.refresh(worker)
+        assert intent.status == "RUNNING"
+        assert worker.status == "RUNNING"

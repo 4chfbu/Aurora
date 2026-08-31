@@ -25,6 +25,42 @@ def test_cataloger_configuration_is_optional_for_deterministic_collection(tmp_pa
         assert result.candidates == []
 
 
+def test_group_registry_stop_terminates_every_running_project(tmp_path: Path, monkeypatch) -> None:
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'group-stop.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        "aurora.services.challenge_group_runner.stop_project_containers",
+        lambda project_id: stopped.append(project_id) or {"stopped": [], "errors": []},
+    )
+
+    with Session(test_engine) as session:
+        group = ChallengeGroup(name="stop-all", max_concurrent=2)
+        first = Project(name="first", goal="stop")
+        second = Project(name="second", goal="stop")
+        session.add_all([group, first, second])
+        session.commit()
+        group_id = group.id
+        first_id = first.id
+        second_id = second.id
+        session.add_all([
+            ChallengeGroupItem(group_id=group_id, project_id=first_id, position=1, status="RUNNING", fused_status="RUNNING"),
+            ChallengeGroupItem(group_id=group_id, project_id=second_id, position=2, status="RUNNING", fused_status="RUNNING"),
+        ])
+        session.commit()
+
+    registry = ChallengeGroupRegistry()
+    registry._runs[group_id] = GroupRunState(group_id=group_id, current_project_id=second_id)
+    state = registry.stop(group_id)
+
+    assert state is not None and state.status == "stopping"
+    assert set(stopped) == {first_id, second_id}
+
+
 def test_ctfplus_problem_bank_uses_api_and_respects_url_pagination(tmp_path: Path) -> None:
     requests: list[tuple[str, dict, str | None]] = []
 

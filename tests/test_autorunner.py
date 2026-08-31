@@ -1,6 +1,7 @@
 import os
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["AURORA_DB_URL"] = "sqlite:////tmp/aurora_test.db"
 os.environ["AURORA_ARTIFACT_DIR"] = "/tmp/aurora_test_artifacts"
@@ -89,6 +90,43 @@ def test_autorun_zero_no_progress_limit_disables_duplicate_blocking() -> None:
         )
         assert result.status_code == 200
         assert result.json()["autorun"]["stop_reason"] != "duplicate_tool_streak"
+
+
+def test_capacity_wait_uses_backoff_without_triggering_no_progress(monkeypatch) -> None:
+    import aurora.services.autorunner as autorunner_module
+
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(
+        autorunner_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"], sleep=sleep),
+    )
+    monkeypatch.setattr(
+        autorunner_module,
+        "run_project_exploration_step",
+        lambda session, project_id, run_id: {"status": "capacity_wait"},
+    )
+
+    with Session(engine) as session:
+        project = Project(name="capacity-backoff", goal="wait fairly")
+        session.add_all([project, Intent(project_id=project.id, objective="pending")])
+        session.commit()
+
+        result = AutoRunnerService().run_until_stop(
+            session,
+            project_id=project.id,
+            limits=AutoRunLimits(max_iterations=2, no_progress_limit=1),
+        )
+
+    assert result.stop_reason == "max_iterations"
+    assert result.iterations == 2
+    assert sum(sleeps) > 0.7
 
 
 def test_autorun_background_start_reports_status() -> None:

@@ -590,8 +590,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
         session.add(runtime_output.llm_trace)
         session.commit()
 
-    attempt.tool_calls = tool_calls
-    if not scheduler.owns_active_lease(session, intent=intent, worker=worker):
+    if not scheduler.begin_conclusion(session, intent=intent, worker=worker):
         # A background reaper already made the authoritative timeout decision.
         # Do not let a late runtime result create facts or overwrite its state.
         session.add(
@@ -616,6 +615,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
             "llm_trace_id": runtime_output.llm_trace.id,
             "tool_calls": tool_calls,
         }
+    attempt.tool_calls = tool_calls
     candidate_flags = FlagValidator().extract_candidate_flags(session, artifact_refs=structured.get("artifact_refs", []), project_id=project_id)
     if candidate_flags:
         structured.setdefault("candidate_flags", []).extend(candidate_flags)

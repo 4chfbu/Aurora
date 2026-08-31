@@ -319,6 +319,7 @@ class ChallengeGroupRunner:
             raise ValueError("challenge group not found")
         max_workers = self._max_workers(session, group)
         capacity_waiters: set[str] = set()
+        capacity_release_epoch = 0
         stop_requested = False
         stop_reason = "manual_stop"
         suspend_detector = SuspendGapDetector()
@@ -420,16 +421,20 @@ class ChallengeGroupRunner:
                 return item_id, outcome, reason
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"aurora-group-{group_id}") as pool:
-            futures: dict[Future[tuple[str, str, str]], str] = {}
+            futures: dict[Future[tuple[str, str, str]], tuple[str, int]] = {}
             while True:
                 if not stop_requested and should_stop and should_stop():
                     stop_requested = True
                     stop_reason = "manual_stop"
+                    for active_item_id, _ in futures.values():
+                        active_item = session.get(ChallengeGroupItem, active_item_id)
+                        if active_item is not None:
+                            stop_project_containers(active_item.project_id)
                 suspend_gap = suspend_detector.poll()
                 if not stop_requested and suspend_gap is not None:
                     stop_requested = True
                     stop_reason = "host_suspend_detected"
-                    for active_item_id in futures.values():
+                    for active_item_id, _ in futures.values():
                         active_item = session.get(ChallengeGroupItem, active_item_id)
                         if active_item is not None:
                             stop_project_containers(active_item.project_id)
@@ -501,7 +506,7 @@ class ChallengeGroupRunner:
                         session.commit()
                         for item_id in dispatch:
                             future = pool.submit(run_item, item_id)
-                            futures[future] = item_id
+                            futures[future] = (item_id, capacity_release_epoch)
 
                 if futures:
                     # Poll periodically so a host suspend/resume jump can
@@ -510,13 +515,18 @@ class ChallengeGroupRunner:
                     if not completed:
                         continue
                     released_or_finished = False
+                    missed_wakeup_waiters: set[str] = set()
                     for future in completed:
-                        item_id = futures.pop(future)
+                        item_id, dispatch_epoch = futures.pop(future)
                         try:
                             _, outcome, reason = future.result()
                             if outcome == "WAITING_RESOURCE" and self._is_capacity_exhausted(reason):
-                                capacity_waiters.add(item_id)
+                                if capacity_release_epoch > dispatch_epoch:
+                                    missed_wakeup_waiters.add(item_id)
+                                else:
+                                    capacity_waiters.add(item_id)
                             else:
+                                capacity_release_epoch += 1
                                 released_or_finished = True
                         except Exception as exc:
                             # Each worker owns an independent Session, so recover
@@ -529,7 +539,10 @@ class ChallengeGroupRunner:
                                     item_id=item_id,
                                     error=exc,
                                 )
+                            capacity_release_epoch += 1
                             released_or_finished = True
+                    if missed_wakeup_waiters:
+                        self._reactivate_capacity_waiters(session, item_ids=missed_wakeup_waiters)
                     if released_or_finished and capacity_waiters:
                         self._reactivate_capacity_waiters(session, item_ids=capacity_waiters)
                         capacity_waiters.clear()
@@ -1725,7 +1738,7 @@ class ChallengeGroupRegistry:
     def start(self, group_id: str) -> GroupRunState:
         with self._lock:
             existing = self._runs.get(group_id)
-            if existing is not None and existing.status == "running":
+            if existing is not None and existing.status in {"running", "stopping"}:
                 return existing
             state = GroupRunState(group_id=group_id)
             self._runs[group_id] = state
@@ -1747,13 +1760,28 @@ class ChallengeGroupRegistry:
         return state
 
     def stop(self, group_id: str) -> GroupRunState | None:
+        project_ids: set[str] = set()
         with self._lock:
             state = self._runs.get(group_id)
             if state is not None:
                 state.stop_requested = True
+                if state.status == "running":
+                    state.status = "stopping"
                 if state.current_project_id:
-                    stop_project_containers(state.current_project_id)
-            return state
+                    project_ids.add(state.current_project_id)
+        if state is None:
+            return None
+        with Session(engine) as session:
+            running_items = session.exec(
+                select(ChallengeGroupItem).where(
+                    ChallengeGroupItem.group_id == group_id,
+                    ChallengeGroupItem.fused_status == "RUNNING",
+                )
+            ).all()
+            project_ids.update(item.project_id for item in running_items)
+        for project_id in project_ids:
+            stop_project_containers(project_id)
+        return state
 
     def status(self, group_id: str) -> dict[str, Any] | None:
         with self._lock:

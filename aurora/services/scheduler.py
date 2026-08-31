@@ -73,26 +73,16 @@ class Scheduler:
         # state (or a retry claimed by a newer worker).
         session.refresh(intent)
         session.refresh(worker)
-        if (
-            intent.status != "RUNNING"
-            or intent.lease_owner != worker.id
-            or worker.status != "RUNNING"
-            or intent.lease_generation != worker.lease_generation
-        ):
+        if intent.status == "RUNNING" and not self.begin_conclusion(session, intent=intent, worker=worker):
             return
-        # Publish a single concluding barrier before writing the terminal
-        # state. Reapers only claim RUNNING rows, so a late result cannot win
-        # after this transaction has acquired the barrier.
-        intent.status = "CONCLUDING"
-        worker.status = "CONCLUDING"
-        intent.updated_at = now_utc()
-        worker.updated_at = now_utc()
-        session.add(intent)
-        session.add(worker)
-        session.commit()
         session.refresh(intent)
         session.refresh(worker)
-        if intent.status != "CONCLUDING" or worker.status != "CONCLUDING":
+        if (
+            intent.status != "CONCLUDING"
+            or intent.lease_owner != worker.id
+            or worker.status != "CONCLUDING"
+            or intent.lease_generation != worker.lease_generation
+        ):
             return
         intent.status = status
         intent.lease_owner = None
@@ -114,11 +104,56 @@ class Scheduler:
         )
         session.commit()
 
+    def begin_conclusion(self, session: Session, *, intent: Intent, worker: Worker) -> bool:
+        """Fence result publication behind an unexpired scheduler lease."""
+        now = now_utc()
+        claimed = session.exec(
+            update(Intent)
+            .where(
+                Intent.id == intent.id,
+                Intent.status == "RUNNING",
+                Intent.lease_owner == worker.id,
+                Intent.lease_generation == worker.lease_generation,
+                Intent.lease_expires_at.is_not(None),
+                Intent.lease_expires_at >= now,
+            )
+            .values(status="CONCLUDING", updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            session.rollback()
+            session.expire_all()
+            return False
+        worker_claimed = session.exec(
+            update(Worker)
+            .where(
+                Worker.id == worker.id,
+                Worker.status == "RUNNING",
+                Worker.lease_generation == intent.lease_generation,
+            )
+            .values(status="CONCLUDING", updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if worker_claimed.rowcount != 1:
+            session.rollback()
+            session.expire_all()
+            return False
+        session.commit()
+        session.expire_all()
+        return True
+
     def owns_active_lease(self, session: Session, *, intent: Intent, worker: Worker) -> bool:
         """Return whether this worker may still publish its final result."""
         session.refresh(intent)
         session.refresh(worker)
-        return intent.status == "RUNNING" and intent.lease_owner == worker.id and worker.status == "RUNNING"
+        return bool(
+            intent.status == "RUNNING"
+            and intent.lease_owner == worker.id
+            and worker.status == "RUNNING"
+            and intent.lease_generation == worker.lease_generation
+            and intent.lease_expires_at
+            and self._at_or_after(intent.lease_expires_at, now_utc())
+        )
 
     def heartbeat(self, session: Session, *, worker_id: str, lease_seconds: int = 300) -> Worker | None:
         worker = session.get(Worker, worker_id)
@@ -130,6 +165,8 @@ class Scheduler:
             or intent.status != "RUNNING"
             or intent.lease_owner != worker.id
             or intent.lease_generation != worker.lease_generation
+            or not intent.lease_expires_at
+            or not self._at_or_after(intent.lease_expires_at, now_utc())
         ):
             return None
 
@@ -163,22 +200,45 @@ class Scheduler:
             )
         ).all()
         timed_out_primary_attempts: list[tuple[Attempt, dict]] = []
+        reaped_count = 0
         for intent in expired:
             previous_status = intent.status
-            intent.status = "PENDING" if intent.retry_count < intent.max_retries else "FAILED"
-            intent.retry_count += 1
+            next_status = "PENDING" if intent.retry_count < intent.max_retries else "FAILED"
+            next_retry_count = intent.retry_count + 1
             worker_id = intent.lease_owner
-            intent.lease_owner = None
-            intent.lease_expires_at = None
-            intent.updated_at = now_utc()
-            session.add(intent)
+            generation = intent.lease_generation
+            claimed = session.exec(
+                update(Intent)
+                .where(
+                    Intent.id == intent.id,
+                    Intent.status == "RUNNING",
+                    Intent.lease_owner == worker_id,
+                    Intent.lease_generation == generation,
+                    Intent.lease_expires_at < now_utc(),
+                )
+                .values(
+                    status=next_status,
+                    retry_count=next_retry_count,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now_utc(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                session.rollback()
+                session.expire_all()
+                continue
+            session.commit()
+            session.expire_all()
+            reaped_count += 1
             session.add(
                 WorkerEvent(
                     project_id=project_id,
                     worker_id=worker_id,
                     intent_id=intent.id,
                     event_type="intent.lease_expired",
-                    payload_json={"previous_status": previous_status, "new_status": intent.status, "retry_count": intent.retry_count},
+                    payload_json={"previous_status": previous_status, "new_status": next_status, "retry_count": next_retry_count},
                 )
             )
             if worker_id:
@@ -234,7 +294,7 @@ class Scheduler:
                 },
                 budget=budget,
             )
-        return len(expired)
+        return reaped_count
 
     def reap_all_expired(self, session: Session) -> int:
         """Reap every active project so stale workers cannot survive unattended."""

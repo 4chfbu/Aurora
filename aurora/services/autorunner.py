@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from collections.abc import Callable
+import time
 from typing import Any
 
 from sqlmodel import Session, select
@@ -85,6 +86,7 @@ class AutoRunnerService:
         if deadline_at is None and limits.max_minutes > 0:
             deadline_at = started_at + timedelta(minutes=limits.max_minutes)
         no_progress_count = 0
+        capacity_wait_count = 0
         recovery_intent_seeded = False
         events: list[dict[str, Any]] = []
         limits_payload = {
@@ -157,7 +159,9 @@ class AutoRunnerService:
             run_result = run_project_exploration_step(session, project_id=project_id, run_id=run_id)
             after = self._counts(session, project_id)
             progress = self._progress(before, after)
-            if progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"]:
+            if run_result.get("status") == "capacity_wait":
+                pass
+            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"]:
                 no_progress_count = 0
             else:
                 no_progress_count += 1
@@ -180,6 +184,19 @@ class AutoRunnerService:
                 if project.status == "FLAG_READY":
                     return AutoRunResult("candidate_ready", "candidate_ready", iteration, project_id, events)
                 return AutoRunResult("completed", "project_completed", iteration, project_id, events)
+            if run_result.get("status") == "capacity_wait":
+                capacity_wait_count += 1
+                retry_delay = min(5.0, 0.25 * (2 ** min(capacity_wait_count - 1, 5)))
+                if deadline_at is not None:
+                    retry_delay = min(retry_delay, max(0.0, (deadline_at - now_utc()).total_seconds()))
+                wait_until = time.monotonic() + retry_delay
+                while time.monotonic() < wait_until:
+                    if should_stop and should_stop():
+                        self._event(session, project_id, "autorun.stopped", {"reason": "manual_stop", "iteration": iteration})
+                        return AutoRunResult("stopped", "manual_stop", iteration, project_id, events)
+                    time.sleep(max(0.0, min(0.1, wait_until - time.monotonic())))
+                continue
+            capacity_wait_count = 0
             if run_result.get("status") == "idle":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)
