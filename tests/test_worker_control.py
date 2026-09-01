@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from aurora.models import Artifact, Attempt, Fact, Worker, WorkerEvent
+from aurora.models import Artifact, Attempt, Fact, ProjectCoordinationState, Worker, WorkerEvent
 from aurora.services.worker_control import WorkerControlService
 
 
@@ -26,6 +26,9 @@ def test_worker_control_is_scoped_and_versions_live_updates(tmp_path) -> None:
         checkpoint = service.save_checkpoint(session, worker=authenticated_worker, attempt=authenticated_attempt, summary="Login route confirmed", completed_steps=["Fetched landing page"], failed_routes=["Default credentials"], next_step="Inspect the session cookie", artifact_refs=[artifact.id])
         board = service.query(session, worker=authenticated_worker, attempt=authenticated_attempt)
         facts = session.exec(select(Fact).where(Fact.project_id == worker.project_id)).all()
+        coordination = session.exec(
+            select(ProjectCoordinationState).where(ProjectCoordinationState.project_id == worker.project_id)
+        ).one()
         events = session.exec(select(WorkerEvent).where(WorkerEvent.attempt_id == attempt.id)).all()
 
         with pytest.raises(PermissionError):
@@ -33,6 +36,7 @@ def test_worker_control_is_scoped_and_versions_live_updates(tmp_path) -> None:
 
     assert result["version"] == 1
     assert checkpoint["version"] == 2
+    assert coordination.graph_version == 2
     assert len(facts) == 1
     assert board["version"] == 2
     assert board["live_checkpoints"][0]["next_step"] == "Inspect the session cookie"
@@ -51,4 +55,3 @@ def test_worker_control_rejects_foreign_evidence(tmp_path) -> None:
 
         with pytest.raises(ValueError, match="this project"):
             WorkerControlService().append_fact(session, worker=worker, attempt=attempt, statement="foreign", category="analysis", confidence=0.5, evidence_refs=[artifact.id])
-

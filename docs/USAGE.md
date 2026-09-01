@@ -415,7 +415,9 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=2
 }
 ```
 
-首次 Bootstrap 仍保持单 Worker。产生首个 Fact 后，Reason 会按图版本提出有限数量的非重叠 Intent，随后多个同级 Explore Worker 并行认领。Web 新建项目区域也提供对应开关和并发数输入。
+没有任何共享事实或 Checkpoint 时，首次 Bootstrap 保持单 Worker；靶机、Hint 或前一轮已经提供共享状态时，Reason 会立即补齐并行槽位。每批同级 Explore Worker 分别认领非重叠 Intent，通过实时 Blackboard 发布事实、反证和 Checkpoint；批次结束后 Reason 汇总全部结果并规划下一批，直到完成或达到阶段截止。Web 新建项目区域也提供对应开关和并发数输入。
+
+TSecBench 批量导入和 Evaluation 在全局开关启用时会自动为新项目开启该机制，无需逐题设置项目开关。
 
 ## 10. 冻结评测
 

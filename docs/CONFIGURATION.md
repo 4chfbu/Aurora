@@ -318,7 +318,9 @@ Subagents 需要同时满足全局开关、创建项目时的 `subagents_enabled
 | `AURORA_MULTI_AGENT_MAX_REASON_INTENTS` | `3` | 每次 Reason 最多提出的独立探索方向。 |
 | `AURORA_MULTI_AGENT_MAX_PENDING_INTENTS` | `8` | 单项目未完成 Intent 的硬上限，防止分支爆炸。 |
 
-每个 Explore Worker 使用独立容器和 workspace；共享内容只通过已提交的 Fact、Artifact、Checkpoint 和 Intent 传播。Reason 使用项目级 lease，同一图版本只运行一次。项目停止及租约过期仍使用现有 fencing，迟到输出不会写回。
+每个 Explore Worker 使用独立容器和 workspace；共享内容只通过已提交的 Fact、Artifact、Checkpoint 和 Intent 传播。Reason 使用项目级 lease，同一图版本只运行一次，并按 `max_parallel_explorers` 补齐空闲分支。Fact 和 Checkpoint 都会推进图版本；一批 Worker 完成后，下一轮 Reason 会读取全部分支的事实、失败路线、Artifact 和下一步，再生成互补分支。规划模型返回空列表、坏 JSON 或暂时不可用时，会从对应题型 playbook 生成有界的不同探索方向，避免退化为单 Worker 串行接力。项目停止及租约过期仍使用现有 fencing，迟到输出不会写回。
+
+启用全局开关后，新建的 TSecBench 批量导入项目和 Evaluation 运行会自动设置项目级 opt-in；普通项目仍需在创建时显式传入 `multi_agent_exploration_enabled=true`。
 
 ### Evaluation 运行约束
 

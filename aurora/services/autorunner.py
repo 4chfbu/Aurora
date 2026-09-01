@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
+from aurora.models import Artifact, AttemptCheckpoint, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
 from aurora.services.multi_agent import run_project_exploration_step
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.manager import ManagerDecision, ManagerService
@@ -161,7 +161,7 @@ class AutoRunnerService:
             progress = self._progress(before, after)
             if run_result.get("status") == "capacity_wait":
                 pass
-            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"]:
+            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"] or progress["new_checkpoints"]:
                 no_progress_count = 0
             else:
                 no_progress_count += 1
@@ -253,6 +253,9 @@ class AutoRunnerService:
                 ).all()
             ),
             "findings": len(session.exec(select(Finding).where(Finding.project_id == project_id)).all()),
+            "checkpoints": len(
+                session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id)).all()
+            ),
             "attempts": len(session.exec(select(Intent).where(Intent.project_id == project_id, Intent.status.in_(["COMPLETED", "FAILED"]))).all()),
         }
 
@@ -404,6 +407,7 @@ class AutoRunnerService:
             "new_facts": after["facts"] - before["facts"],
             "new_artifacts": after["artifacts"] - before["artifacts"],
             "new_findings": after["findings"] - before["findings"],
+            "new_checkpoints": after["checkpoints"] - before["checkpoints"],
             "new_attempts": after["attempts"] - before["attempts"],
         }
 

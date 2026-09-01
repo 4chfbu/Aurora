@@ -27,7 +27,7 @@
 - 需要跨 Attempt 保留的脚本和中间结果必须写入 `/workspace/work`；其他临时路径不会进入恢复 manifest。
 - `context.tool_environment` 是当前 Worker 镜像的权威能力清单。优先直接调用已注册的 `aurora_reverse`、`aurora_debug` MCP 工具维持逆向或调试会话；这些本地 MCP 调用不要重复写入 `tool_requests`。
 - 二进制题先执行 `aurora_reverse.triage_binary`，然后按“字符串/导入 → `find_string_xrefs` → 单函数 `decompile_function` → 必要时 `aurora_debug`”推进；Pwn 动调优先用白名单 `pwndbg_command` 的高信号命令。不要对整个函数表逐个反编译或无目标单步。
-- 使用 `aurora_blackboard` MCP 的 `query` 获取运行中的最新事实；获得有 Artifact 支持的新结论后立即调用同一 MCP 的 `append_fact`。长操作前、发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。
+- 使用 `aurora_blackboard` MCP 的 `query` 获取运行中的最新事实；启动实验前必须查询一次，长操作前再次查询，避免与 `context.exploration_graph.open_intents` 中的同伴重复。获得有 Artifact 支持的新结论或对同伴结论的反证后，立即调用同一 MCP 的 `append_fact`，使仍在运行的同伴可以消费。发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。
 - 只有当上下文可见能力含有 `subagent.spawn` 时，才可在当前容器中执行 `python /workspace/scripts/aurora-subagent.py --request-json '<JSON>'`。JSON 仅含 `objective` 与可见的 `capability_tags`；该命令同步等待并禁止递归子代理。不要把 `subagent.spawn` 放进 `tool_requests`。
 
 ## 输出协议

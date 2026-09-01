@@ -8,7 +8,8 @@ from sqlmodel import Session, select
 from aurora.api import create_app
 from aurora.config import get_settings
 from aurora.db import engine
-from aurora.models import Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy
+from aurora.models import Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, WorkerEvent
+from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.multi_agent import run_project_exploration_step
 from aurora.services.project_coordination import ProjectCoordinationService
@@ -146,12 +147,18 @@ def test_graph_versions_fence_reason_passes() -> None:
 def test_reason_pass_creates_bounded_parallel_intents_once(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
     monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS", "3")
     get_settings.cache_clear()
     client = TestClient(create_app())
     with client:
         project_id = client.post(
             "/api/projects",
-            json={"name": "reason", "goal": "fan out", "multi_agent_exploration_enabled": True},
+            json={
+                "name": "reason",
+                "goal": "fan out",
+                "multi_agent_exploration_enabled": True,
+                "max_parallel_explorers": 3,
+            },
         ).json()["id"]
 
     response = {
@@ -173,5 +180,118 @@ def test_reason_pass_creates_bounded_parallel_intents_once(monkeypatch) -> None:
         second = ProjectReasoner().run(session, project_id=project_id)
 
     assert first["status"] == "proposed"
-    assert len(first["created_intent_ids"]) == 3
+    assert len(first["created_intent_ids"]) == 2
+    assert first["details"]["open_intents"] == 1
+    assert first["details"]["requested_intents"] == 2
     assert second["status"] == "unchanged"
+
+
+def test_reason_fills_empty_model_plan_with_playbook_branch(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={
+                "name": "fallback-fanout",
+                "goal": "inspect an authorized web target",
+                "challenge_type": "web",
+                "multi_agent_exploration_enabled": True,
+                "max_parallel_explorers": 2,
+            },
+        ).json()["id"]
+
+    monkeypatch.setattr(
+        "aurora.services.project_reasoner.chat_completion",
+        lambda **kwargs: {"choices": [{"message": {"content": '{"intents": []}'}}]},
+    )
+    with Session(engine) as session:
+        BlackboardRepository().upsert_fact(
+            session,
+            project_id=project_id,
+            statement="The authorized target exposes HTTP.",
+        )
+        result = ProjectReasoner().run(session, project_id=project_id)
+        pending = session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+        ).all()
+
+    assert result["status"] == "proposed"
+    assert result["details"]["model_created"] == 0
+    assert result["details"]["fallback_created"] == 1
+    assert len(pending) == 2
+
+
+def test_real_reason_worker_blackboard_loop_runs_parallel_batches(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={
+                "name": "closed-loop",
+                "goal": "exercise a reason-worker-blackboard loop",
+                "multi_agent_exploration_enabled": True,
+                "max_parallel_explorers": 2,
+            },
+        ).json()["id"]
+
+    calls = 0
+
+    def reason_response(**kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "choices": [{
+                "message": {
+                    "content": (
+                        '{"intents":[{"objective":"independent branch '
+                        f'{calls}","capabilities":["blackboard.query"],'
+                        '"depends_on_facts":[],"priority":4,"risk_level":"low"}]}'
+                    )
+                }
+            }]
+        }
+
+    monkeypatch.setattr("aurora.services.project_reasoner.chat_completion", reason_response)
+    with Session(engine) as session:
+        BlackboardRepository().upsert_fact(
+            session,
+            project_id=project_id,
+            statement="Initial shared evidence is available.",
+        )
+        result = AutoRunnerService().run_until_stop(
+            session,
+            project_id=project_id,
+            limits=AutoRunLimits(max_iterations=2, no_progress_limit=0),
+        )
+        batches = session.exec(
+            select(WorkerEvent)
+            .where(
+                WorkerEvent.project_id == project_id,
+                WorkerEvent.event_type == "multi_agent.batch_started",
+            )
+            .order_by(WorkerEvent.created_at)
+        ).all()
+        reason_events = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project_id,
+                WorkerEvent.event_type == "reason.completed",
+            )
+        ).all()
+        workers = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project_id,
+                WorkerEvent.event_type == "worker.started",
+            )
+        ).all()
+
+    assert result.stop_reason == "max_iterations"
+    assert [event.payload_json["worker_count"] for event in batches] == [2, 2]
+    assert len(workers) == 4
+    assert len(reason_events) == 2
+    assert all(event.payload_json["status"] == "proposed" for event in reason_events)

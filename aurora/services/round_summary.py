@@ -13,6 +13,7 @@ from aurora.models import Attempt, AttemptCheckpoint, Fact, Intent, Project, Pro
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.intent_dsl import IntentDSL
 from aurora.services.mcp_registry import visible_mcp_tools
+from aurora.services.project_coordination import ProjectCoordinationService
 
 
 class RoundReflectionService:
@@ -119,6 +120,7 @@ class RoundReflectionService:
         )
         session.commit()
         session.refresh(checkpoint)
+        ProjectCoordinationService().record_graph_change(session, project_id=attempt.project_id)
         return checkpoint
 
     def _fallback(

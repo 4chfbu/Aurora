@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
+from aurora.config import get_settings
 from aurora.db import engine
 import pytest
 
-from aurora.models import ChallengeGroup, ChallengeGroupItem, EvaluationItemResult, FlagCandidate, Intent, Project, now_utc
+from aurora.models import ChallengeGroup, ChallengeGroupItem, EvaluationItemResult, FlagCandidate, Intent, Project, ProjectRuntimePolicy, now_utc
 from aurora.services.challenge_group_runner import ChallengeGroupRunner
 from aurora.services.evaluation import EvaluationService
 from aurora.services.tsecbench import TSecBenchChallenge
@@ -54,6 +55,31 @@ def test_evaluation_suite_is_frozen_and_excludes_completed_challenges() -> None:
         assert [item["unique_code"] for item in suite.items_json] == ["fresh-web"]
         assert suite.items_json[0]["version_hash"]
         assert suite.content_hash
+
+
+def test_evaluation_projects_opt_into_multi_agent_when_globally_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS", "3")
+    get_settings.cache_clear()
+    try:
+        with Session(engine) as session:
+            suite = EvaluationService().create_suite(session, name="parallel-evaluation", client=FakeClient())
+            run = EvaluationService().create_run(
+                session,
+                suite_id=suite.id,
+                label="parallel",
+                variant="candidate",
+                client=FakeClient(),
+            )
+            result = session.exec(select(EvaluationItemResult).where(EvaluationItemResult.run_id == run.id)).one()
+            policy = session.exec(
+                select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == result.project_id)
+            ).one()
+
+            assert policy.multi_agent_exploration_enabled is True
+            assert policy.max_parallel_explorers == 3
+    finally:
+        get_settings.cache_clear()
 
 
 def test_evaluation_run_uses_platform_completion_and_compares_same_suite() -> None:

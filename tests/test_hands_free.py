@@ -5,8 +5,8 @@ import time
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from aurora.config import Settings
-from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, FlagCandidate, Intent, Project, Worker, WorkerEvent, now_utc
+from aurora.config import Settings, get_settings
+from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, Finding, FlagCandidate, ImportBatch, ImportCandidate, Intent, Project, ProjectRuntimePolicy, Worker, WorkerEvent, now_utc
 from aurora.services.hands_free import MAX_ATTACHMENT_BYTES, HandsFreeService
 from aurora.services.challenge_group_runner import ChallengeGroupRegistry, ChallengeGroupRunner, GroupRunState
 from aurora.services.challenge_group_runner import fail_group_run, recover_interrupted_groups, recover_legacy_target_blocked_groups
@@ -333,6 +333,48 @@ def test_hands_free_stages_same_domain_attachments_and_confirms_projects(tmp_pat
         assert "可继续分析题目与附件" in (imported_project.target_verification_reason or "")
         repeated = service.confirm(session, result.batch.id, [candidate.id for candidate in result.candidates])
         assert {item["status"] for item in repeated} == {"existing"}
+
+
+def test_tsecbench_confirm_opts_into_multi_agent_when_globally_enabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_PROJECT_WORKERS", "3")
+    get_settings.cache_clear()
+    try:
+        settings = Settings(
+            artifact_dir=tmp_path,
+            multi_agent_exploration_enabled=True,
+            multi_agent_max_project_workers=3,
+        )
+        service = HandsFreeService(settings=settings)
+        with Session(service_session_engine()) as session:
+            batch = ImportBatch(
+                source_url="https://tsecbench.example/tasks",
+                status="READY",
+                title="TSecBench",
+                platform="tsecbench",
+            )
+            session.add(batch)
+            session.commit()
+            candidate = ImportCandidate(
+                batch_id=batch.id,
+                title="Parallel challenge",
+                description="Solve it.",
+                challenge_url="https://tsecbench.example/tasks/parallel",
+                challenge_type="web",
+                confidence=1.0,
+            )
+            session.add(candidate)
+            session.commit()
+
+            created = service.confirm(session, batch.id, [candidate.id])
+            policy = session.exec(
+                select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == created[0]["project_id"])
+            ).one()
+
+            assert policy.multi_agent_exploration_enabled is True
+            assert policy.max_parallel_explorers == 3
+    finally:
+        get_settings.cache_clear()
 
 
 def test_login_page_pauses_batch_without_persisting_credentials(tmp_path: Path) -> None:

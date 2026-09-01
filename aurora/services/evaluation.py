@@ -202,6 +202,8 @@ class EvaluationService:
                 challenge_type=str(item.get("challenge_type") or "unknown"),
                 allowed_hosts=[],
                 hint="Use only the authorized platform instance and imported challenge evidence.",
+                multi_agent_exploration_enabled=settings.multi_agent_exploration_enabled,
+                max_parallel_explorers=settings.multi_agent_max_project_workers,
             )
             meta = {**item, "platform": suite.platform, "provenance": "evaluation_snapshot"}
             group_item = ChallengeGroupItem(

@@ -252,6 +252,13 @@ class ContextBuilder:
                     for item in active_workers
                 ],
                 "coordination": "Peers coordinate only through committed facts, artifacts, checkpoints, and intents.",
+                "collaboration_cycle": [
+                    "Query the live blackboard before selecting an experiment and before any expensive operation.",
+                    "Avoid work already owned by another open intent or disproved in a checkpoint.",
+                    "Append evidence-backed facts immediately so running peers can consume them.",
+                    "Publish contradictions and failed routes, not only successful findings.",
+                    "Save a checkpoint with one concrete next step before final output.",
+                ],
             },
             "authorization_scope": scope.model_dump(mode="json") if scope else None,
             "facts": [

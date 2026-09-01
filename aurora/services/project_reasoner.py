@@ -7,12 +7,13 @@ from pydantic import ValidationError
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Fact, Intent, Project, ProjectRuntimePolicy, WorkerEvent
-from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.models import Artifact, AttemptCheckpoint, Fact, Intent, Project, ProjectRuntimePolicy, WorkerEvent
+from aurora.services.blackboard_repository import BlackboardRepository, normalize_text
 from aurora.services.intent_dsl import IntentDSL
 from aurora.services.llm_http import LLMRequestError, chat_completion
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.project_coordination import ProjectCoordinationService
+from aurora.services.solver_playbooks import select_playbook
 
 
 class ProjectReasoner:
@@ -33,9 +34,16 @@ class ProjectReasoner:
         facts = session.exec(
             select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at)
         ).all()
+        checkpoint = session.exec(
+            select(AttemptCheckpoint)
+            .where(AttemptCheckpoint.project_id == project_id)
+            .order_by(AttemptCheckpoint.created_at.desc())
+        ).first()
         # Preserve the bootstrap fast path. The first solver gets an uncluttered
-        # attempt before the graph starts fanning out.
-        if not facts:
+        # attempt before the graph starts fanning out. A checkpoint without a
+        # fact is still useful graph state and must be allowed to trigger the
+        # next Reason pass.
+        if not facts and checkpoint is None:
             return {"status": "waiting_for_first_fact", "created_intent_ids": []}
 
         coordination = ProjectCoordinationService()
@@ -61,6 +69,7 @@ class ProjectReasoner:
                 select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at)
             ).all()
             created = self._reason(session, project_id=project_id, policy=policy, facts=facts)
+            details = getattr(self, "_last_reason_details", {})
             coordination.finish_reason(
                 session,
                 project_id=project_id,
@@ -76,11 +85,16 @@ class ProjectReasoner:
                         "graph_version": graph_version,
                         "created_intent_ids": created,
                         "status": "proposed" if created else "noop",
+                        "details": details,
                     },
                 )
             )
             session.commit()
-            return {"status": "proposed" if created else "noop", "created_intent_ids": created}
+            return {
+                "status": "proposed" if created else "noop",
+                "created_intent_ids": created,
+                "details": details,
+            }
         except Exception as exc:
             # A failed planning pass must not spin on every dispatcher tick.
             # A later Fact/Hint increments graph_version and makes it eligible again.
@@ -110,7 +124,7 @@ class ProjectReasoner:
     ) -> list[str]:
         settings = get_settings()
         project = session.get(Project, project_id)
-        if project is None or not settings.llm_api_key:
+        if project is None:
             return []
         open_intents = session.exec(
             select(Intent).where(
@@ -118,19 +132,46 @@ class ProjectReasoner:
                 Intent.status.in_(["PENDING", "RUNNING", "CONCLUDING"]),
             )
         ).all()
+        intent_history = session.exec(
+            select(Intent).where(Intent.project_id == project_id).order_by(Intent.created_at.desc()).limit(50)
+        ).all()
+        checkpoints = session.exec(
+            select(AttemptCheckpoint)
+            .where(AttemptCheckpoint.project_id == project_id)
+            .order_by(AttemptCheckpoint.created_at.desc())
+            .limit(12)
+        ).all()
+        artifacts = session.exec(
+            select(Artifact)
+            .where(Artifact.project_id == project_id)
+            .order_by(Artifact.created_at.desc())
+            .limit(20)
+        ).all()
         available = max(0, policy.max_pending_intents - len(open_intents))
-        limit = min(policy.max_reason_intents, available)
+        parallel_slots = max(0, policy.max_parallel_explorers - len(open_intents))
+        limit = min(policy.max_reason_intents, available, parallel_slots)
         if limit <= 0:
+            self._last_reason_details = {
+                "requested_intents": 0,
+                "open_intents": len(open_intents),
+                "reason": "parallel_slots_full",
+            }
             return []
+        current_phase = self._current_phase(open_intents, checkpoints)
         prompt = {
             "task": (
                 "Read the shared exploration graph and propose only new, high-value, non-overlapping, "
-                "parallelizable exploration directions. Existing open intents must not be duplicated. "
-                f"Return JSON {{\"intents\": [...]}} with at most {limit} items. Each item has objective, "
+                "parallelizable exploration directions. Fill the available peer slots while the project is active; "
+                "do not return an empty list merely because one broad bootstrap intent already exists. Existing open "
+                "or completed routes must not be duplicated. "
+                f"Return JSON {{\"intents\": [...]}} with exactly {limit} item(s) when that many distinct routes remain. Each item has objective, "
                 "capabilities, depends_on_facts, priority, and risk_level. Return an empty list when existing "
-                "work already covers the useful directions. Do not include commands or chain-of-thought."
+                "work truly covers every useful direction. Assign one falsifiable experiment per item and include how "
+                "its result complements the other branches. Do not include commands or chain-of-thought."
             ),
             "goal": project.goal,
+            "challenge_type": project.challenge_type,
+            "current_phase": current_phase,
             "facts": [
                 {"id": fact.id, "statement": fact.statement, "category": fact.category, "confidence": fact.confidence}
                 for fact in facts[-100:]
@@ -139,40 +180,146 @@ class ProjectReasoner:
                 {"id": intent.id, "objective": intent.objective, "status": intent.status}
                 for intent in open_intents
             ],
+            "completed_or_failed_routes": [
+                {"id": intent.id, "objective": intent.objective, "status": intent.status}
+                for intent in intent_history
+                if intent.status in {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}
+            ],
+            "recent_checkpoints": [
+                {
+                    "summary": checkpoint.summary,
+                    "conclusions": checkpoint.conclusions,
+                    "hypotheses": checkpoint.hypotheses,
+                    "failed_routes": checkpoint.failed_routes,
+                    "next_steps": checkpoint.next_steps,
+                    "fact_refs": checkpoint.fact_refs,
+                    "artifact_refs": checkpoint.artifact_refs,
+                }
+                for checkpoint in checkpoints
+            ],
+            "recent_artifacts": [
+                {"id": artifact.id, "type": artifact.type, "summary": artifact.summary}
+                for artifact in artifacts
+                if artifact.type not in {"codex-transcript", "subagent-transcript"}
+            ],
         }
-        body = chat_completion(
-            settings=settings,
-            model=settings.model_for_role("planner"),
-            messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
-            timeout=settings.llm_timeout_seconds,
-        )
-        try:
-            payload = json.loads(body["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise LLMRequestError(f"reason response parse error: {exc}") from exc
-        candidates = payload.get("intents", []) if isinstance(payload, dict) else []
-        if not isinstance(candidates, list):
-            raise LLMRequestError("reason response intents must be a list")
+        planner_error: str | None = None
+        candidates: list[Any] = []
+        if settings.llm_api_key:
+            try:
+                body = chat_completion(
+                    settings=settings,
+                    model=settings.model_for_role("planner"),
+                    messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
+                    timeout=settings.llm_timeout_seconds,
+                )
+                payload = json.loads(body["choices"][0]["message"]["content"])
+                parsed = payload.get("intents", []) if isinstance(payload, dict) else []
+                if not isinstance(parsed, list):
+                    raise LLMRequestError("reason response intents must be a list")
+                candidates = parsed
+            except (LLMRequestError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                planner_error = f"{type(exc).__name__}: {exc}"[:500]
+        else:
+            planner_error = "planner API key is not configured"
 
         allowed = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False)}
         fact_ids = {fact.id for fact in facts}
+        historical_objectives = {normalize_text(intent.objective) for intent in intent_history}
         repository = BlackboardRepository()
         created: list[str] = []
-        for candidate in candidates[:limit]:
+        accepted_objectives: set[str] = set()
+        model_created = self._create_candidates(
+            session,
+            project_id=project_id,
+            candidates=candidates,
+            limit=limit,
+            current_phase=current_phase,
+            allowed=allowed,
+            fact_ids=fact_ids,
+            historical_objectives=historical_objectives,
+            accepted_objectives=accepted_objectives,
+            repository=repository,
+        )
+        created.extend(model_created)
+        fallback_created: list[str] = []
+        if len(created) < limit:
+            fallback_created = self._create_candidates(
+                session,
+                project_id=project_id,
+                candidates=self._fallback_candidates(project, facts=facts, checkpoints=checkpoints),
+                limit=limit - len(created),
+                current_phase=current_phase,
+                allowed=allowed,
+                fact_ids=fact_ids,
+                historical_objectives=historical_objectives,
+                accepted_objectives=accepted_objectives,
+                repository=repository,
+            )
+            created.extend(fallback_created)
+        self._last_reason_details = {
+            "requested_intents": limit,
+            "open_intents": len(open_intents),
+            "model_candidates": len(candidates),
+            "model_created": len(model_created),
+            "fallback_created": len(fallback_created),
+            "current_phase": current_phase,
+            "planner_error": planner_error,
+        }
+        return created
+
+    @staticmethod
+    def _current_phase(open_intents: list[Intent], checkpoints: list[AttemptCheckpoint]) -> int:
+        values: list[int] = []
+        for budget in [*(intent.budget or {} for intent in open_intents), *(item.budget_json or {} for item in checkpoints)]:
+            try:
+                values.append(int(budget.get("phase", 1) or 1))
+            except (TypeError, ValueError):
+                continue
+        return max(1, min(4, max(values, default=1)))
+
+    @staticmethod
+    def _create_candidates(
+        session: Session,
+        *,
+        project_id: str,
+        candidates: list[Any],
+        limit: int,
+        current_phase: int,
+        allowed: set[str],
+        fact_ids: set[str],
+        historical_objectives: set[str],
+        accepted_objectives: set[str],
+        repository: BlackboardRepository,
+    ) -> list[str]:
+        created: list[str] = []
+        for candidate in candidates:
+            if len(created) >= limit:
+                break
             if not isinstance(candidate, dict):
                 continue
+            raw_capabilities = candidate.get("capabilities", [])
+            capabilities = (
+                [str(capability) for capability in raw_capabilities if str(capability) in allowed]
+                if isinstance(raw_capabilities, list)
+                else []
+            )
             try:
                 intent = IntentDSL(
                     objective=candidate.get("objective", ""),
-                    capabilities=candidate.get("capabilities", []),
+                    capabilities=capabilities,
                     depends_on_facts=candidate.get("depends_on_facts", []),
                     priority=candidate.get("priority", 1.0),
                     risk_level=candidate.get("risk_level", "low"),
                 )
             except ValidationError:
                 continue
-            if not intent.capabilities or any(capability not in allowed for capability in intent.capabilities):
+            if not intent.capabilities:
                 continue
+            normalized = normalize_text(intent.objective)
+            if normalized in historical_objectives or normalized in accepted_objectives:
+                continue
+            accepted_objectives.add(normalized)
             result = repository.upsert_intent(
                 session,
                 project_id=project_id,
@@ -181,8 +328,57 @@ class ProjectReasoner:
                 dependency_fact_ids=[fact_id for fact_id in intent.depends_on_facts if fact_id in fact_ids],
                 priority=intent.priority,
                 risk_level=intent.risk_level,
-                budget={"model_role": "solver", "phase": 2},
+                budget={
+                    "model_role": "triage" if current_phase == 1 else "reviewer" if current_phase >= 4 else "solver",
+                    "phase": current_phase,
+                },
             )
             if result.created:
                 created.append(result.item.id)
         return created
+
+    @staticmethod
+    def _fallback_candidates(
+        project: Project,
+        *,
+        facts: list[Fact],
+        checkpoints: list[AttemptCheckpoint],
+    ) -> list[dict[str, Any]]:
+        evidence_text = " ".join([project.goal, *(fact.statement for fact in facts[-20:])])
+        playbook = select_playbook(project.challenge_type, evidence_text)
+        capabilities = list(dict.fromkeys([*playbook.capabilities, "blackboard.query"]))
+        dependencies = [fact.id for fact in facts[-5:]]
+        candidates = [
+            {
+                "objective": (
+                    "Run an independent, evidence-backed branch for this playbook step: "
+                    f"{step}. Read the shared board first, avoid failed routes, publish decisive evidence immediately, "
+                    "and stop after one falsifiable experiment."
+                ),
+                "capabilities": capabilities,
+                "depends_on_facts": dependencies,
+                "priority": max(1.0, 2.0 - index * 0.1),
+                "risk_level": "low",
+            }
+            for index, step in enumerate(playbook.first_steps)
+        ]
+        next_steps = [
+            str(step).strip()
+            for checkpoint in checkpoints
+            for step in checkpoint.next_steps
+            if str(step).strip()
+        ]
+        candidates.extend(
+            {
+                "objective": (
+                    "Independently validate this unresolved checkpoint direction against the shared evidence: "
+                    f"{step[:1000]}. Report confirming or contradicting observations and do not repeat recorded failures."
+                ),
+                "capabilities": capabilities,
+                "depends_on_facts": dependencies,
+                "priority": 1.7,
+                "risk_level": "low",
+            }
+            for step in next_steps[:6]
+        )
+        return candidates

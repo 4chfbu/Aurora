@@ -359,6 +359,10 @@ class HandsFreeService:
                 # URL and only that discovered host becomes tool-authorized.
                 allowed_hosts=[],
                 hint="Challenge page retained as import evidence; do not treat the training platform as a target.",
+                multi_agent_exploration_enabled=(
+                    batch.platform == "tsecbench" and self.settings.multi_agent_exploration_enabled
+                ),
+                max_parallel_explorers=self.settings.multi_agent_max_project_workers,
             )
             project.target_verification_status = "UNVERIFIED"
             project.target_verification_reason = "靶机为可选项；可继续分析题目与附件，也可稍后自动识别或人工注入"

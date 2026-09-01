@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 
 from aurora.models import Artifact, Attempt, AttemptCheckpoint, Fact, Worker, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import BlackboardRepository
+from aurora.services.project_coordination import ProjectCoordinationService
 
 
 class WorkerControlService:
@@ -117,6 +118,7 @@ class WorkerControlService:
             "artifact_refs": refs,
         }
         self._advance(session, worker=worker, attempt=attempt, event_type="checkpoint.saved", payload=payload)
+        ProjectCoordinationService().record_graph_change(session, project_id=worker.project_id)
         return {"status": "saved", "version": attempt.blackboard_version}
 
     @staticmethod
@@ -139,4 +141,3 @@ class WorkerControlService:
             )
         )
         session.commit()
-

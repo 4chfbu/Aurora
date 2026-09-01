@@ -165,7 +165,7 @@ The bundled `codex-via-cc-switch.sh` wrapper makes children reuse the private CC
 
 ## Multi-Agent Exploration
 
-Aurora also supports Cairn-style peer exploration. Unlike `subagent.spawn`, peer Explorers are independent project-level Workers: each atomically claims a different Intent, runs in an isolated Worker container/workspace, and coordinates only through the project Fact/Intent/Artifact blackboard. A single fenced Reason pass reacts to each new graph version and may add bounded, non-overlapping Intents.
+Aurora also supports Cairn-style peer exploration. Unlike `subagent.spawn`, peer Explorers are independent project-level Workers: each atomically claims a different Intent, runs in an isolated Worker container/workspace, and coordinates only through the project Fact/Intent/Artifact/Checkpoint blackboard. A fenced Reason pass fills available peer slots with bounded, non-overlapping branches. Every evidence-backed Fact or Checkpoint advances the graph; after a parallel batch completes, Reason consumes all branch results and plans the next wave. Invalid or empty planner output falls back to distinct challenge playbook branches instead of silently degrading to one Worker.
 
 Enable the global guard, then opt in when creating a project:
 
