@@ -149,3 +149,18 @@
   .flag-candidate-review { grid-template-columns: 22px minmax(0, 1fr); }
   .flag-candidate-review button { justify-content: center; }
 }
+
+.agent-settings-dialog { width: min(920px, 100%); }
+.agent-settings-section { display: grid; gap: 12px; border: 1px solid #26384d; background: #0d1723; padding: 14px; }
+.agent-settings-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.agent-settings-heading strong, .agent-settings-heading small { display: block; }
+.agent-settings-heading strong { color: #dceaf5; font-size: .86rem; }
+.agent-settings-heading small { margin-top: 4px; color: #758ba1; font-size: .68rem; }
+.agent-settings-heading button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #277c94; border-radius: 4px; background: #123347; color: #dff8ff; padding: 7px 9px; font-size: .74rem; }
+.agent-toggle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.agent-toggle-grid label { display: flex; align-items: center; gap: 8px; border: 1px solid #24374a; background: #0a121c; padding: 9px 10px; color: #a9bfd0; letter-spacing: 0; text-transform: none; }
+.agent-toggle-grid input { width: 15px; height: 15px; accent-color: #55c6da; }
+.agent-number-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.agent-number-grid label { display: grid; gap: 6px; letter-spacing: .06em; }
+.agent-number-grid input { width: 100%; border: 1px solid #263446; border-radius: 4px; background: #0a121c; color: #dce7f2; padding: 8px 9px; }
+@media (max-width: 760px) { .agent-number-grid, .agent-toggle-grid { grid-template-columns: 1fr; } }

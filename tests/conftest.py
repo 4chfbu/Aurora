@@ -30,6 +30,10 @@ def isolated_runtime_for_tests(monkeypatch):
     monkeypatch.setenv("AURORA_WORKER_IMAGE", "aurora-test-image-not-present")
     monkeypatch.setenv("AURORA_CONTAINER_NETWORK", "bridge")
     monkeypatch.setattr("aurora.services.demo.get_worker_runtime", lambda: TestWorkerRuntime())
+    # API lifespan startup/shutdown must not discover or remove containers from
+    # the developer's real Docker daemon while the isolated test database is in
+    # use. OpenVPNGatewayRegistry behavior is covered with FakeGateway instead.
+    monkeypatch.setattr("aurora.api.openvpn_gateway_registry.initialize", lambda: None)
 
     def _ready_test_preflight(settings, challenge_type=None):
         environment = tool_environment(settings, challenge_type)

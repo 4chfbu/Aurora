@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 from aurora.config import Settings, get_settings
 from aurora.models import Artifact, ChallengeGroup, ChallengeGroupItem, Fact, ImportArtifact, ImportBatch, ImportCandidate, WorkerEvent, now_utc, new_id
 from aurora.services.demo import create_project_with_bootstrap
+from aurora.services.agent_runtime import agent_runtime_settings
 from aurora.services.flag_prefix_config import _normalize_prefixes
 from aurora.services.prompt_renderer import PromptRenderer
 from aurora.services.network_proxy import network_proxy_registry
@@ -323,6 +324,7 @@ class HandsFreeService:
         candidates_by_id = {candidate.id: candidate for candidate in found_candidates}
         candidates = [candidates_by_id[candidate_id] for candidate_id in requested]
         normalized_flag_prefixes = _normalize_prefixes(flag_prefixes or []) if flag_prefixes is not None else None
+        agent_runtime = agent_runtime_settings(session)
         group = ChallengeGroup(
             import_batch_id=batch_id,
             name=(batch.title or f"Imported batch {batch_id[-8:]}")[:240],
@@ -360,9 +362,9 @@ class HandsFreeService:
                 allowed_hosts=[],
                 hint="Challenge page retained as import evidence; do not treat the training platform as a target.",
                 multi_agent_exploration_enabled=(
-                    batch.platform == "tsecbench" and self.settings.multi_agent_exploration_enabled
+                    batch.platform == "tsecbench" and agent_runtime.multi_agent_exploration_enabled
                 ),
-                max_parallel_explorers=self.settings.multi_agent_max_project_workers,
+                max_parallel_explorers=agent_runtime.default_max_project_workers,
             )
             project.target_verification_status = "UNVERIFIED"
             project.target_verification_reason = "靶机为可选项；可继续分析题目与附件，也可稍后自动识别或人工注入"

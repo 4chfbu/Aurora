@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from threading import Barrier, Lock
+import json
+from threading import Barrier, Event, Lock
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -8,7 +9,7 @@ from sqlmodel import Session, select
 from aurora.api import create_app
 from aurora.config import get_settings
 from aurora.db import engine
-from aurora.models import Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, WorkerEvent
+from aurora.models import ChallengeGroup, ChallengeGroupItem, Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, WorkerEvent
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.multi_agent import run_project_exploration_step
@@ -103,6 +104,159 @@ def test_parallel_explorers_claim_distinct_intents_and_overlap(monkeypatch) -> N
     assert len(set(claimed_intents)) == 2
 
 
+def test_parallel_batch_stops_sibling_after_project_becomes_terminal(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "4")
+    get_settings.cache_clear()
+    with Session(engine) as session:
+        project = Project(name="short-circuit", goal="stop sibling")
+        session.add_all([
+            project,
+            ProjectRuntimePolicy(
+                project_id=project.id,
+                multi_agent_exploration_enabled=True,
+                max_parallel_explorers=2,
+            ),
+            Intent(project_id=project.id, objective="winning branch", priority=2),
+            Intent(project_id=project.id, objective="slow branch", priority=1),
+        ])
+        session.commit()
+        project_id = project.id
+
+    barrier = Barrier(2)
+    stop_requested = Event()
+    lock = Lock()
+    calls = 0
+
+    def fake_execute(worker_session: Session, *, project_id: str) -> dict:
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        barrier.wait(timeout=5)
+        if call == 1:
+            project = worker_session.get(Project, project_id)
+            assert project is not None
+            project.status = "FLAG_READY"
+            worker_session.add(project)
+            worker_session.commit()
+            assert stop_requested.wait(timeout=5)
+            return {"status": "completed"}
+        assert stop_requested.wait(timeout=5)
+        return {"status": "cancelled"}
+
+    monkeypatch.setattr("aurora.services.multi_agent._run_one_demo_step_claimed", fake_execute)
+    monkeypatch.setattr(
+        "aurora.services.multi_agent.stop_project_containers",
+        lambda project_id: (stop_requested.set() or {"stopped": ["worker-container"], "errors": []}),
+    )
+    claim = project_run_control.acquire(project_id=project_id, owner="test")
+    assert claim is not None
+    try:
+        with Session(engine) as session:
+            result = run_project_exploration_step(session, project_id=project_id, run_id=claim.run_id)
+            event = session.exec(
+                select(WorkerEvent).where(
+                    WorkerEvent.project_id == project_id,
+                    WorkerEvent.event_type == "multi_agent.batch_short_circuited",
+                )
+            ).one()
+    finally:
+        project_run_control.release(project_id=project_id, run_id=claim.run_id)
+
+    assert result["worker_count"] == 2
+    assert event.payload_json["project_status"] == "FLAG_READY"
+    assert event.payload_json["stopped_containers"] == ["worker-container"]
+
+
+def test_group_projects_receive_a_fair_share_of_global_workers(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "4")
+    get_settings.cache_clear()
+    with Session(engine) as session:
+        group = ChallengeGroup(name="fair", max_concurrent=3)
+        projects = [Project(name=f"fair-{index}", goal="share capacity") for index in range(3)]
+        session.add(group)
+        session.add_all(projects)
+        session.flush()
+        session.add_all([
+            ChallengeGroupItem(group_id=group.id, project_id=project.id, position=index)
+            for index, project in enumerate(projects, start=1)
+        ])
+        session.add(ProjectRuntimePolicy(
+            project_id=projects[0].id,
+            multi_agent_exploration_enabled=True,
+            max_parallel_explorers=2,
+        ))
+        session.add_all([
+            Intent(project_id=projects[0].id, objective="branch one", priority=2),
+            Intent(project_id=projects[0].id, objective="branch two", priority=1),
+        ])
+        session.commit()
+        project_id = projects[0].id
+
+    monkeypatch.setattr(
+        "aurora.services.multi_agent._run_one_demo_step_claimed",
+        lambda worker_session, project_id: {"status": "completed"},
+    )
+    claim = project_run_control.acquire(project_id=project_id, owner="test")
+    assert claim is not None
+    try:
+        with Session(engine) as session:
+            result = run_project_exploration_step(session, project_id=project_id, run_id=claim.run_id)
+    finally:
+        project_run_control.release(project_id=project_id, run_id=claim.run_id)
+
+    assert result["worker_count"] == 2
+
+
+def test_group_fair_share_uses_priority_dispatched_items(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "4")
+    get_settings.cache_clear()
+    with Session(engine) as session:
+        group = ChallengeGroup(name="priority-fair", max_concurrent=3)
+        projects = [Project(name=f"priority-{position}", goal="share capacity") for position in range(1, 7)]
+        session.add(group)
+        session.add_all(projects)
+        session.flush()
+        items = [
+            ChallengeGroupItem(
+                group_id=group.id,
+                project_id=project.id,
+                position=position,
+                status="RUNNING" if position in {4, 5, 6} else "PENDING",
+                fused_status="RUNNING" if position in {4, 5, 6} else "PENDING",
+            )
+            for position, project in enumerate(projects, start=1)
+        ]
+        session.add_all(items)
+        selected = projects[4]
+        session.add(ProjectRuntimePolicy(
+            project_id=selected.id,
+            multi_agent_exploration_enabled=True,
+            max_parallel_explorers=2,
+        ))
+        session.add(Intent(project_id=selected.id, objective="dispatched branch", priority=1))
+        session.commit()
+        project_id = selected.id
+
+    monkeypatch.setattr(
+        "aurora.services.multi_agent._run_one_demo_step_claimed",
+        lambda worker_session, project_id: {"status": "completed"},
+    )
+    claim = project_run_control.acquire(project_id=project_id, owner="test")
+    assert claim is not None
+    try:
+        with Session(engine) as session:
+            result = run_project_exploration_step(session, project_id=project_id, run_id=claim.run_id)
+    finally:
+        project_run_control.release(project_id=project_id, run_id=claim.run_id)
+
+    assert result["status"] == "multi_agent_batch"
+    assert result["worker_count"] == 1
+
+
 def test_multi_agent_step_rejects_unowned_run_id(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
     get_settings.cache_clear()
@@ -165,28 +319,77 @@ def test_reason_pass_creates_bounded_parallel_intents_once(monkeypatch) -> None:
         "choices": [{
             "message": {
                 "content": '{"intents": ['
-                '{"objective":"branch 1","capabilities":["blackboard.query"],"depends_on_facts":[],"priority":4,"risk_level":"low"},'
-                '{"objective":"branch 2","capabilities":["blackboard.query"],"depends_on_facts":[],"priority":3,"risk_level":"low"},'
+                '{"objective":"branch 1","depends_on_facts":[],"priority":4,"risk_level":"low"},'
+                '{"objective":"branch 2","capabilities":["not.available"],"depends_on_facts":[],"priority":3,"risk_level":"low"},'
                 '{"objective":"branch 3","capabilities":["blackboard.query"],"depends_on_facts":[],"priority":2,"risk_level":"low"},'
                 '{"objective":"branch 4","capabilities":["blackboard.query"],"depends_on_facts":[],"priority":1,"risk_level":"low"}'
                 ']}'
             }
         }]
     }
-    monkeypatch.setattr("aurora.services.project_reasoner.chat_completion", lambda **kwargs: response)
+    prompts: list[dict] = []
+
+    def reason_response(**kwargs):
+        prompts.append(json.loads(kwargs["messages"][0]["content"]))
+        return response
+
+    monkeypatch.setattr("aurora.services.project_reasoner.chat_completion", reason_response)
     with Session(engine) as session:
+        bootstrap = session.exec(
+            select(Intent).where(Intent.project_id == project_id).order_by(Intent.created_at)
+        ).first()
+        assert bootstrap is not None
+        bootstrap.status = "COMPLETED"
+        session.add(bootstrap)
+        session.commit()
         BlackboardRepository().upsert_fact(session, project_id=project_id, statement="new graph evidence")
-        first = ProjectReasoner().run(session, project_id=project_id)
-        second = ProjectReasoner().run(session, project_id=project_id)
+        first = ProjectReasoner().run(session, project_id=project_id, phase=2)
+        second = ProjectReasoner().run(session, project_id=project_id, phase=2)
+        created = [session.get(Intent, intent_id) for intent_id in first["created_intent_ids"]]
 
     assert first["status"] == "proposed"
-    assert len(first["created_intent_ids"]) == 2
-    assert first["details"]["open_intents"] == 1
-    assert first["details"]["requested_intents"] == 2
+    assert len(first["created_intent_ids"]) == 3
+    assert first["details"]["open_intents"] == 0
+    assert first["details"]["requested_intents"] == 3
+    assert first["details"]["current_phase"] == 2
+    assert all(intent is not None and intent.budget["phase"] == 2 for intent in created)
+    assert all(intent is not None and intent.capability_tags for intent in created)
+    assert "blackboard.query" in prompts[0]["allowed_capabilities"]
     assert second["status"] == "unchanged"
 
 
-def test_reason_fills_empty_model_plan_with_playbook_branch(monkeypatch) -> None:
+def test_reason_waits_for_bootstrap_despite_import_fact(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={
+                "name": "bootstrap-fence",
+                "goal": "do not fan out before bootstrap",
+                "multi_agent_exploration_enabled": True,
+            },
+        ).json()["id"]
+
+    monkeypatch.setattr(
+        "aurora.services.project_reasoner.chat_completion",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("planner must not run before bootstrap")),
+    )
+    with Session(engine) as session:
+        BlackboardRepository().upsert_fact(
+            session,
+            project_id=project_id,
+            statement="Imported challenge metadata is available.",
+            category="import",
+        )
+        result = ProjectReasoner().run(session, project_id=project_id)
+
+    assert result == {"status": "waiting_for_bootstrap", "created_intent_ids": []}
+
+
+def test_reason_respects_valid_empty_model_plan_as_noop(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
     monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -208,6 +411,13 @@ def test_reason_fills_empty_model_plan_with_playbook_branch(monkeypatch) -> None
         lambda **kwargs: {"choices": [{"message": {"content": '{"intents": []}'}}]},
     )
     with Session(engine) as session:
+        bootstrap = session.exec(
+            select(Intent).where(Intent.project_id == project_id).order_by(Intent.created_at)
+        ).first()
+        assert bootstrap is not None
+        bootstrap.status = "COMPLETED"
+        session.add(bootstrap)
+        session.commit()
         BlackboardRepository().upsert_fact(
             session,
             project_id=project_id,
@@ -218,10 +428,49 @@ def test_reason_fills_empty_model_plan_with_playbook_branch(monkeypatch) -> None
             select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
         ).all()
 
-    assert result["status"] == "proposed"
+    assert result["status"] == "noop"
     assert result["details"]["model_created"] == 0
-    assert result["details"]["fallback_created"] == 1
-    assert len(pending) == 2
+    assert result["details"]["fallback_created"] == 0
+    assert len(pending) == 0
+
+
+def test_reason_records_invalid_candidate_and_uses_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = TestClient(create_app())
+    with client:
+        project_id = client.post(
+            "/api/projects",
+            json={
+                "name": "invalid-candidate",
+                "goal": "inspect an authorized web target",
+                "challenge_type": "web",
+                "multi_agent_exploration_enabled": True,
+                "max_parallel_explorers": 2,
+            },
+        ).json()["id"]
+
+    monkeypatch.setattr(
+        "aurora.services.project_reasoner.chat_completion",
+        lambda **kwargs: {"choices": [{"message": {"content": '{"intents":[42]}'}}]},
+    )
+    with Session(engine) as session:
+        bootstrap = session.exec(
+            select(Intent).where(Intent.project_id == project_id).order_by(Intent.created_at)
+        ).first()
+        assert bootstrap is not None
+        bootstrap.status = "COMPLETED"
+        session.add(bootstrap)
+        session.commit()
+        BlackboardRepository().upsert_fact(session, project_id=project_id, statement="HTTP is reachable.")
+        result = ProjectReasoner().run(session, project_id=project_id)
+
+    assert result["status"] == "proposed"
+    assert result["details"]["fallback_created"] == 2
+    assert result["details"]["model_candidate_rejections"] == [
+        {"index": 0, "reason": "candidate_not_object"}
+    ]
 
 
 def test_real_reason_worker_blackboard_loop_runs_parallel_batches(monkeypatch) -> None:
@@ -291,7 +540,7 @@ def test_real_reason_worker_blackboard_loop_runs_parallel_batches(monkeypatch) -
         ).all()
 
     assert result.stop_reason == "max_iterations"
-    assert [event.payload_json["worker_count"] for event in batches] == [2, 2]
-    assert len(workers) == 4
-    assert len(reason_events) == 2
+    assert [event.payload_json["worker_count"] for event in batches] == [1, 2]
+    assert len(workers) == 3
+    assert len(reason_events) == 1
     assert all(event.payload_json["status"] == "proposed" for event in reason_events)

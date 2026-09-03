@@ -110,7 +110,7 @@ def test_capacity_wait_uses_backoff_without_triggering_no_progress(monkeypatch) 
     monkeypatch.setattr(
         autorunner_module,
         "run_project_exploration_step",
-        lambda session, project_id, run_id: {"status": "capacity_wait"},
+        lambda session, project_id, run_id, on_dispatch=None: {"status": "capacity_wait"},
     )
 
     with Session(engine) as session:
@@ -123,10 +123,81 @@ def test_capacity_wait_uses_backoff_without_triggering_no_progress(monkeypatch) 
             project_id=project.id,
             limits=AutoRunLimits(max_iterations=2, no_progress_limit=1),
         )
+        capacity_events = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project.id,
+                WorkerEvent.event_type == "autorun.capacity_wait_started",
+            )
+        ).all()
+        iteration_events = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.project_id == project.id,
+                WorkerEvent.event_type.in_([
+                    "autorun.iteration.started",
+                    "autorun.iteration.completed",
+                ]),
+            )
+        ).all()
 
     assert result.stop_reason == "max_iterations"
     assert result.iterations == 2
     assert sum(sleeps) > 0.7
+    assert len(capacity_events) == 1
+    assert iteration_events == []
+
+
+def test_autorun_passes_scheduler_phase_to_reasoner(monkeypatch) -> None:
+    phases: list[int | None] = []
+    monkeypatch.setattr(
+        "aurora.services.autorunner.ProjectReasoner.run",
+        lambda self, session, project_id, phase=None: phases.append(phase) or {"status": "unchanged"},
+    )
+    monkeypatch.setattr(
+        "aurora.services.autorunner.run_project_exploration_step",
+        lambda session, project_id, run_id, on_dispatch=None: (
+            on_dispatch() or {"status": "idle"}
+        ),
+    )
+    with Session(engine) as session:
+        project = Project(name="phase-two", goal="propagate phase")
+        session.add_all([project, Intent(project_id=project.id, objective="pending")])
+        session.commit()
+
+        AutoRunnerService().run_until_stop(
+            session,
+            project_id=project.id,
+            limits=AutoRunLimits(max_iterations=1, phase=2),
+        )
+
+    assert phases == [2]
+
+
+def test_autorun_preserves_reason_noop_without_seeding_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "aurora.services.autorunner.ProjectReasoner.run",
+        lambda self, session, project_id, phase=None: {"status": "noop"},
+    )
+    monkeypatch.setattr(
+        "aurora.services.autorunner.ManagerService.run_project",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("manager must not override noop")),
+    )
+    with Session(engine) as session:
+        project = Project(name="reason-noop", goal="stop cleanly")
+        session.add(project)
+        session.commit()
+
+        result = AutoRunnerService().run_until_stop(
+            session,
+            project_id=project.id,
+            limits=AutoRunLimits(max_iterations=1),
+        )
+        pending = session.exec(
+            select(Intent).where(Intent.project_id == project.id, Intent.status == "PENDING")
+        ).all()
+
+    assert result.stop_reason == "no_runnable_work"
+    assert result.iterations == 0
+    assert pending == []
 
 
 def test_autorun_background_start_reports_status() -> None:

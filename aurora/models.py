@@ -33,6 +33,20 @@ class OpenVPNSetting(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=now_utc)
 
 
+class AgentRuntimeSetting(SQLModel, table=True):
+    id: str = Field(default="global", primary_key=True)
+    multi_agent_exploration_enabled: bool = False
+    max_global_workers: int = 4
+    default_max_project_workers: int = 2
+    default_max_reason_intents: int = 3
+    default_max_pending_intents: int = 8
+    subagents_enabled: bool = False
+    default_max_subagents_per_worker: int = 2
+    default_max_subagents_concurrent: int = 2
+    max_challenge_group_concurrent: int = 2
+    updated_at: datetime = Field(default_factory=now_utc)
+
+
 class SchemaVersion(SQLModel, table=True):
     id: str = Field(default="aurora", primary_key=True)
     version: int = 1

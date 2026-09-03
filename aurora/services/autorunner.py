@@ -128,9 +128,21 @@ class AutoRunnerService:
                 events.append(payload)
                 return AutoRunResult("blocked", "observer_escalate", iteration - 1, project_id, events)
 
-            reason_decision = ProjectReasoner().run(session, project_id=project_id)
+            reason_decision = ProjectReasoner().run(
+                session,
+                project_id=project_id,
+                phase=limits.phase,
+            )
             manager_decision = None
             if not self._has_pending_intent(session, project_id):
+                if reason_decision.get("status") == "noop":
+                    self._event(
+                        session,
+                        project_id,
+                        "autorun.stopped",
+                        {"reason": "no_runnable_work", "iteration": iteration - 1},
+                    )
+                    return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
                 manager_decision = ManagerService().run_project(session, project_id=project_id)
                 if not self._has_pending_intent(session, project_id) and not recovery_intent_seeded:
                     self._seed_fallback_intent(
@@ -155,17 +167,51 @@ class AutoRunnerService:
                 return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
 
             before = self._counts(session, project_id)
-            self._event(session, project_id, "autorun.iteration.started", {"iteration": iteration})
-            run_result = run_project_exploration_step(session, project_id=project_id, run_id=run_id)
+            run_result = run_project_exploration_step(
+                session,
+                project_id=project_id,
+                run_id=run_id,
+                on_dispatch=lambda: self._event(
+                    session,
+                    project_id,
+                    "autorun.iteration.started",
+                    {"iteration": iteration},
+                ),
+            )
             after = self._counts(session, project_id)
             progress = self._progress(before, after)
             if run_result.get("status") == "capacity_wait":
-                pass
+                capacity_wait_count += 1
+                if capacity_wait_count == 1:
+                    self._event(
+                        session,
+                        project_id,
+                        "autorun.capacity_wait_started",
+                        {"iteration": iteration},
+                    )
+                retry_delay = min(5.0, 0.25 * (2 ** min(capacity_wait_count - 1, 5)))
+                if deadline_at is not None:
+                    retry_delay = min(retry_delay, max(0.0, (deadline_at - now_utc()).total_seconds()))
+                wait_until = time.monotonic() + retry_delay
+                while time.monotonic() < wait_until:
+                    if should_stop and should_stop():
+                        self._event(session, project_id, "autorun.stopped", {"reason": "manual_stop", "iteration": iteration})
+                        return AutoRunResult("stopped", "manual_stop", iteration, project_id, events)
+                    time.sleep(max(0.0, min(0.1, wait_until - time.monotonic())))
+                continue
             elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"] or progress["new_checkpoints"]:
                 no_progress_count = 0
             else:
                 no_progress_count += 1
 
+            if capacity_wait_count:
+                self._event(
+                    session,
+                    project_id,
+                    "autorun.capacity_wait_ended",
+                    {"iteration": iteration, "wait_iterations": capacity_wait_count},
+                )
+                capacity_wait_count = 0
             payload = {
                 "iteration": iteration,
                 "observer": {"decision": "DEFERRED", "reason": "The Solver owns route selection inside this turn."},
@@ -184,19 +230,6 @@ class AutoRunnerService:
                 if project.status == "FLAG_READY":
                     return AutoRunResult("candidate_ready", "candidate_ready", iteration, project_id, events)
                 return AutoRunResult("completed", "project_completed", iteration, project_id, events)
-            if run_result.get("status") == "capacity_wait":
-                capacity_wait_count += 1
-                retry_delay = min(5.0, 0.25 * (2 ** min(capacity_wait_count - 1, 5)))
-                if deadline_at is not None:
-                    retry_delay = min(retry_delay, max(0.0, (deadline_at - now_utc()).total_seconds()))
-                wait_until = time.monotonic() + retry_delay
-                while time.monotonic() < wait_until:
-                    if should_stop and should_stop():
-                        self._event(session, project_id, "autorun.stopped", {"reason": "manual_stop", "iteration": iteration})
-                        return AutoRunResult("stopped", "manual_stop", iteration, project_id, events)
-                    time.sleep(max(0.0, min(0.1, wait_until - time.monotonic())))
-                continue
-            capacity_wait_count = 0
             if run_result.get("status") == "idle":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)

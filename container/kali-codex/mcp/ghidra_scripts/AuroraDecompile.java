@@ -20,7 +20,13 @@ public class AuroraDecompile extends GhidraScript {
         try {
             Address address = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(args[0]);
             function = currentProgram.getFunctionManager().getFunctionContaining(address);
+            if (function == null) {
+                Address rebased = currentProgram.getImageBase().add(address.getOffset());
+                function = currentProgram.getFunctionManager().getFunctionContaining(rebased);
+            }
         } catch (Exception ignored) {
+        }
+        if (function == null) {
             for (Function candidate : currentProgram.getFunctionManager().getFunctions(true)) {
                 if (candidate.getName().equals(args[0])) {
                     function = candidate;

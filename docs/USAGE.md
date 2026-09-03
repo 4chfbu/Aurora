@@ -392,6 +392,8 @@ AURORA_FOFA_KEY=your-fofa-key
 
 ### 同容器 Subagents
 
+Web 左侧的 `Agent 分配` 面板可随时修改全局开关与默认值、当前项目的 Explore/Reason/Pending/Subagent 配额，以及当前题组并发数。配置保存在数据库中，并从下一次派发开始生效；降低上限不会强制终止已经运行的 Worker。环境变量只用于首次初始化这些持久化设置。
+
 先开启全局开关，再在创建项目时传入 `subagents_enabled: true`：
 
 ```dotenv
@@ -415,7 +417,7 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=2
 }
 ```
 
-没有任何共享事实或 Checkpoint 时，首次 Bootstrap 保持单 Worker；靶机、Hint 或前一轮已经提供共享状态时，Reason 会立即补齐并行槽位。每批同级 Explore Worker 分别认领非重叠 Intent，通过实时 Blackboard 发布事实、反证和 Checkpoint；批次结束后 Reason 汇总全部结果并规划下一批，直到完成或达到阶段截止。Web 新建项目区域也提供对应开关和并发数输入。
+每个项目始终先运行唯一的 Bootstrap Worker；导入信息、靶机状态或 Hint 形成的初始 Fact 不会提前触发 Reason。Bootstrap 结束后，Reason 才按当前阶段和全局容量提出非重叠 Intent；合法空计划表示本轮无需继续，不会被固定 fallback 覆盖。同题 Explore Worker 可在 Blackboard 中直接引用同项目 Artifact ID，或引用自己 `/workspace` 内的文件，控制面会安全登记为 Artifact；其他 Worker 可用 `read_artifact` 读取有界文本预览。调度器为并发项目保留公平份额，并在项目进入 `FLAG_READY` 或其他终态后立即停止同批 Worker。Web 新建项目区域也提供对应开关和并发数输入。
 
 TSecBench 批量导入和 Evaluation 在全局开关启用时会自动为新项目开启该机制，无需逐题设置项目开关。
 

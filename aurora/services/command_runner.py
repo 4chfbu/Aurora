@@ -352,6 +352,7 @@ class KaliContainerRunner(CommandRunner):
         workspace = cwd.resolve()
         relative_cwd = workspace.relative_to(Path.cwd().resolve())
         container_cwd = Path("/workspace")
+        (workspace / "runtime" / "home").mkdir(parents=True, exist_ok=True)
         workspace_stat = workspace.stat()
         vpn_network = openvpn_gateway_registry.worker_network()
         selected_network = vpn_network or self.network

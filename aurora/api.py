@@ -21,6 +21,7 @@ from aurora.config import get_settings
 from aurora.db import SCHEMA_VERSION, engine, get_session, init_db
 from aurora.models import (
     Artifact,
+    AgentRuntimeSetting,
     Attempt,
     AttemptCheckpoint,
     ContextSnapshot,
@@ -56,6 +57,7 @@ from aurora.services.blackboard_repository import route_fingerprint
 from aurora.services.observer import ObserverService
 from aurora.services.manager import ManagerService
 from aurora.services.autorunner import AutoRunLimits, AutoRunnerService
+from aurora.services.agent_runtime import agent_runtime_settings, update_agent_runtime_settings
 from aurora.services.autorun_registry import autorun_registry
 from aurora.services.api_instance_lock import acquire_api_instance_lock
 from aurora.services.container_control import get_project_container_logs, stop_project_containers
@@ -236,6 +238,46 @@ class SlabMatchConfigRequest(BaseModel):
 
 class ConcurrencyConfigRequest(BaseModel):
     max_agents: int = Field(default=2, ge=1, le=8)
+
+
+class AgentRuntimeSettingsRequest(BaseModel):
+    multi_agent_exploration_enabled: bool
+    max_global_workers: int = Field(ge=1, le=32)
+    default_max_project_workers: int = Field(ge=1, le=32)
+    default_max_reason_intents: int = Field(ge=1, le=32)
+    default_max_pending_intents: int = Field(ge=1, le=128)
+    subagents_enabled: bool
+    default_max_subagents_per_worker: int = Field(ge=1, le=16)
+    default_max_subagents_concurrent: int = Field(ge=1, le=16)
+    max_challenge_group_concurrent: int = Field(ge=1, le=32)
+
+    @model_validator(mode="after")
+    def validate_worker_limits(self) -> "AgentRuntimeSettingsRequest":
+        if self.default_max_project_workers > self.max_global_workers:
+            raise ValueError("default_max_project_workers cannot exceed max_global_workers")
+        if self.default_max_subagents_concurrent > self.default_max_subagents_per_worker:
+            raise ValueError("default_max_subagents_concurrent cannot exceed default_max_subagents_per_worker")
+        return self
+
+
+class ProjectRuntimePolicyRequest(BaseModel):
+    subagents_enabled: bool
+    max_subagents_per_worker: int = Field(ge=1, le=16)
+    max_subagents_concurrent: int = Field(ge=1, le=16)
+    multi_agent_exploration_enabled: bool
+    max_parallel_explorers: int = Field(ge=1, le=32)
+    max_reason_intents: int = Field(ge=1, le=32)
+    max_pending_intents: int = Field(ge=1, le=128)
+
+    @model_validator(mode="after")
+    def validate_project_limits(self) -> "ProjectRuntimePolicyRequest":
+        if self.max_subagents_concurrent > self.max_subagents_per_worker:
+            raise ValueError("max_subagents_concurrent cannot exceed max_subagents_per_worker")
+        return self
+
+
+class ChallengeGroupRuntimePolicyRequest(BaseModel):
+    max_concurrent: int = Field(ge=1, le=32)
 
 
 class FlagPrefixesRequest(BaseModel):
@@ -516,15 +558,27 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
 
     @app.get("/api/settings/concurrency")
-    def get_concurrency_config() -> dict[str, Any]:
-        return public_concurrency_config()
+    def get_concurrency_config(session: Session = Depends(get_session)) -> dict[str, Any]:
+        runtime = agent_runtime_settings(session)
+        config = public_concurrency_config()
+        return {**config, "max_agents": runtime.max_challenge_group_concurrent, "source": "runtime"}
 
     @app.put("/api/settings/concurrency")
-    def update_concurrency_config(payload: ConcurrencyConfigRequest) -> dict[str, Any]:
+    def update_concurrency_config(payload: ConcurrencyConfigRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
-            return configure_concurrency(max_agents=payload.max_agents)
+            config = configure_concurrency(max_agents=payload.max_agents)
+            update_agent_runtime_settings(session, {"max_challenge_group_concurrent": payload.max_agents})
+            return config
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/settings/agents")
+    def get_agent_settings(session: Session = Depends(get_session)) -> AgentRuntimeSetting:
+        return agent_runtime_settings(session)
+
+    @app.put("/api/settings/agents")
+    def update_agent_settings(payload: AgentRuntimeSettingsRequest, session: Session = Depends(get_session)) -> AgentRuntimeSetting:
+        return update_agent_runtime_settings(session, payload.model_dump())
 
     @app.get("/api/settings/flag-prefixes")
     def get_flag_prefixes() -> dict[str, Any]:
@@ -812,6 +866,22 @@ def create_app() -> FastAPI:
         }
         return {"group": group, "items": items, "projects": projects, "candidate_flags": candidate_flags, "flag_candidates": group_candidates, "events": events, "background": challenge_group_registry.status(group_id)}
 
+    @app.put("/api/challenge-groups/{group_id}/runtime-policy")
+    def update_challenge_group_runtime_policy(
+        group_id: str,
+        payload: ChallengeGroupRuntimePolicyRequest,
+        session: Session = Depends(get_session),
+    ) -> ChallengeGroup:
+        group = session.get(ChallengeGroup, group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="challenge group not found")
+        group.max_concurrent = payload.max_concurrent
+        group.updated_at = now_utc()
+        session.add(group)
+        session.commit()
+        session.refresh(group)
+        return group
+
     @app.get("/api/challenge-groups/{group_id}/flag-prefixes")
     def get_group_flag_prefixes(group_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
@@ -920,6 +990,23 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="runtime policy not found")
         return policy
 
+    @app.put("/api/projects/{project_id}/runtime-policy")
+    def update_runtime_policy(
+        project_id: str,
+        payload: ProjectRuntimePolicyRequest,
+        session: Session = Depends(get_session),
+    ) -> ProjectRuntimePolicy:
+        _require_project(session, project_id)
+        policy = session.exec(select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)).first()
+        if policy is None:
+            raise HTTPException(status_code=404, detail="runtime policy not found")
+        for name, value in payload.model_dump().items():
+            setattr(policy, name, value)
+        session.add(policy)
+        session.commit()
+        session.refresh(policy)
+        return policy
+
     @app.post("/api/projects/{project_id}/browser/session")
     def set_browser_session(project_id: str, payload: BrowserSessionRequest, session: Session = Depends(get_session)) -> dict[str, str]:
         _require_project(session, project_id)
@@ -939,6 +1026,23 @@ def create_app() -> FastAPI:
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         return service.query(session, worker=worker, attempt=attempt)
+
+    @app.get("/internal/workers/{worker_id}/artifacts/{artifact_id}")
+    def worker_read_artifact(
+        worker_id: str,
+        artifact_id: str,
+        max_bytes: int = 64_000,
+        authorization: str | None = Header(default=None),
+        session: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        service = WorkerControlService()
+        try:
+            worker, _ = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+            return service.read_artifact(session, worker=worker, artifact_id=artifact_id, max_bytes=max_bytes)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/internal/workers/{worker_id}/facts")
     def worker_append_fact(worker_id: str, payload: WorkerFactRequest, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:

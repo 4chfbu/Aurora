@@ -6,7 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from aurora.config import get_settings
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 settings = get_settings()

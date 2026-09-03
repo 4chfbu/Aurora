@@ -1,4 +1,5 @@
 import json
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,20 @@ def test_worker_container_environment_override_selects_role_model(monkeypatch) -
     assert "AURORA_CODEX_MODEL_CONTEXT_WINDOW=1000000" in args
 
 
+def test_blackboard_mcp_forwards_worker_control_environment() -> None:
+    config = tomllib.loads(Path("container/kali-codex/codex-config.toml").read_text(encoding="utf-8"))
+    servers = config["mcp_servers"]
+    blackboard = servers["aurora_blackboard"]
+
+    assert set(blackboard["env_vars"]) == {
+        "AURORA_WORKER_CONTROL_BASE_URL",
+        "AURORA_WORKER_ID",
+        "AURORA_WORKER_CONTROL_TOKEN",
+    }
+    assert "env_vars" not in servers["aurora_reverse"]
+    assert "env_vars" not in servers["aurora_debug"]
+
+
 def test_worker_container_runs_as_workspace_owner(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "codex-workspaces" / "proj_test" / "worker_test"
@@ -69,6 +84,7 @@ def test_worker_container_runs_as_workspace_owner(monkeypatch, tmp_path) -> None
     stat = workspace.stat()
     assert command[user_index + 1] == f"{stat.st_uid}:{stat.st_gid}"
     assert "HOME=/workspace/runtime/home" in command
+    assert workspace.joinpath("runtime", "home").is_dir()
 
 
 def test_streaming_runner_enforces_soft_timeout(monkeypatch, tmp_path) -> None:
@@ -551,6 +567,16 @@ def test_codex_wrapper_streams_json_and_can_resume() -> None:
     assert 'model_reasoning_effort=' in wrapper
 
 
+def test_codex_wrapper_registers_explicit_custom_model_metadata() -> None:
+    wrapper = Path("scripts/codex-via-cc-switch.sh").read_text(encoding="utf-8")
+
+    assert "codex debug models | jq" in wrapper
+    assert 'model_catalog_json=' in wrapper
+    assert '.slug = $model' in wrapper
+    assert '.context_window = $context_window' in wrapper
+    assert '.auto_compact_token_limit = $auto_compact_token_limit' in wrapper
+
+
 def test_cc_switch_entrypoint_is_restart_safe() -> None:
     entrypoint = Path("container/cc-switch/entrypoint.sh").read_text(encoding="utf-8")
 
@@ -903,6 +929,29 @@ class ExecuteWithFallbackRunner(CommandRunner):
         return CommandResult(command, command, str(cwd), "", "", 0, "test")
 
 
+class StdoutOnlyConcludeRunner(ConcludeFallbackRunner):
+    def run_streaming(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout: int | None,
+        on_output,
+        soft_timeout: int | None = None,
+        finalize_grace: int = 10,
+    ) -> CommandResult:
+        self.commands.append(command)
+        return CommandResult(
+            command=command,
+            executed_command=command,
+            cwd=str(cwd),
+            stdout=json.dumps(self.payload),
+            stderr="",
+            exit_code=0,
+            backend="test",
+        )
+
+
 def _conclude_fallback_state(engine, *, thread_id: str | None = "thread_current"):
     project_id = "proj_conclude"
     project = Project(id=project_id, name="conclude", goal="preserve evidence")
@@ -957,7 +1006,6 @@ def test_codex_conclude_fallback_recovers_same_thread_output(monkeypatch, tmp_pa
             "reason_summary": "The prior thread already contained the endpoint observation.",
             "next_tool_plan": [],
         },
-        "tool_requests": [{"tool_name": "sandbox.exec", "request": {"command": "should-not-run"}}],
     }
     runner = ConcludeFallbackRunner(payload)
     runtime = CodexHarnessRuntime(
@@ -1005,10 +1053,15 @@ def test_codex_conclude_fallback_recovers_same_thread_output(monkeypatch, tmp_pa
     assert outcome.structured_output is not None
     assert outcome.structured_output["summary"].startswith("Recovered")
     assert outcome.structured_output["tool_requests"] == []
-    assert outcome.diagnostic["dropped_tool_requests"] == 1
     assert "AURORA_CODEX_RESUME_THREAD_ID=thread_current" in runner.commands[0]
+    assert "aurora-conclude-output-schema.json" in runner.commands[0]
     assert "aurora-conclude-last-message.json" in runner.commands[0]
     assert "Do not run commands" in workspace.joinpath("aurora-conclude.md").read_text(encoding="utf-8")
+    conclude_schema = json.loads(
+        workspace.joinpath("aurora-conclude-output-schema.json").read_text(encoding="utf-8")
+    )
+    assert "tool_requests" not in conclude_schema["properties"]
+    assert "subagent_reports" not in conclude_schema["properties"]
     assert [event.event_type for event in events] == [
         "attempt.conclude_fallback_started",
         "attempt.conclude_fallback_completed",
@@ -1091,6 +1144,49 @@ def test_codex_conclude_fallback_failure_keeps_primary_result(monkeypatch, tmp_p
         "attempt.conclude_fallback_started",
         "attempt.conclude_fallback_failed",
     ]
+    get_settings.cache_clear()
+
+
+def test_codex_conclude_fallback_rejects_stdout_event_as_final_output(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AURORA_CODEX_CONCLUDE_FALLBACK_SECONDS", "45")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    project_id = _conclude_fallback_state(engine)
+    payload = {
+        "status": "partial",
+        "summary": "This valid-looking object was emitted on the event stream.",
+        "tool_requests": [],
+    }
+    runner = StdoutOnlyConcludeRunner(payload)
+    runtime = CodexHarnessRuntime(artifact_store=ArtifactStore(tmp_path / "artifacts"), command_runner=runner)
+    workspace = tmp_path / "codex-workspaces" / project_id / "worker_conclude"
+    workspace.mkdir(parents=True)
+    snapshot = SimpleNamespace(
+        project_id=project_id,
+        sections_json={"current_intent": {"objective": "recover"}},
+        visible_tools_json=[],
+    )
+    primary = CommandResult("primary", "primary", str(workspace), "", "", 124, "test", "command_timed_out")
+
+    with Session(engine) as session:
+        outcome = runtime._try_conclude_fallback(
+            session,
+            worker=session.get(Worker, "worker_conclude"),
+            attempt=session.get(Attempt, "attempt_conclude"),
+            snapshot=snapshot,
+            workspace=workspace,
+            model="test-model",
+            runner=runner,
+            primary_completed=primary,
+            primary_diagnostic={"source": None},
+        )
+
+    assert outcome.attempted is True
+    assert outcome.recovered is False
+    assert outcome.structured_output is None
+    assert outcome.diagnostic["output"]["source"] is None
     get_settings.cache_clear()
 
 

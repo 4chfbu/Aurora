@@ -31,6 +31,7 @@ from aurora.services.harvester_runner import AutoRunnerHarvester, HarvesterRunne
 from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.suspend_guard import SuspendGapDetector
+from aurora.services.agent_runtime import agent_runtime_settings
 
 
 @dataclass
@@ -83,6 +84,13 @@ class ChallengeGroupRunner:
             return
 
         while True:
+            session.expire_all()
+            group = session.get(ChallengeGroup, group_id)
+            if group is None:
+                raise ValueError("challenge group not found")
+            if self._max_workers(session, group) > 1:
+                self._run_concurrent(session, group_id=group_id, should_stop=should_stop, on_project=on_project)
+                return
             if should_stop and should_stop():
                 self._close_running_environments(session, group_id=group_id)
                 group.status = "STOPPED"
@@ -400,7 +408,8 @@ class ChallengeGroupRunner:
                         return item_id, wait_status, warning
                     self._maybe_fetch_hint(worker_session, item=current, project=project)
                     task = self._task_payload(worker_session, item=current, project=project)
-                    self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": max_workers})
+                    dispatch_limit = self._max_workers(worker_session, current_group)
+                    self._event(worker_session, group_id, current.id, "group.item.dispatched", {"project_id": project.id, "phase": current.phase, "environment_warning": warning, "max_concurrent": dispatch_limit})
                     worker_session.commit()
                     attempts_before = self._attempt_count(worker_session, project.id)
                     result = self.harvester.run(worker_session, project_id=project.id, task=task, limits=limits, should_stop=run_should_stop)
@@ -420,7 +429,7 @@ class ChallengeGroupRunner:
                 self._resolve_phase(worker_session, group=current_group, item=current, project=project, outcome=outcome, reason=reason)
                 return item_id, outcome, reason
 
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"aurora-group-{group_id}") as pool:
+        with ThreadPoolExecutor(max_workers=32, thread_name_prefix=f"aurora-group-{group_id}") as pool:
             futures: dict[Future[tuple[str, str, str]], tuple[str, int]] = {}
             while True:
                 if not stop_requested and should_stop and should_stop():
@@ -450,6 +459,7 @@ class ChallengeGroupRunner:
                 group = session.get(ChallengeGroup, group_id)
                 if group is None:
                     raise ValueError("challenge group not found")
+                max_workers = self._max_workers(session, group)
 
                 if stop_requested and not futures:
                     self._close_running_environments(session, group_id=group_id)
@@ -685,6 +695,7 @@ class ChallengeGroupRunner:
     @classmethod
     def _max_workers(cls, session: Session, group: ChallengeGroup) -> int:
         settings = get_settings()
+        runtime = agent_runtime_settings(session)
         if cls._is_tsecbench_group(session, group.id):
             return min(
                 max(1, int(group.max_concurrent or 1)),
@@ -697,7 +708,7 @@ class ChallengeGroupRunner:
             )
         return min(
             max(1, int(group.max_concurrent or 1)),
-            max(1, int(settings.max_challenge_group_concurrent or 1)),
+            max(1, int(runtime.max_challenge_group_concurrent or 1)),
         )
 
     @staticmethod

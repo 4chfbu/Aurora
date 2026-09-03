@@ -20,6 +20,7 @@ from aurora.services.subagent_collector import SubagentCollector
 from aurora.services.worker_runtime import get_worker_runtime
 from aurora.services.tool_profiles import worker_preflight
 from aurora.services.project_run_control import project_run_control
+from aurora.services.agent_runtime import agent_runtime_settings
 
 
 def _execution_budget(intent: object) -> dict:
@@ -166,22 +167,22 @@ def create_project_with_bootstrap(
 
     scope = AuthorizationScope(project_id=project.id, allowed_hosts=allowed_hosts or [])
     session.add(scope)
-    settings = get_settings()
+    runtime = agent_runtime_settings(session)
     session.add(
         ProjectRuntimePolicy(
             project_id=project.id,
-            subagents_enabled=bool(subagents_enabled and settings.subagents_enabled),
-            max_subagents_per_worker=settings.subagents_max_per_worker,
-            max_subagents_concurrent=settings.subagents_max_concurrent,
+            subagents_enabled=bool(subagents_enabled and runtime.subagents_enabled),
+            max_subagents_per_worker=runtime.default_max_subagents_per_worker,
+            max_subagents_concurrent=runtime.default_max_subagents_concurrent,
             multi_agent_exploration_enabled=bool(
-                multi_agent_exploration_enabled and settings.multi_agent_exploration_enabled
+                multi_agent_exploration_enabled and runtime.multi_agent_exploration_enabled
             ),
             max_parallel_explorers=min(
-                max_parallel_explorers or settings.multi_agent_max_project_workers,
-                settings.multi_agent_max_global_workers,
+                max_parallel_explorers or runtime.default_max_project_workers,
+                runtime.max_global_workers,
             ),
-            max_reason_intents=settings.multi_agent_max_reason_intents,
-            max_pending_intents=settings.multi_agent_max_pending_intents,
+            max_reason_intents=runtime.default_max_reason_intents,
+            max_pending_intents=runtime.default_max_pending_intents,
         )
     )
     session.add(ProjectCoordinationState(project_id=project.id))

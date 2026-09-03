@@ -25,6 +25,11 @@ command = "/opt/aurora-venv/bin/python"
 args = ["/opt/aurora-mcp/blackboard_server.py"]
 startup_timeout_sec = 20
 tool_timeout_sec = 30
+env_vars = [
+    "AURORA_WORKER_CONTROL_BASE_URL",
+    "AURORA_WORKER_ID",
+    "AURORA_WORKER_CONTROL_TOKEN",
+]
 
 [mcp_servers.aurora_blackboard.env]
 AURORA_MCP_EVENT_LOG = "/workspace/runtime/mcp-events.jsonl"

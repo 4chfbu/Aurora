@@ -1,6 +1,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -45,8 +46,21 @@ def query() -> dict[str, Any]:
 
 
 @mcp.tool()
+def read_artifact(artifact_id: str, max_bytes: int = 64_000) -> dict[str, Any]:
+    """Read a bounded text preview of a same-project Artifact referenced by the Blackboard."""
+    payload = {"artifact_id": artifact_id, "max_bytes": max_bytes}
+    encoded_id = urllib.parse.quote(artifact_id, safe="")
+    return audited(
+        "aurora_blackboard",
+        "read_artifact",
+        payload,
+        lambda: _request(f"/artifacts/{encoded_id}?max_bytes={max_bytes}"),
+    )
+
+
+@mcp.tool()
 def append_fact(statement: str, evidence_refs: list[str], category: str = "analysis", confidence: float = 0.7) -> dict[str, Any]:
-    """Persist an evidence-backed fact immediately to the project Blackboard."""
+    """Persist a fact using same-project Artifact IDs or files inside this Worker's /workspace."""
     payload = {"statement": statement, "evidence_refs": evidence_refs, "category": category, "confidence": confidence}
     return audited("aurora_blackboard", "append_fact", payload, lambda: _request("/facts", payload))
 
@@ -59,7 +73,7 @@ def save_checkpoint(
     next_step: str = "",
     artifact_refs: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Save current progress before a long operation or final response."""
+    """Save progress; artifact_refs may be Artifact IDs or files inside this Worker's /workspace."""
     payload = {
         "summary": summary,
         "completed_steps": completed_steps or [],

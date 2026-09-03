@@ -307,6 +307,7 @@ class CodexHarnessRuntime:
             workspace=prompt_file.parent,
         )
         tool_environment = snapshot.sections_json.get("tool_environment") or {}
+        subagent_policy = (snapshot.sections_json.get("operating_mode") or {}).get("subagents") or {}
         profile = str(tool_environment.get("profile") or "heavy")
         runner = self.command_runner or AutoCommandRunner(
             prefer_kali=True,
@@ -321,6 +322,9 @@ class CodexHarnessRuntime:
                 "AURORA_WORKER_ID": worker.id,
                 "AURORA_WORKER_CONTROL_TOKEN": control_token,
                 "AURORA_CODEX_RESUME_THREAD_ID": resume_thread_id or "",
+                "AURORA_SUBAGENTS_ENABLED": "true" if subagent_policy.get("enabled") else "false",
+                "AURORA_SUBAGENTS_MAX_PER_WORKER": str(max(1, int(subagent_policy.get("max_per_worker") or 1))),
+                "AURORA_SUBAGENTS_MAX_CONCURRENT": str(max(1, int(subagent_policy.get("max_concurrent") or 1))),
             },
         )
         try:
@@ -1069,12 +1073,19 @@ class CodexHarnessRuntime:
             return ConcludeFallbackOutcome(False, False, diagnostic)
 
         prompt_file = self._write_conclude_prompt(snapshot, workspace)
+        output_schema_file = workspace / "aurora-conclude-output-schema.json"
+        conclude_schema = self._conclude_json_schema()
+        output_schema_file.write_text(
+            json.dumps(conclude_schema, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         output_file = workspace / "aurora-conclude-last-message.json"
         if output_file.exists():
             output_file.unlink()
         command = self._render_command(
             prompt_file,
             model=model,
+            output_schema_filename=output_schema_file.name,
             last_message_filename=output_file.name,
         )
         command = f"AURORA_CODEX_RESUME_THREAD_ID={shlex.quote(thread_id)} {command}"
@@ -1146,6 +1157,8 @@ class CodexHarnessRuntime:
                 session=session,
                 worker=worker,
                 attempt=attempt,
+                allow_stream_fallback=False,
+                output_schema=conclude_schema,
             )
         except Exception as exc:
             session.rollback()
@@ -1211,14 +1224,12 @@ class CodexHarnessRuntime:
         objective = str(snapshot.sections_json.get("current_intent", {}).get("objective") or "current intent")
         prompt_file = workspace / "aurora-conclude.md"
         prompt_file.write_text(
-            "# Conclude fallback\n\n"
             "The previous solver turn ended without a schema-valid final response. Stop investigating now. "
             "Use only evidence and observations already present in this same Codex thread.\n\n"
             "Rules:\n"
             "- Do not run commands, call tools or MCP servers, browse, inspect new files, wait, or start subagents.\n"
             "- Do not claim facts or flags that were not already confirmed.\n"
             "- Return one raw JSON object matching the supplied output schema and nothing else.\n"
-            "- Set tool_requests and subagent_reports to empty arrays.\n"
             "- If the intent is unfinished, use status=partial and provide one concrete suggested_intent with "
             "an expected_observation, or a blocker with a concrete next_step.\n"
             "- Reference only Artifact IDs already known in the thread.\n\n"
@@ -1550,6 +1561,27 @@ class CodexHarnessRuntime:
         schema["required"] = list(schema["properties"])
         return schema
 
+    def _conclude_json_schema(self) -> dict[str, Any]:
+        full_schema = self._json_schema()
+        fields = (
+            "status",
+            "summary",
+            "fact_candidates",
+            "artifact_refs",
+            "failed_attempts",
+            "suggested_intents",
+            "candidate_flags",
+            "blockers",
+            "decision_summary",
+        )
+        properties = full_schema["properties"]
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {field: properties[field] for field in fields},
+            "required": list(fields),
+        }
+
     def _render_command(
         self,
         prompt_file: Path,
@@ -1655,6 +1687,8 @@ class CodexHarnessRuntime:
         session: Session | None = None,
         worker: Worker | None = None,
         attempt: Attempt | None = None,
+        allow_stream_fallback: bool = True,
+        output_schema: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         diagnostic: dict[str, Any] = {"source": None, "output_file": str(output_file), "output_file_exists": output_file.exists()}
         if output_file.exists():
@@ -1670,7 +1704,7 @@ class CodexHarnessRuntime:
                     # complete object before declaring the solve lost.
                     parsed = self._parse_json(raw)
                     diagnostic["tolerant_json"] = True
-                self._validate_output(parsed)
+                self._validate_output(parsed, output_schema=output_schema)
                 return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
             except json.JSONDecodeError as exc:
                 diagnostic.update({"source": "last_message_file", "error": f"invalid JSON at line {exc.lineno}, column {exc.colno}"})
@@ -1680,24 +1714,26 @@ class CodexHarnessRuntime:
                 failure_kind = "output_schema_invalid"
             except OSError as exc:
                 diagnostic.update({"source": "last_message_file", "error": str(exc)})
-        try:
-            parsed = self._parse_json(stdout)
-            self._validate_output(parsed)
-            diagnostic.update({"source": "stdout_fallback", "stdout_bytes": len(stdout.encode("utf-8", errors="replace"))})
-            return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
-        except (json.JSONDecodeError, ValueError) as exc:
-            diagnostic.setdefault("error", str(exc)[:300])
+        if allow_stream_fallback:
+            try:
+                parsed = self._parse_json(stdout)
+                self._validate_output(parsed, output_schema=output_schema)
+                diagnostic.update({"source": "stdout_fallback", "stdout_bytes": len(stdout.encode("utf-8", errors="replace"))})
+                return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
+            except (json.JSONDecodeError, ValueError) as exc:
+                diagnostic.setdefault("error", str(exc)[:300])
         # Some Codex/provider combinations emit the final assistant message to
         # stderr. The process can hit the outer timeout after emitting a result
         # but before writing --output-last-message. Recover only a schema-valid
         # full worker result; progress JSON must not become a completion result.
-        try:
-            parsed = self._parse_json(stderr)
-            self._validate_output(parsed)
-            diagnostic.update({"source": "stderr_fallback", "stderr_bytes": len(stderr.encode("utf-8", errors="replace"))})
-            return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
-        except (json.JSONDecodeError, ValueError) as exc:
-            diagnostic.setdefault("stderr_error", str(exc)[:300])
+        if allow_stream_fallback:
+            try:
+                parsed = self._parse_json(stderr)
+                self._validate_output(parsed, output_schema=output_schema)
+                diagnostic.update({"source": "stderr_fallback", "stderr_bytes": len(stderr.encode("utf-8", errors="replace"))})
+                return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
+            except (json.JSONDecodeError, ValueError) as exc:
+                diagnostic.setdefault("stderr_error", str(exc)[:300])
         # Codex emits structured provider failures (including DeepSeek's
         # reasoning_content contract error) on stdout when --json is enabled.
         # Inspect both streams so the real provider failure is not flattened
@@ -1723,10 +1759,15 @@ class CodexHarnessRuntime:
             return "provider_invalid_request"
         return None
 
-    def _validate_output(self, parsed: Any) -> None:
+    def _validate_output(
+        self,
+        parsed: Any,
+        *,
+        output_schema: dict[str, Any] | None = None,
+    ) -> None:
         if not isinstance(parsed, dict):
             raise ValueError("final output must be a JSON object")
-        allowed = set(self._json_schema()["properties"])
+        allowed = set((output_schema or self._json_schema())["properties"])
         unknown = set(parsed) - allowed
         if unknown:
             raise ValueError(f"final output has unknown fields: {', '.join(sorted(unknown))}")

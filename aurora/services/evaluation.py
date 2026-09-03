@@ -23,6 +23,7 @@ from aurora.models import (
     now_utc,
 )
 from aurora.services.demo import create_project_with_bootstrap
+from aurora.services.agent_runtime import agent_runtime_settings
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.tsecbench import TSecBenchClient
 from aurora.services.tool_profiles import manifest_sha256
@@ -159,6 +160,7 @@ class EvaluationService:
                 f"{', '.join(dirty_items)}"
             )
         settings = get_settings()
+        agent_runtime = agent_runtime_settings(session)
         config = {
             "models": {
                 role: {
@@ -202,8 +204,8 @@ class EvaluationService:
                 challenge_type=str(item.get("challenge_type") or "unknown"),
                 allowed_hosts=[],
                 hint="Use only the authorized platform instance and imported challenge evidence.",
-                multi_agent_exploration_enabled=settings.multi_agent_exploration_enabled,
-                max_parallel_explorers=settings.multi_agent_max_project_workers,
+                multi_agent_exploration_enabled=agent_runtime.multi_agent_exploration_enabled,
+                max_parallel_explorers=agent_runtime.default_max_project_workers,
             )
             meta = {**item, "platform": suite.platform, "provenance": "evaluation_snapshot"}
             group_item = ChallengeGroupItem(

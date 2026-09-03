@@ -7,29 +7,46 @@ from pydantic import ValidationError
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, AttemptCheckpoint, Fact, Intent, Project, ProjectRuntimePolicy, WorkerEvent
+from aurora.models import (
+    Artifact,
+    AttemptCheckpoint,
+    ChallengeGroupItem,
+    Fact,
+    Intent,
+    Project,
+    ProjectRuntimePolicy,
+    WorkerEvent,
+)
 from aurora.services.blackboard_repository import BlackboardRepository, normalize_text
 from aurora.services.intent_dsl import IntentDSL
 from aurora.services.llm_http import LLMRequestError, chat_completion
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.project_coordination import ProjectCoordinationService
 from aurora.services.solver_playbooks import select_playbook
+from aurora.services.agent_runtime import agent_runtime_settings
 
 
 class ProjectReasoner:
     """Run one Cairn-style Reason pass for each newly committed graph state."""
 
-    def run(self, session: Session, *, project_id: str) -> dict[str, Any]:
+    def run(self, session: Session, *, project_id: str, phase: int | None = None) -> dict[str, Any]:
         settings = get_settings()
+        runtime = agent_runtime_settings(session)
         policy = session.exec(
             select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)
         ).first()
         if not (
-            settings.multi_agent_exploration_enabled
+            runtime.multi_agent_exploration_enabled
             and policy is not None
             and policy.multi_agent_exploration_enabled
         ):
             return {"status": "disabled", "created_intent_ids": []}
+
+        bootstrap = session.exec(
+            select(Intent).where(Intent.project_id == project_id).order_by(Intent.created_at)
+        ).first()
+        if bootstrap is None or bootstrap.status not in {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}:
+            return {"status": "waiting_for_bootstrap", "created_intent_ids": []}
 
         facts = session.exec(
             select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at)
@@ -68,7 +85,7 @@ class ProjectReasoner:
             facts = session.exec(
                 select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at)
             ).all()
-            created = self._reason(session, project_id=project_id, policy=policy, facts=facts)
+            created = self._reason(session, project_id=project_id, policy=policy, facts=facts, phase=phase)
             details = getattr(self, "_last_reason_details", {})
             coordination.finish_reason(
                 session,
@@ -121,6 +138,7 @@ class ProjectReasoner:
         project_id: str,
         policy: ProjectRuntimePolicy,
         facts: list[Fact],
+        phase: int | None = None,
     ) -> list[str]:
         settings = get_settings()
         project = session.get(Project, project_id)
@@ -157,7 +175,26 @@ class ProjectReasoner:
                 "reason": "parallel_slots_full",
             }
             return []
-        current_phase = self._current_phase(open_intents, checkpoints)
+        group_item = session.exec(
+            select(ChallengeGroupItem)
+            .where(ChallengeGroupItem.project_id == project_id)
+            .order_by(ChallengeGroupItem.updated_at.desc())
+        ).first()
+        current_phase = self._current_phase(
+            open_intents,
+            checkpoints,
+            preferred_phase=phase if phase is not None else (group_item.phase if group_item is not None else None),
+        )
+        allowed = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False)}
+        playbook = select_playbook(
+            project.challenge_type,
+            " ".join([project.goal, *(fact.statement for fact in facts[-20:])]),
+        )
+        default_capabilities = [
+            capability
+            for capability in dict.fromkeys([*playbook.capabilities, "blackboard.query"])
+            if capability in allowed
+        ]
         prompt = {
             "task": (
                 "Read the shared exploration graph and propose only new, high-value, non-overlapping, "
@@ -172,6 +209,8 @@ class ProjectReasoner:
             "goal": project.goal,
             "challenge_type": project.challenge_type,
             "current_phase": current_phase,
+            "allowed_capabilities": sorted(allowed),
+            "default_capabilities": default_capabilities,
             "facts": [
                 {"id": fact.id, "statement": fact.statement, "category": fact.category, "confidence": fact.confidence}
                 for fact in facts[-100:]
@@ -204,6 +243,7 @@ class ProjectReasoner:
             ],
         }
         planner_error: str | None = None
+        planner_response_valid = False
         candidates: list[Any] = []
         if settings.llm_api_key:
             try:
@@ -214,21 +254,24 @@ class ProjectReasoner:
                     timeout=settings.llm_timeout_seconds,
                 )
                 payload = json.loads(body["choices"][0]["message"]["content"])
-                parsed = payload.get("intents", []) if isinstance(payload, dict) else []
+                if not isinstance(payload, dict) or "intents" not in payload:
+                    raise LLMRequestError("reason response must contain intents")
+                parsed = payload["intents"]
                 if not isinstance(parsed, list):
                     raise LLMRequestError("reason response intents must be a list")
                 candidates = parsed
+                planner_response_valid = True
             except (LLMRequestError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                 planner_error = f"{type(exc).__name__}: {exc}"[:500]
         else:
             planner_error = "planner API key is not configured"
 
-        allowed = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False)}
         fact_ids = {fact.id for fact in facts}
         historical_objectives = {normalize_text(intent.objective) for intent in intent_history}
         repository = BlackboardRepository()
         created: list[str] = []
         accepted_objectives: set[str] = set()
+        model_candidate_rejections: list[dict[str, Any]] = []
         model_created = self._create_candidates(
             session,
             project_id=project_id,
@@ -236,14 +279,20 @@ class ProjectReasoner:
             limit=limit,
             current_phase=current_phase,
             allowed=allowed,
+            default_capabilities=default_capabilities,
             fact_ids=fact_ids,
             historical_objectives=historical_objectives,
             accepted_objectives=accepted_objectives,
             repository=repository,
+            rejection_diagnostics=model_candidate_rejections,
         )
         created.extend(model_created)
         fallback_created: list[str] = []
-        if len(created) < limit:
+        contract_rejections = {"candidate_not_object", "validation_error"}
+        if any(item["reason"] in contract_rejections for item in model_candidate_rejections):
+            planner_response_valid = False
+            planner_error = planner_error or "reason response contains invalid intent candidates"
+        if not planner_response_valid and len(created) < limit:
             fallback_created = self._create_candidates(
                 session,
                 project_id=project_id,
@@ -251,6 +300,7 @@ class ProjectReasoner:
                 limit=limit - len(created),
                 current_phase=current_phase,
                 allowed=allowed,
+                default_capabilities=default_capabilities,
                 fact_ids=fact_ids,
                 historical_objectives=historical_objectives,
                 accepted_objectives=accepted_objectives,
@@ -265,11 +315,22 @@ class ProjectReasoner:
             "fallback_created": len(fallback_created),
             "current_phase": current_phase,
             "planner_error": planner_error,
+            "model_candidate_rejections": model_candidate_rejections,
         }
         return created
 
     @staticmethod
-    def _current_phase(open_intents: list[Intent], checkpoints: list[AttemptCheckpoint]) -> int:
+    def _current_phase(
+        open_intents: list[Intent],
+        checkpoints: list[AttemptCheckpoint],
+        *,
+        preferred_phase: int | None = None,
+    ) -> int:
+        if preferred_phase is not None:
+            try:
+                return max(1, min(4, int(preferred_phase)))
+            except (TypeError, ValueError):
+                pass
         values: list[int] = []
         for budget in [*(intent.budget or {} for intent in open_intents), *(item.budget_json or {} for item in checkpoints)]:
             try:
@@ -287,23 +348,33 @@ class ProjectReasoner:
         limit: int,
         current_phase: int,
         allowed: set[str],
+        default_capabilities: list[str],
         fact_ids: set[str],
         historical_objectives: set[str],
         accepted_objectives: set[str],
         repository: BlackboardRepository,
+        rejection_diagnostics: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         created: list[str] = []
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             if len(created) >= limit:
                 break
             if not isinstance(candidate, dict):
+                if rejection_diagnostics is not None:
+                    rejection_diagnostics.append({"index": index, "reason": "candidate_not_object"})
                 continue
             raw_capabilities = candidate.get("capabilities", [])
             capabilities = (
-                [str(capability) for capability in raw_capabilities if str(capability) in allowed]
+                list(
+                    dict.fromkeys(
+                        str(capability) for capability in raw_capabilities if str(capability) in allowed
+                    )
+                )
                 if isinstance(raw_capabilities, list)
                 else []
             )
+            if not capabilities:
+                capabilities = default_capabilities
             try:
                 intent = IntentDSL(
                     objective=candidate.get("objective", ""),
@@ -312,12 +383,20 @@ class ProjectReasoner:
                     priority=candidate.get("priority", 1.0),
                     risk_level=candidate.get("risk_level", "low"),
                 )
-            except ValidationError:
+            except ValidationError as exc:
+                if rejection_diagnostics is not None:
+                    rejection_diagnostics.append(
+                        {"index": index, "reason": "validation_error", "detail": str(exc.errors()[0]["type"])[:120]}
+                    )
                 continue
             if not intent.capabilities:
+                if rejection_diagnostics is not None:
+                    rejection_diagnostics.append({"index": index, "reason": "no_allowed_capabilities"})
                 continue
             normalized = normalize_text(intent.objective)
             if normalized in historical_objectives or normalized in accepted_objectives:
+                if rejection_diagnostics is not None:
+                    rejection_diagnostics.append({"index": index, "reason": "duplicate_objective"})
                 continue
             accepted_objectives.add(normalized)
             result = repository.upsert_intent(
@@ -335,6 +414,8 @@ class ProjectReasoner:
             )
             if result.created:
                 created.append(result.item.id)
+            elif rejection_diagnostics is not None:
+                rejection_diagnostics.append({"index": index, "reason": "repository_duplicate"})
         return created
 
     @staticmethod

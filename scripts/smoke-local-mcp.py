@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import threading
+import tomllib
 from pathlib import Path
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,7 +18,13 @@ from mcp.client.stdio import stdio_client
 SERVERS = {
     "aurora_reverse": ("/opt/aurora-mcp/reverse_server.py", {"triage_binary", "open_binary", "decompile_function", "find_xrefs", "find_string_xrefs", "list_imports", "list_sessions"}),
     "aurora_debug": ("/opt/aurora-mcp/debug_server.py", {"start_session", "read_memory", "pwndbg_command", "stop_session"}),
-    "aurora_blackboard": ("/opt/aurora-mcp/blackboard_server.py", {"query", "append_fact", "save_checkpoint"}),
+    "aurora_blackboard": ("/opt/aurora-mcp/blackboard_server.py", {"query", "read_artifact", "append_fact", "save_checkpoint"}),
+}
+
+WORKER_CONTROL_ENV_VARS = {
+    "AURORA_WORKER_CONTROL_BASE_URL",
+    "AURORA_WORKER_ID",
+    "AURORA_WORKER_CONTROL_TOKEN",
 }
 
 SMOKE_SOURCE = """\
@@ -38,7 +45,7 @@ def build_smoke_binary() -> Path:
     source = Path("/workspace/aurora-mcp-smoke.c")
     binary = Path("/workspace/aurora-mcp-smoke")
     source.write_text(SMOKE_SOURCE, encoding="utf-8")
-    subprocess.run(["gcc", "-O0", "-g", "-fno-pie", "-no-pie", str(source), "-o", str(binary)], check=True)
+    subprocess.run(["gcc", "-O0", "-g", "-fpie", "-pie", str(source), "-o", str(binary)], check=True)
     return binary
 
 
@@ -98,6 +105,9 @@ async def check_blackboard_behavior(session: ClientSession) -> None:
     response = tool_payload(await session.call_tool("query", {}))
     if response.get("project_id") != "smoke-worker" or response.get("facts") != []:
         raise RuntimeError("aurora_blackboard query did not return the control-plane response")
+    artifact = tool_payload(await session.call_tool("read_artifact", {"artifact_id": "artifact_smoke", "max_bytes": 32}))
+    if artifact.get("id") != "artifact_smoke" or artifact.get("content") != "smoke evidence":
+        raise RuntimeError("aurora_blackboard read_artifact did not return the bounded evidence preview")
 
 
 async def check_debug_behavior(session: ClientSession, binary: Path) -> None:
@@ -131,12 +141,30 @@ async def check_server(name: str, script: str, expected: set[str], binary: Path,
             print(f"{name}: {len(names)} tools")
 
 
+def codex_mcp_environment(name: str) -> dict[str, str]:
+    config = tomllib.loads(Path("/root/.codex/config.toml").read_text(encoding="utf-8"))
+    server = config["mcp_servers"][name]
+    environment = {key: value for key, value in os.environ.items() if key not in WORKER_CONTROL_ENV_VARS}
+    environment.update(server.get("env", {}))
+    for key in server.get("env_vars", []):
+        if key in os.environ:
+            environment[key] = os.environ[key]
+    return environment
+
+
 class BlackboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path != "/internal/workers/smoke-worker/blackboard" or self.headers.get("Authorization") != "Bearer smoke-token":
+        if self.headers.get("Authorization") != "Bearer smoke-token":
             self.send_error(403)
             return
-        body = json.dumps({"project_id": "smoke-worker", "facts": [], "checkpoints": []}).encode("utf-8")
+        if self.path == "/internal/workers/smoke-worker/blackboard":
+            payload = {"project_id": "smoke-worker", "facts": [], "checkpoints": []}
+        elif self.path == "/internal/workers/smoke-worker/artifacts/artifact_smoke?max_bytes=32":
+            payload = {"id": "artifact_smoke", "content": "smoke evidence", "truncated": False}
+        else:
+            self.send_error(404)
+            return
+        body = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -152,15 +180,15 @@ async def main() -> None:
     control = ThreadingHTTPServer(("127.0.0.1", 0), BlackboardHandler)
     threading.Thread(target=control.serve_forever, daemon=True).start()
     try:
+        os.environ.update({
+            "AURORA_WORKER_CONTROL_BASE_URL": f"http://127.0.0.1:{control.server_port}",
+            "AURORA_WORKER_ID": "smoke-worker",
+            "AURORA_WORKER_CONTROL_TOKEN": "smoke-token",
+        })
         for name, (script, expected) in SERVERS.items():
             env = None
             if name == "aurora_blackboard":
-                env = {
-                    **os.environ,
-                    "AURORA_WORKER_CONTROL_BASE_URL": f"http://127.0.0.1:{control.server_port}",
-                    "AURORA_WORKER_ID": "smoke-worker",
-                    "AURORA_WORKER_CONTROL_TOKEN": "smoke-token",
-                }
+                env = codex_mcp_environment(name)
             await check_server(name, script, expected, binary, env)
     finally:
         control.shutdown()

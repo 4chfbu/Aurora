@@ -13,6 +13,7 @@ from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.tool_contract import tools_for_runtime
 from aurora.services.tool_profiles import tool_environment
 from aurora.services.solver_playbooks import select_playbook
+from aurora.services.agent_runtime import agent_runtime_settings
 
 
 SECRET_PATTERNS = [
@@ -93,6 +94,7 @@ class ContextBuilder:
 
         scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project_id)).first()
         policy = session.exec(select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)).first()
+        agent_runtime = agent_runtime_settings(session)
         worker = session.get(Worker, worker_id) if worker_id else None
         coordination = session.exec(
             select(ProjectCoordinationState).where(ProjectCoordinationState.project_id == project_id)
@@ -108,7 +110,7 @@ class ContextBuilder:
             .order_by(Worker.created_at)
         ).all()
         allow_subagents = bool(
-            settings.subagents_enabled
+            agent_runtime.subagents_enabled
             and settings.worker_runtime.strip().lower() in {"codex", "codex_harness", "harness"}
             and policy is not None
             and policy.subagents_enabled
