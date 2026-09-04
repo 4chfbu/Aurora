@@ -104,6 +104,7 @@ def run_project_exploration_step(
     *,
     project_id: str,
     run_id: str,
+    allow_multi_agent: bool = True,
     on_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if not project_run_control.owns(project_id=project_id, run_id=run_id):
@@ -113,7 +114,8 @@ def run_project_exploration_step(
         select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)
     ).first()
     enabled = bool(
-        runtime.multi_agent_exploration_enabled
+        allow_multi_agent
+        and runtime.multi_agent_exploration_enabled
         and policy is not None
         and policy.multi_agent_exploration_enabled
     )

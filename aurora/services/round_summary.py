@@ -62,8 +62,12 @@ class RoundReflectionService:
                     "risk_level": "low",
                     "budget": {"model_role": "reviewer" if next_phase == 4 else "solver", "phase": next_phase},
                 }]
+        candidates = data.get("intents", [])
+        handoff_limit = budget.get("max_handoff_intents")
+        if isinstance(candidates, list) and isinstance(handoff_limit, int) and handoff_limit > 0:
+            candidates = candidates[:handoff_limit]
         generated_intent_ids = (
-            self._create_intents(session, attempt=attempt, candidates=data.get("intents", []))
+            self._create_intents(session, attempt=attempt, candidates=candidates)
             if author_intents
             else []
         )

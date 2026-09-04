@@ -321,6 +321,8 @@ class CodexHarnessRuntime:
                 "AURORA_WORKER_CONTROL_BASE_URL": self.settings.worker_control_base_url,
                 "AURORA_WORKER_ID": worker.id,
                 "AURORA_WORKER_CONTROL_TOKEN": control_token,
+                "AURORA_WORKER_CONTROL_TIMEOUT_SECONDS": str(self.settings.worker_control_timeout_seconds),
+                "AURORA_WORKER_CONTROL_MAX_ATTEMPTS": str(self.settings.worker_control_max_attempts),
                 "AURORA_CODEX_RESUME_THREAD_ID": resume_thread_id or "",
                 "AURORA_SUBAGENTS_ENABLED": "true" if subagent_policy.get("enabled") else "false",
                 "AURORA_SUBAGENTS_MAX_PER_WORKER": str(max(1, int(subagent_policy.get("max_per_worker") or 1))),
@@ -1704,6 +1706,14 @@ class CodexHarnessRuntime:
                     # complete object before declaring the solve lost.
                     parsed = self._parse_json(raw)
                     diagnostic["tolerant_json"] = True
+                parsed, repairs = self._repair_output(
+                    parsed,
+                    snapshot=snapshot,
+                    output_schema=output_schema,
+                )
+                if repairs:
+                    diagnostic["repaired"] = True
+                    diagnostic["repairs"] = repairs
                 self._validate_output(parsed, output_schema=output_schema)
                 return self._normalize(parsed, snapshot, artifact_id, session=session, worker=worker, attempt=attempt), diagnostic
             except json.JSONDecodeError as exc:
@@ -1810,6 +1820,97 @@ class CodexHarnessRuntime:
             )
             if not has_follow_up and not has_blocker:
                 raise ValueError("partial output requires one follow-up intent with expected_observation or a blocker next_step")
+
+    def _repair_output(
+        self,
+        parsed: Any,
+        *,
+        snapshot: ContextSnapshot,
+        output_schema: dict[str, Any] | None = None,
+    ) -> tuple[Any, list[str]]:
+        """Repair structural-only mistakes in the designated final-message file.
+
+        This deliberately never extracts or invents facts, flags, evidence, or
+        tool results. Stream fallbacks still require a complete valid object so
+        progress events cannot be mistaken for the final answer.
+        """
+        if not isinstance(parsed, dict):
+            return parsed, []
+        repairs: list[str] = []
+        candidate = dict(parsed)
+        if len(candidate) == 1:
+            wrapped = next(iter(candidate.values()))
+            if isinstance(wrapped, dict) and next(iter(candidate)) in {"result", "output", "final"}:
+                candidate = dict(wrapped)
+                repairs.append("unwrapped final object")
+
+        schema = output_schema or self._json_schema()
+        allowed = set(schema["properties"])
+        unknown = sorted(set(candidate) - allowed)
+        if unknown:
+            candidate = {key: value for key, value in candidate.items() if key in allowed}
+            repairs.append(f"removed unknown fields: {', '.join(unknown)}")
+
+        raw_status = candidate.get("status")
+        status = str(raw_status or "partial").strip().lower()
+        if status not in {"success", "partial", "failed"}:
+            status = "partial"
+        if raw_status != status:
+            candidate["status"] = status
+            repairs.append("normalized status")
+
+        summary = candidate.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            candidate["summary"] = (
+                str(summary).strip()[:2000]
+                if summary is not None and str(summary).strip()
+                else "Worker returned a structurally incomplete result."
+            )
+            repairs.append("normalized summary")
+
+        array_fields = allowed - {"status", "summary", "decision_summary"}
+        for field in sorted(array_fields):
+            value = candidate.get(field)
+            if value is None:
+                candidate[field] = []
+                repairs.append(f"filled {field}")
+            elif not isinstance(value, list):
+                candidate[field] = [value] if isinstance(value, (dict, str)) else []
+                repairs.append(f"normalized {field} array")
+
+        intent = snapshot.sections_json.get("current_intent", {})
+        decision = candidate.get("decision_summary")
+        if not isinstance(decision, dict):
+            decision = {}
+            repairs.append("created decision_summary")
+        normalized_decision = {
+            "selected_intent": str(decision.get("selected_intent") or intent.get("objective") or "unknown objective")[:2000],
+            "reason_summary": str(decision.get("reason_summary") or candidate["summary"])[:2000],
+            "next_tool_plan": decision.get("next_tool_plan") if isinstance(decision.get("next_tool_plan"), list) else ([decision["next_tool_plan"]] if isinstance(decision.get("next_tool_plan"), str) else []),
+        }
+        if decision != normalized_decision:
+            repairs.append("normalized decision_summary")
+        candidate["decision_summary"] = normalized_decision
+
+        if candidate["status"] == "partial":
+            has_follow_up = any(
+                isinstance(item, dict)
+                and str(item.get("objective") or "").strip()
+                and str(item.get("expected_observation") or "").strip()
+                for item in candidate.get("suggested_intents", [])
+            )
+            has_blocker = any(
+                isinstance(item, dict) and str(item.get("next_step") or "").strip()
+                for item in candidate.get("blockers", [])
+            )
+            if not has_follow_up and not has_blocker and "blockers" in allowed:
+                candidate["blockers"] = [{
+                    "kind": "missing_evidence",
+                    "reason": "The final response did not contain a valid continuation contract.",
+                    "next_step": "Resume from the latest project evidence and run one discriminating experiment.",
+                }]
+                repairs.append("added safe partial continuation blocker")
+        return candidate, repairs
 
     def _failure_output(self, failure_kind: str, stderr: str, artifact_id: str, snapshot: ContextSnapshot) -> dict[str, Any]:
         intent = snapshot.sections_json.get("current_intent", {})

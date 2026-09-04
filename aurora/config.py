@@ -58,8 +58,14 @@ class Settings(BaseModel):
     codex_transcript_max_bytes: int = Field(default_factory=lambda: int(os.getenv("AURORA_CODEX_TRANSCRIPT_MAX_BYTES", str(2 * 1024 * 1024))))
     codex_workspace_dir: Path = Field(default_factory=lambda: Path(os.getenv("AURORA_CODEX_WORKSPACE_DIR", "./codex-workspaces")))
     worker_control_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_CONTROL_BASE_URL", "http://host.docker.internal:8000"))
+    worker_control_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_WORKER_CONTROL_TIMEOUT_SECONDS", "8")), ge=1, le=30)
+    worker_control_max_attempts: int = Field(default_factory=lambda: int(os.getenv("AURORA_WORKER_CONTROL_MAX_ATTEMPTS", "3")), ge=1, le=5)
     worker_container_cpus: float = Field(default_factory=lambda: float(os.getenv("AURORA_WORKER_CONTAINER_CPUS", "2")))
-    worker_container_memory: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_CONTAINER_MEMORY", "4g"))
+    worker_container_memory: str = Field(default_factory=lambda: os.getenv("AURORA_WORKER_CONTAINER_MEMORY", "2g"))
+    worker_container_memory_swap: str = Field(
+        default_factory=lambda: os.getenv("AURORA_WORKER_CONTAINER_MEMORY_SWAP")
+        or os.getenv("AURORA_WORKER_CONTAINER_MEMORY", "2g")
+    )
     llm_api_key: str | None = Field(default_factory=lambda: os.getenv("AURORA_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"))
     llm_base_url: str = Field(default_factory=lambda: os.getenv("AURORA_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1")
     llm_model: str = Field(default_factory=lambda: os.getenv("AURORA_LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini")
@@ -125,6 +131,7 @@ class Settings(BaseModel):
     openvpn_image: str = Field(default_factory=lambda: os.getenv("AURORA_OPENVPN_IMAGE", "aurora-openvpn:latest"))
     openvpn_container_name: str = Field(default_factory=lambda: os.getenv("AURORA_OPENVPN_CONTAINER_NAME", "aurora-openvpn"))
     openvpn_connect_timeout_seconds: int = Field(default_factory=lambda: int(os.getenv("AURORA_OPENVPN_CONNECT_TIMEOUT_SECONDS", "75")))
+    openvpn_key_file: Path = Field(default_factory=lambda: Path(os.getenv("AURORA_OPENVPN_KEY_FILE", ".runtime-cache/openvpn.key")))
 
     @model_validator(mode="after")
     def validate_codex_context_budget(self) -> "Settings":

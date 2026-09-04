@@ -110,7 +110,7 @@ def test_capacity_wait_uses_backoff_without_triggering_no_progress(monkeypatch) 
     monkeypatch.setattr(
         autorunner_module,
         "run_project_exploration_step",
-        lambda session, project_id, run_id, on_dispatch=None: {"status": "capacity_wait"},
+        lambda session, project_id, run_id, allow_multi_agent=True, on_dispatch=None: {"status": "capacity_wait"},
     )
 
     with Session(engine) as session:
@@ -154,7 +154,7 @@ def test_autorun_passes_scheduler_phase_to_reasoner(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "aurora.services.autorunner.run_project_exploration_step",
-        lambda session, project_id, run_id, on_dispatch=None: (
+        lambda session, project_id, run_id, allow_multi_agent=True, on_dispatch=None: (
             on_dispatch() or {"status": "idle"}
         ),
     )
@@ -170,6 +170,54 @@ def test_autorun_passes_scheduler_phase_to_reasoner(monkeypatch) -> None:
         )
 
     assert phases == [2]
+
+
+def test_phase_one_defers_reasoning_runs_once_and_seeds_phase_two_handoff(monkeypatch) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "aurora.services.autorunner.ProjectReasoner.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("phase 1 must not fan out")),
+    )
+    monkeypatch.setattr(
+        "aurora.services.autorunner.ManagerService.run_project",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("phase 1 must not ask Manager to fan out")),
+    )
+
+    def run_serial(session, project_id, run_id, allow_multi_agent=True, on_dispatch=None):
+        calls.append(allow_multi_agent)
+        intent = session.exec(
+            select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")
+        ).one()
+        intent.status = "COMPLETED"
+        session.add(intent)
+        session.commit()
+        if on_dispatch:
+            on_dispatch()
+        return {"status": "completed_round"}
+
+    monkeypatch.setattr("aurora.services.autorunner.run_project_exploration_step", run_serial)
+    with Session(engine) as session:
+        project = Project(name="phase-one", goal="solve directly")
+        session.add(project)
+        session.commit()
+
+        result = AutoRunnerService().run_until_stop(
+            session,
+            project_id=project.id,
+            limits=AutoRunLimits(
+                max_iterations=1,
+                phase=1,
+                allow_multi_agent=False,
+                handoff_phase=2,
+            ),
+        )
+        handoff = session.exec(
+            select(Intent).where(Intent.project_id == project.id, Intent.status == "PENDING")
+        ).one()
+
+    assert result.stop_reason == "max_iterations"
+    assert calls == [False]
+    assert handoff.budget["phase"] == 2
 
 
 def test_autorun_preserves_reason_noop_without_seeding_fallback(monkeypatch) -> None:

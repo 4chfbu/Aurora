@@ -1,8 +1,11 @@
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -14,26 +17,44 @@ mcp = FastMCP("aurora_blackboard")
 BASE_URL = os.getenv("AURORA_WORKER_CONTROL_BASE_URL", "").rstrip("/")
 WORKER_ID = os.getenv("AURORA_WORKER_ID", "")
 TOKEN = os.getenv("AURORA_WORKER_CONTROL_TOKEN", "")
+REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("AURORA_WORKER_CONTROL_TIMEOUT_SECONDS", "8")))
+MAX_ATTEMPTS = max(1, int(os.getenv("AURORA_WORKER_CONTROL_MAX_ATTEMPTS", "3")))
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
 def _request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if not BASE_URL or not WORKER_ID or not TOKEN:
         raise RuntimeError("Aurora worker control channel is not configured")
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(
-        f"{BASE_URL}/internal/workers/{WORKER_ID}{path}",
-        data=body,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-        method="POST" if payload is not None else "GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            parsed = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Aurora control request failed: HTTP {exc.code}: {detail[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Aurora control request failed: {exc}") from exc
+    request_payload = dict(payload) if payload is not None else None
+    if request_payload is not None:
+        request_payload.setdefault("request_id", uuid.uuid4().hex)
+    body = json.dumps(request_payload).encode("utf-8") if request_payload is not None else None
+    parsed: Any = None
+    last_error: Exception | None = None
+    for attempt_number in range(1, MAX_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            f"{BASE_URL}/internal/workers/{WORKER_ID}{path}",
+            data=body,
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            method="POST" if request_payload is not None else "GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            last_error = None
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in RETRYABLE_HTTP_STATUS or attempt_number >= MAX_ATTEMPTS:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Aurora control request failed: HTTP {exc.code}: {detail[:500]}") from exc
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            if attempt_number >= MAX_ATTEMPTS:
+                break
+        time.sleep(min(0.2 * (2 ** (attempt_number - 1)), 1.0))
+    if last_error is not None:
+        raise RuntimeError(f"Aurora control request failed after {MAX_ATTEMPTS} attempts: {last_error}") from last_error
     if not isinstance(parsed, dict):
         raise RuntimeError("Aurora control response was not an object")
     return parsed

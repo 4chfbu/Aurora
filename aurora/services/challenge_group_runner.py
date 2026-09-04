@@ -32,6 +32,7 @@ from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.project_repair import reopen_project_after_invalid_flag
 from aurora.services.suspend_guard import SuspendGapDetector
 from aurora.services.agent_runtime import agent_runtime_settings
+from aurora.services.tsecbench_phase_policy import tsecbench_phase_budget, tsecbench_phase_minutes
 
 
 @dataclass
@@ -586,9 +587,9 @@ class ChallengeGroupRunner:
 
     @staticmethod
     def _phase_max_minutes(item: ChallengeGroupItem) -> int:
-        evaluation = str((item.competition_meta or {}).get("provenance") or "") == "evaluation_snapshot"
-        evaluation_minutes = {1: 5, 2: 20, 3: 25}
-        return evaluation_minutes.get(item.phase, 25) if evaluation else (30 if item.phase == 1 else 60)
+        if competition_platform(item) == "tsecbench":
+            return tsecbench_phase_minutes(item.phase)
+        return 30 if item.phase == 1 else 60
 
     @classmethod
     def _ensure_phase_window(cls, item: ChallengeGroupItem) -> None:
@@ -603,6 +604,7 @@ class ChallengeGroupRunner:
     def _autorun_limits(cls, item: ChallengeGroupItem) -> AutoRunLimits:
         cls._ensure_phase_window(item)
         max_minutes = cls._phase_max_minutes(item)
+        bounded_no_progress = competition_platform(item) == "tsecbench"
         deadline_at = item.phase_deadline_at
         if deadline_at is not None and deadline_at.tzinfo is None:
             deadline_at = deadline_at.replace(tzinfo=timezone.utc)
@@ -610,15 +612,23 @@ class ChallengeGroupRunner:
             # A phase is bounded by its deadline, not by an arbitrary number
             # of Solver turns. AutoRunner treats zero as unlimited and still
             # stops for completion, runtime failures, manual stop, or timeout.
-            max_iterations=0,
+            # TSecBench phase 1 is one Cairn-style bootstrap attempt. Its
+            # checkpoint and continuation Intent are handed to phase 2 rather
+            # than being consumed by another phase-1 Worker.
+            max_iterations=1 if bounded_no_progress and item.phase == 1 else 0,
             # The Worker hard timeout is clamped to the same phase envelope in
             # _apply_phase_attempt_budget, so this outer deadline is effective
             # even while a model turn is still running.
             max_minutes=max_minutes,
-            no_progress_limit=0,
+            # This counter observes complete Solver batches, not individual
+            # shell actions. Later phases stop sooner when a whole batch adds
+            # no evidence, preserving capacity for untouched items.
+            no_progress_limit=(1 if item.phase >= 3 else 2) if bounded_no_progress else 0,
             stop_on_observer_escalate=True,
             phase=item.phase,
             deadline_at=deadline_at,
+            allow_multi_agent=not (bounded_no_progress and item.phase == 1),
+            handoff_phase=2 if bounded_no_progress and item.phase == 1 else None,
         )
 
     @classmethod
@@ -696,15 +706,18 @@ class ChallengeGroupRunner:
     def _max_workers(cls, session: Session, group: ChallengeGroup) -> int:
         settings = get_settings()
         runtime = agent_runtime_settings(session)
+        explorer_cap = max(1, int(runtime.max_global_workers or 1)) if runtime.multi_agent_exploration_enabled else 32
         if cls._is_tsecbench_group(session, group.id):
             return min(
                 max(1, int(group.max_concurrent or 1)),
                 max(1, int(settings.tsecbench_max_concurrent or 1)),
+                explorer_cap,
             )
         if cls._is_slab_match_group(session, group.id):
             return min(
                 max(1, int(group.max_concurrent or 1)),
                 max(1, int(settings.slab_match_max_concurrent or 1)),
+                explorer_cap,
             )
         return min(
             max(1, int(group.max_concurrent or 1)),
@@ -1133,16 +1146,9 @@ class ChallengeGroupRunner:
             .where(ChallengeGroupItem.project_id == project_id)
             .order_by(ChallengeGroupItem.updated_at.desc())
         ).first()
-        evaluation = bool(
-            group_item
-            and str((group_item.competition_meta or {}).get("provenance") or "") == "evaluation_snapshot"
-        )
-        if evaluation:
-            phase_defaults = {
-                1: (240, 300, 0, 3),
-                2: (1_140, 1_200, 0, 3),
-                3: (1_440, 1_500, 0, 4),
-            }.get(phase, (1_440, 1_500, 0, 4))
+        tsecbench = competition_platform(group_item) == "tsecbench" if group_item is not None else False
+        if tsecbench:
+            phase_defaults = tsecbench_phase_budget(phase)
         else:
             phase_defaults = {
                 1: (1_500, 1_800, 0, 3),
@@ -1181,6 +1187,12 @@ class ChallengeGroupRunner:
             budget["max_no_progress_actions"] = 0
             budget["model_role"] = "solver"
             budget.setdefault("finalize_grace_seconds", 60)
+            if phase == 1 and tsecbench:
+                budget["max_handoff_intents"] = 1
+                budget["phase_strategy"] = "tsecbench_bootstrap"
+            else:
+                budget.pop("max_handoff_intents", None)
+                budget.pop("phase_strategy", None)
             intent.budget = budget
             intent.updated_at = now_utc()
             session.add(intent)
@@ -1193,9 +1205,7 @@ class ChallengeGroupRunner:
         (marker_dir / "done.flag").write_text("all challenge items reached a terminal state\n", encoding="utf-8")
 
     def _maybe_fetch_hint(self, session: Session, *, item: ChallengeGroupItem, project: Project) -> None:
-        solved = int((item.competition_meta or {}).get("solved_by_count", 0) or 0)
-        retrying = bool(item.failure_history)
-        should_fetch = item.phase == 3 or (item.phase == 2 and (solved == 0 or retrying))
+        should_fetch = item.phase == 3
         if should_fetch and not item.hint_taken:
             adapter = self._competition_for(item)
             try:

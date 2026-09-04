@@ -107,7 +107,8 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_WORKER_IMAGE_HEAVY` | `aurora-kali-codex:heavy` | Pwn、Reverse、Crypto、Forensics、Misc 和未知题型使用的完整分析镜像。 |
 | `AURORA_CONTAINER_NETWORK` | `aurora-runtime` | Worker 与 CC Switch 共用的私有 Docker bridge 网络。 |
 | `AURORA_WORKER_CONTAINER_CPUS` | `2` | Worker 容器的 CPU 限额，传给 `docker/podman run --cpus`。 |
-| `AURORA_WORKER_CONTAINER_MEMORY` | `4g` | Worker 容器的内存限额，传给 `docker/podman run --memory`。 |
+| `AURORA_WORKER_CONTAINER_MEMORY` | `2g` | Worker 容器的内存限额，传给 `docker/podman run --memory`。 |
+| `AURORA_WORKER_CONTAINER_MEMORY_SWAP` | 与内存限额相同 | Worker 容器的内存与交换区总限额；默认禁止超出内存限额继续占用宿主机交换区。 |
 | `AURORA_BUILD_PROXY` | 未设置 | 可选的镜像构建 HTTP/HTTPS 代理；不会传入运行中的 Worker。 |
 | `AURORA_CODEX_WORKSPACE_DIR` | `./codex-workspaces` | 每个项目和 Worker 的提示词、输入附件、输出 schema 和 transcript 工作目录。 |
 | `AURORA_WORKER_CONTROL_BASE_URL` | `http://host.docker.internal:8000` | Worker 内 `aurora_blackboard` MCP 回连 Aurora 控制面的地址；令牌按 Attempt 生成且仅保存哈希。 |
@@ -192,8 +193,8 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | 执行路径 | Phase 1 | Phase 2 | Phase 3 | 动作预算 |
 | --- | --- | --- | --- | --- |
 | 独立项目/普通 Scheduler 默认 | soft 3600s / hard 5400s | soft 3600s / hard 5400s | soft 3600s / hard 5400s | `max_agent_actions=0`、`max_no_progress_actions=0`，即默认不按命令数截断 |
-| 普通题目组 | soft 1500s / hard 1800s | soft 3300s / hard 3600s | soft 3300s / hard 3600s | 同上；仍由超时与 `max_route_repeats` 约束 |
-| Evaluation | soft 240s / hard 300s | soft 1140s / hard 1200s | soft 1440s / hard 1500s | 同上；对应 5/20/25 分钟阶段 |
+| 其他普通题目组 | soft 1500s / hard 1800s | soft 3300s / hard 3600s | soft 3300s / hard 3600s | 非 TSecBench 题目组仍由超时与 `max_route_repeats` 约束 |
+| TSecBench（含 Evaluation） | soft 660s / hard 720s | soft 1440s / hard 1500s | soft 2340s / hard 2400s | 对应 12/25/40 分钟；P1 单 Agent，P2/P3 可多 Agent，hint 仅 P3 获取 |
 
 如果 Intent 显式给出更小的阶段超时，题目组会保留更小值；更大的值会被阶段上限钳制。当前 Phase 1–4 默认关闭固定 shell 动作数与“无进展动作数”截断，因此 `AURORA_DEFAULT_MAX_AGENT_ACTIONS` 和 `AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS` 主要是兼容回退值；要启用动作上限，应在 Intent `budget` 中显式设置 `max_agent_actions`。题目组会强制把 `max_no_progress_actions` 设为 `0`。
 
@@ -272,7 +273,8 @@ metadata 主机以及字面量私网、回环、link-local、reserved IP。Acces
 ### 容器化 OpenVPN（可选）
 
 Web 左侧的 `OpenVPN` 设置可上传单文件 OVPN、配置可选账号密码和需要经隧道访问的 IPv4/CIDR。
-配置使用网页主密码加密后落库，主密码只驻留当前 API 进程；重启后必须重新解锁并手动连接。
+配置使用本机自动生成的 32 字节密钥加密后落库，密钥默认保存在 `.runtime-cache/openvpn.key`，权限为 `0600`；
+重启后自动解密，无需网页主密码。备份或迁移数据库时必须同时备份该密钥文件。
 VPN 运行在独立容器网络命名空间中，不修改宿主机路由。连接时强制忽略服务端下发的默认路由和 DNS，
 仅网页列出的网段走隧道。连接健康时新 Solver Worker 共享该网络命名空间；掉线时阻止新 Worker，
 不会回退直连。存在运行中的 Solver Worker 时不能连接、断开或修改配置。
@@ -280,6 +282,7 @@ VPN 运行在独立容器网络命名空间中，不修改宿主机路由。连�
 首版只接受带内联证书/私钥的 TUN 配置；不支持 ZIP、外部证书路径、脚本/plugin 或 OVPN 内自定义路由。
 运行 `scripts/runtime-up.sh` 会构建默认镜像 `aurora-openvpn:latest`，也可通过
 `AURORA_OPENVPN_IMAGE`、`AURORA_OPENVPN_CONTAINER_NAME` 和 `AURORA_OPENVPN_CONNECT_TIMEOUT_SECONDS` 调整。连接等待默认 75 秒，且不会低于 OpenVPN 默认的 60 秒 TLS 握手窗口。
+可用 `AURORA_OPENVPN_KEY_FILE` 修改本机密钥路径。旧版主密码加密的配置无法自动迁移，升级后需重新上传一次 OVPN。
 
 ### FOFA 能力
 
@@ -333,7 +336,7 @@ Evaluation 没有单独环境变量，使用 TSecBench 配置和角色模型配�
 - variant 只能是 `baseline` 或 `candidate`。
 
 一次成功的 baseline 会污染同一平台账号的题目状态，因此 candidate 必须使用独立的干净 Token/账号，或在平台重置接受进度后再创建。
-单题阶段预算固定为 5/20/25 分钟，共 50 分钟。晋级需要至少 30 个有效样本、成功率提升 15 个百分点、错误提交率不变差、
+单题阶段预算固定为 12/25/40 分钟，共 77 分钟。P1 只执行一个直解 Agent 回合并留下一个续跑 Intent，P2/P3 才启用多 Agent；平台 hint 仅在 P3 获取。晋级需要至少 30 个有效样本、成功率提升 15 个百分点、错误提交率不变差、
 重复请求达到降低门槛，并且派生候选验证覆盖率与终态 checkpoint 覆盖率都为 100%。
 
 ## 4. 前端与启动配置

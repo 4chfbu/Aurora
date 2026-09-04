@@ -1126,7 +1126,7 @@ def test_runner_materializes_runnable_intent_before_allocating_target() -> None:
 
         assert len(observed_budgets) == 1
         assert observed_budgets[0]["phase"] == 1
-        assert 2 <= observed_budgets[0]["hard_timeout_seconds"] <= 1800
+        assert 2 <= observed_budgets[0]["hard_timeout_seconds"] <= 720
 
 
 def test_tsecbench_bare_port_80_is_an_http_target(tmp_path: Path) -> None:
@@ -1180,6 +1180,104 @@ def test_tsecbench_group_is_detected_for_platform_dispatch() -> None:
         session.add(ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, competition_meta={"platform": "tsecbench", "unique_code": "one"}))
         session.commit()
         assert ChallengeGroupRunner._is_tsecbench_group(session, group.id) is True
+
+
+def test_tsecbench_later_phases_stop_after_a_batch_without_new_evidence() -> None:
+    first = ChallengeGroupItem(
+        group_id="group",
+        project_id="project",
+        position=1,
+        phase=1,
+        competition_meta={"platform": "tsecbench"},
+    )
+    second = ChallengeGroupItem(
+        group_id="group",
+        project_id="project",
+        position=1,
+        phase=2,
+        competition_meta={"platform": "tsecbench"},
+    )
+    third = ChallengeGroupItem(
+        group_id="group",
+        project_id="project",
+        position=1,
+        phase=3,
+        competition_meta={"platform": "tsecbench"},
+    )
+
+    first_limits = ChallengeGroupRunner._autorun_limits(first)
+    assert first_limits.max_minutes == 12
+    assert first_limits.max_iterations == 1
+    assert first_limits.allow_multi_agent is False
+    assert first_limits.handoff_phase == 2
+    assert ChallengeGroupRunner._autorun_limits(second).max_minutes == 25
+    assert ChallengeGroupRunner._autorun_limits(second).no_progress_limit == 2
+    assert ChallengeGroupRunner._autorun_limits(third).max_minutes == 40
+    assert ChallengeGroupRunner._autorun_limits(third).no_progress_limit == 1
+
+
+def test_tsecbench_hint_is_fetched_only_in_phase_three() -> None:
+    calls: list[str] = []
+
+    class Adapter:
+        def fetch_hint(self, session, *, project_id):
+            calls.append(project_id)
+            return "use the parser differential"
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="hint-phase")
+        project = Project(name="one", goal="solve")
+        session.add_all([group, project])
+        session.commit()
+        item = ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            phase=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "one", "solved_by_count": 0},
+            failure_history=[{"phase": 1, "outcome": "FAILED"}],
+        )
+        session.add(item)
+        session.commit()
+        runner = ChallengeGroupRunner(competition=Adapter())
+
+        runner._maybe_fetch_hint(session, item=item, project=project)
+        item.phase = 2
+        runner._maybe_fetch_hint(session, item=item, project=project)
+        assert calls == []
+        assert item.hint_taken is False
+
+        item.phase = 3
+        runner._maybe_fetch_hint(session, item=item, project=project)
+        runner._maybe_fetch_hint(session, item=item, project=project)
+        assert calls == [project.id]
+        assert item.hint_taken is True
+        assert item.hint_content == "use the parser differential"
+
+
+def test_tsecbench_group_concurrency_does_not_exceed_global_worker_capacity(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "2")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        group = ChallengeGroup(name="tsec-capacity", max_concurrent=3)
+        project = Project(name="one", goal="solve")
+        session.add_all([group, project])
+        session.commit()
+        session.add(ChallengeGroupItem(
+            group_id=group.id,
+            project_id=project.id,
+            position=1,
+            competition_meta={"platform": "tsecbench", "unique_code": "one"},
+        ))
+        session.commit()
+
+        assert ChallengeGroupRunner._max_workers(session, group) == 2
+    get_settings.cache_clear()
 
 
 def test_unconfigured_tsecbench_never_falls_back_to_local_solver() -> None:

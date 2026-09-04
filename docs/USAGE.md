@@ -61,8 +61,8 @@ Slab Match 提交时会读取赛事 `match_info.rule`：只有规则明确要求
 并拒绝 localhost、metadata 主机和字面量私网/回环/link-local/reserved IP。跨域附件不会携带 AccessKey。
 
 如不希望 SSLVPN 修改宿主机网络，可在 Web 左侧打开独立的 `OpenVPN` 设置：上传包含内联证书的 `.ovpn`，
-设置至少 10 字符的加密主密码，逐行填写需要转发的 IPv4/CIDR，并按“保存配置 → 连接”操作。
-只有列出的网段会进入隧道；未连接时保持原有网络。API 重启后配置仍在，但必须重新输入主密码解锁并手动连接。
+逐行填写需要转发的 IPv4/CIDR，并按“保存配置 → 连接”操作。配置由本机自动生成的密钥加密保存，
+API 重启后无需输入主密码。只有列出的网段会进入隧道；未连接时保持原有网络。
 连接、断开或修改配置前应停止所有 Solver Worker，VPN 掉线时 Aurora 会阻止新 Worker 而不会回退直连。
 
 ## 2. 启动服务
@@ -431,7 +431,7 @@ baseline 与 candidate 必须使用相互独立的干净平台会话：baseline 
 不能直接启动 candidate。请改用独立 Benchmark Token/账号，或先由平台重置整套题目的接受进度。冻结快照中只要含远程附件，
 当前版本也会拒绝运行，因为 Evaluation 尚未实现附件物化，不能保证两组输入一致。
 
-每题按 5/20/25 分钟三个阶段执行，Worker hard timeout 同步钳制到对应阶段，总上限 50 分钟。报告以平台确认完成为成功，
+每题按 12/25/40 分钟三个阶段执行，Worker hard timeout 同步钳制到对应阶段，总上限 77 分钟。P1 只进行一次单 Agent 直解并把 checkpoint 和一个续跑 Intent 交给 P2；P2/P3 才启用多 Agent，平台 hint 仅在 P3 自动获取。报告以平台确认完成为成功，
 并统计错误提交、重复请求、派生候选验证覆盖率和终态 checkpoint 覆盖率。比较结果只有同时满足以下条件才会 `promoted=true`：
 
 - baseline/candidate 来自同一冻结套件，且两边有效样本数至少 30；

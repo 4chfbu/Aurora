@@ -262,7 +262,30 @@ class CapabilityGateway:
         artifacts: list[Artifact] = []
         for ref in dict.fromkeys(ref for ref in refs if isinstance(ref, str)):
             artifact = session.get(Artifact, ref)
-            if artifact is None or artifact.project_id != project_id or artifact.type in {"codex-transcript", "subagent-transcript", "blackboard-query", "tool-request"}:
+            if artifact is None:
+                try:
+                    source_path = self._worker_workspace_file(workspace=workspace, ref=ref)
+                    artifact = self.artifact_store.write_file(
+                        session,
+                        project_id=project_id,
+                        source=source_path,
+                        summary=f"Worker verification evidence: {source_path.name}",
+                        source_attempt_id=attempt_id,
+                        artifact_type="worker-evidence",
+                        origin_kind="worker_observation",
+                        deduplicate=True,
+                    )
+                except (OSError, ValueError) as exc:
+                    return self._verification_failure(
+                        session,
+                        project_id,
+                        request,
+                        worker_id,
+                        intent_id,
+                        attempt_id,
+                        f"untrusted or foreign source artifact: {ref} ({exc})",
+                    )
+            if artifact.project_id != project_id or artifact.type in {"codex-transcript", "subagent-transcript", "blackboard-query", "tool-request"}:
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, f"untrusted or foreign source artifact: {ref}")
             artifacts.append(artifact)
         if not artifacts:
@@ -362,7 +385,7 @@ class CapabilityGateway:
             session.refresh(trace)
             return ToolResult(
                 True,
-                trace.summary or "Flag verified",
+                f"{trace.summary or 'Flag verified'}; submit with candidate_id={candidate.id}",
                 [artifact.id, *[source.id for source in artifacts]],
                 {
                     "runs": 2,
@@ -376,6 +399,24 @@ class CapabilityGateway:
             )
         finally:
             shutil.rmtree(verify_root, ignore_errors=True)
+
+    @staticmethod
+    def _worker_workspace_file(*, workspace: Path, ref: str) -> Path:
+        if ref == "/workspace":
+            relative = Path()
+        elif ref.startswith("/workspace/"):
+            relative = Path(ref.removeprefix("/workspace/"))
+        else:
+            supplied = Path(ref)
+            relative = supplied if not supplied.is_absolute() else None
+        candidate = (workspace / relative).resolve() if relative is not None else Path(ref).resolve()
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("artifact path escapes the worker workspace") from exc
+        if not candidate.is_file():
+            raise ValueError("artifact path must name an existing file in the worker workspace")
+        return candidate
 
     def _flag_submit(
         self,

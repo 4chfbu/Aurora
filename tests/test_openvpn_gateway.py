@@ -9,7 +9,6 @@ from aurora.config import get_settings
 from aurora.api import create_app
 from aurora.services.openvpn_gateway import (
     OpenVPNGatewayRegistry,
-    OpenVPNLocked,
     OpenVPNRuntimeError,
     normalize_routes,
     validate_ovpn,
@@ -31,6 +30,10 @@ class FakeGateway(OpenVPNGatewayRegistry):
         super().__init__()
         self.commands: list[list[str]] = []
         self.running = False
+
+    @staticmethod
+    def _machine_key() -> bytes:
+        return b"k" * 32
 
     def _run(self, args: list[str], *, timeout: int = 15) -> subprocess.CompletedProcess[str]:
         self.commands.append(args)
@@ -67,25 +70,25 @@ def test_route_validation_normalizes_and_blocks_dangerous_ranges() -> None:
             normalize_routes([route], docker_subnets=["172.29.0.0/16"])
 
 
-def test_encrypted_config_is_locked_after_restart_and_contains_no_secrets() -> None:
+def test_encrypted_config_auto_unlocks_after_restart_and_contains_no_secrets() -> None:
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
     gateway = FakeGateway()
     with Session(engine) as session:
-        saved = gateway.save(session, ovpn=PROFILE, vault_password="vault-password", routes=["10.20.0.0/16"], username="alice", password="vpn-secret")
+        saved = gateway.save(session, ovpn=PROFILE, routes=["10.20.0.0/16"], username="alice", password="vpn-secret")
         stored = session.get(OpenVPNSetting, "global")
-        assert saved["state"] == "unlocked"
+        assert saved["state"] == "disconnected"
         assert stored is not None
         rendered = bytes(stored.encrypted_payload)
         assert b"vpn-secret" not in rendered and b"vpn.example" not in rendered
 
         restarted = FakeGateway()
-        assert restarted.public_config(session)["locked"] is True
-        with pytest.raises(OpenVPNLocked):
-            restarted.unlock(session, "wrong-password")
-        unlocked = restarted.unlock(session, "vault-password")
-        assert unlocked["state"] == "unlocked"
-        assert unlocked["credentials_configured"] is True
+        restored = restarted.public_config(session)
+        assert restored["locked"] is False
+        assert restored["state"] == "disconnected"
+        assert restored["credentials_configured"] is True
+        assert restarted._payload is not None
+        assert restarted._payload["password"] == "vpn-secret"
 
 
 def test_saving_new_profile_deletes_and_replaces_old_encrypted_record() -> None:
@@ -93,20 +96,55 @@ def test_saving_new_profile_deletes_and_replaces_old_encrypted_record() -> None:
     SQLModel.metadata.create_all(engine)
     gateway = FakeGateway()
     with Session(engine) as session:
-        gateway.save(session, ovpn=PROFILE, vault_password="first-password", routes=["10.20.0.0/16"], username=None, password=None)
+        gateway.save(session, ovpn=PROFILE, routes=["10.20.0.0/16"], username=None, password=None)
         first = session.get(OpenVPNSetting, "global")
         assert first is not None
         first_ciphertext = bytes(first.encrypted_payload)
 
         replacement = PROFILE.replace(b"vpn.example", b"vpn-new.example")
-        gateway.save(session, ovpn=replacement, vault_password="second-password", routes=["10.30.0.0/16"], username=None, password=None)
+        gateway.save(session, ovpn=replacement, routes=["10.30.0.0/16"], username=None, password=None)
         current = session.get(OpenVPNSetting, "global")
 
         assert current is not None
         assert bytes(current.encrypted_payload) != first_ciphertext
         assert current.routes == ["10.30.0.0/16"]
-        with pytest.raises(OpenVPNLocked):
-            OpenVPNGatewayRegistry().unlock(session, "first-password")
+        restarted = FakeGateway()
+        assert restarted.public_config(session)["state"] == "disconnected"
+        assert restarted._payload is not None
+        assert "vpn-new.example" in restarted._payload["ovpn"]
+
+
+def test_legacy_master_password_config_requires_reupload() -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OpenVPNSetting(
+            encrypted_payload=b"legacy-ciphertext",
+            salt=b"legacy-password-salt",
+            nonce=b"0" * 12,
+            routes=["10.20.0.0/16"],
+        ))
+        session.commit()
+
+        public = FakeGateway().public_config(session)
+
+        assert public["locked"] is False
+        assert public["state"] == "error"
+        assert public["reconfigure_required"] is True
+        assert "upload the OVPN profile again" in public["last_error"]
+
+
+def test_machine_key_is_stable_and_private(monkeypatch, tmp_path) -> None:
+    key_path = tmp_path / "runtime" / "openvpn.key"
+    monkeypatch.setenv("AURORA_OPENVPN_KEY_FILE", str(key_path))
+    get_settings.cache_clear()
+
+    first = OpenVPNGatewayRegistry._machine_key()
+    second = OpenVPNGatewayRegistry._machine_key()
+
+    assert first == second
+    assert len(first) == 32
+    assert key_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_openvpn_timeout_explains_incomplete_handshake() -> None:
@@ -181,14 +219,14 @@ def test_auth_profile_requires_web_credentials() -> None:
     SQLModel.metadata.create_all(engine)
     gateway = FakeGateway()
     with Session(engine) as session, pytest.raises(ValueError, match="requires a VPN username"):
-        gateway.save(session, ovpn=PROFILE + b"auth-user-pass\n", vault_password="vault-password", routes=["10.20.0.0/16"], username=None, password=None)
+        gateway.save(session, ovpn=PROFILE + b"auth-user-pass\n", routes=["10.20.0.0/16"], username=None, password=None)
 
 
 def test_openvpn_upload_api_uses_multipart_without_exposing_secrets(monkeypatch) -> None:
     from aurora.services.openvpn_gateway import openvpn_gateway_registry
 
     captured: dict[str, object] = {}
-    public = {"configured": True, "locked": False, "connected": False, "desired_connected": False, "state": "unlocked", "routes": ["10.20.0.0/16"], "credentials_configured": True, "last_error": None, "updated_at": None}
+    public = {"configured": True, "locked": False, "connected": False, "desired_connected": False, "state": "disconnected", "routes": ["10.20.0.0/16"], "credentials_configured": True, "reconfigure_required": False, "last_error": None, "updated_at": None}
 
     def save(session, **kwargs):
         captured.update(kwargs)
@@ -200,11 +238,11 @@ def test_openvpn_upload_api_uses_multipart_without_exposing_secrets(monkeypatch)
         response = client.put(
             "/api/settings/openvpn",
             files={"ovpn": ("client.ovpn", PROFILE, "text/plain")},
-            data={"vault_password": "vault-password", "routes": "10.20.0.0/16", "username": "alice", "password": "vpn-secret"},
+            data={"routes": "10.20.0.0/16", "username": "alice", "password": "vpn-secret"},
         )
 
     assert response.status_code == 200
     assert response.json() == public
     assert captured["ovpn"] == PROFILE
     assert captured["routes"] == ["10.20.0.0/16"]
-    assert "vpn-secret" not in response.text and "vault-password" not in response.text
+    assert "vpn-secret" not in response.text

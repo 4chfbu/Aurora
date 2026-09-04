@@ -162,7 +162,7 @@ uv run --extra dev pytest -q tests/test_flag_verification.py
 | `reliability.py` | 项目可靠性报告 |
 | `subagent_collector.py` | 子代理结果收集 |
 | `browser_interaction.py` / `browser_sessions.py` | 受控浏览器会话与靶机页面操作 |
-| `openvpn_gateway.py` | OpenVPN 配置、解锁、连接和健康检查 |
+| `openvpn_gateway.py` | OpenVPN 本机密钥加密、连接和健康检查 |
 | `network_proxy.py` | 全局代理配置 |
 | `command_runner.py` | 本地/Kali 容器/自动命令执行 |
 | `worker_control.py` | Worker 黑板的内部回调认证与写入 |

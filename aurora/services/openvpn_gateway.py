@@ -14,7 +14,6 @@ from typing import Any
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from sqlmodel import Session
 
 from aurora.config import Settings, get_settings
@@ -22,7 +21,8 @@ from aurora.models import OpenVPNSetting, now_utc
 
 
 MAX_OVPN_BYTES = 1024 * 1024
-AAD = b"aurora-openvpn-v1"
+AAD = b"aurora-openvpn-machine-key-v1"
+MACHINE_KEY_MARKER = b"machine-key-v1"
 FORBIDDEN_DIRECTIVES = {
     "up", "down", "route-up", "route-pre-down", "ipchange", "learn-address",
     "client-connect", "client-disconnect", "plugin", "management", "management-client",
@@ -46,12 +46,6 @@ class OpenVPNConflict(OpenVPNError):
 
 class OpenVPNRuntimeError(OpenVPNError):
     pass
-
-
-def _derive_key(password: str, salt: bytes) -> bytes:
-    if len(password) < 10 or len(password) > 1024:
-        raise ValueError("VPN vault password must be between 10 and 1024 characters")
-    return Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(password.encode("utf-8"))
 
 
 def validate_ovpn(content: bytes) -> str:
@@ -178,28 +172,76 @@ class OpenVPNGatewayRegistry:
         except (json.JSONDecodeError, TypeError):
             return []
 
+    @staticmethod
+    def _machine_key() -> bytes:
+        path = get_settings().openvpn_key_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                os.write(descriptor, secrets.token_bytes(32))
+            finally:
+                os.close(descriptor)
+        try:
+            key = path.read_bytes()
+            path.chmod(0o600)
+        except OSError as exc:
+            raise OpenVPNRuntimeError(f"cannot read OpenVPN machine key: {exc}") from exc
+        if len(key) != 32:
+            raise OpenVPNRuntimeError("OpenVPN machine key must contain exactly 32 bytes")
+        return key
+
+    def _load_payload(self, setting: OpenVPNSetting) -> None:
+        if self._payload is not None:
+            return
+        if bytes(setting.salt) != MACHINE_KEY_MARKER:
+            raise OpenVPNLocked("existing OpenVPN configuration uses the retired master password; upload the OVPN profile again")
+        try:
+            decoded = AESGCM(self._machine_key()).decrypt(setting.nonce, setting.encrypted_payload, AAD)
+            payload = json.loads(decoded)
+            if not isinstance(payload, dict) or not isinstance(payload.get("ovpn"), str):
+                raise ValueError("invalid OpenVPN payload")
+        except (InvalidTag, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise OpenVPNLocked("OpenVPN configuration cannot be decrypted with the local machine key; upload the OVPN profile again") from exc
+        self._payload = {
+            "ovpn": payload["ovpn"],
+            "username": str(payload.get("username") or ""),
+            "password": str(payload.get("password") or ""),
+        }
+        self._routes = list(setting.routes)
+
     def public_config(self, session: Session) -> dict[str, Any]:
         setting = session.get(OpenVPNSetting, "global")
+        reconfigure_required = False
+        migration_error: str | None = None
+        if setting is not None and self._payload is None:
+            try:
+                self._load_payload(setting)
+            except OpenVPNLocked as exc:
+                reconfigure_required = True
+                migration_error = str(exc)
         running = self._container_running() if setting else False
         healthy = running and self._healthy(setting.routes)
-        state = "unconfigured" if not setting else "locked" if self._payload is None else "connected" if healthy else "error" if self._desired_connected else "unlocked"
+        state = "unconfigured" if not setting else "error" if reconfigure_required else "connected" if healthy else "error" if self._desired_connected else "disconnected"
         return {
             "configured": setting is not None,
-            "locked": setting is not None and self._payload is None,
+            "locked": False,
             "connected": healthy,
             "desired_connected": self._desired_connected,
             "state": state,
             "routes": list(setting.routes) if setting else [],
             "credentials_configured": bool(setting and setting.credentials_configured),
-            "last_error": self._last_error,
+            "reconfigure_required": reconfigure_required,
+            "last_error": migration_error or self._last_error,
             "updated_at": setting.updated_at.isoformat() if setting else None,
         }
 
-    def save(self, session: Session, *, ovpn: bytes, vault_password: str, routes: list[str], username: str | None, password: str | None) -> dict[str, Any]:
+    def save(self, session: Session, *, ovpn: bytes, routes: list[str], username: str | None, password: str | None) -> dict[str, Any]:
         with self._lock:
             self._assert_mutable()
-            if session.get(OpenVPNSetting, "global") is not None and self._payload is None:
-                raise OpenVPNLocked("unlock the existing VPN configuration before replacing it")
             text = validate_ovpn(ovpn)
             normalized = normalize_routes(routes, docker_subnets=self._docker_subnets())
             username = (username or "").strip()
@@ -213,18 +255,17 @@ class OpenVPNGatewayRegistry:
             )
             if requires_credentials and not username:
                 raise ValueError("this OVPN profile requires a VPN username and password")
-            salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
-            key = _derive_key(vault_password, salt)
+            nonce = secrets.token_bytes(12)
             payload = {"ovpn": text, "username": username, "password": password}
-            encrypted = AESGCM(key).encrypt(nonce, json.dumps(payload).encode("utf-8"), AAD)
+            encrypted = AESGCM(self._machine_key()).encrypt(nonce, json.dumps(payload).encode("utf-8"), AAD)
             previous = session.get(OpenVPNSetting, "global")
             if previous is not None:
                 # A replacement is a real delete-and-create operation rather
                 # than an in-place mutation of the old encrypted profile.
                 session.delete(previous)
                 session.flush()
-            setting = OpenVPNSetting(encrypted_payload=encrypted, salt=salt, nonce=nonce)
-            setting.encrypted_payload, setting.salt, setting.nonce = encrypted, salt, nonce
+            setting = OpenVPNSetting(encrypted_payload=encrypted, salt=MACHINE_KEY_MARKER, nonce=nonce)
+            setting.encrypted_payload, setting.salt, setting.nonce = encrypted, MACHINE_KEY_MARKER, nonce
             setting.routes = normalized
             setting.credentials_configured = bool(username)
             setting.updated_at = now_utc()
@@ -238,39 +279,13 @@ class OpenVPNGatewayRegistry:
             self._cleanup_runtime()
             return self.public_config(session)
 
-    def unlock(self, session: Session, vault_password: str) -> dict[str, Any]:
-        with self._lock:
-            setting = session.get(OpenVPNSetting, "global")
-            if setting is None:
-                raise OpenVPNConflict("VPN is not configured")
-            try:
-                key = _derive_key(vault_password, setting.salt)
-                payload = json.loads(AESGCM(key).decrypt(setting.nonce, setting.encrypted_payload, AAD))
-            except (InvalidTag, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise OpenVPNLocked("invalid VPN vault password") from exc
-            self._payload = payload
-            self._routes = list(setting.routes)
-            self._last_error = None
-            return self.public_config(session)
-
-    def lock(self, session: Session) -> dict[str, Any]:
-        with self._lock:
-            self._assert_mutable()
-            self._desired_connected = False
-            self._remove_container()
-            self._cleanup_runtime()
-            self._payload = None
-            self._routes = []
-            return self.public_config(session)
-
     def connect(self, session: Session) -> dict[str, Any]:
         with self._lock:
             self._assert_mutable()
             setting = session.get(OpenVPNSetting, "global")
             if setting is None:
                 raise OpenVPNConflict("VPN is not configured")
-            if self._payload is None:
-                raise OpenVPNLocked("VPN configuration is locked")
+            self._load_payload(setting)
             self._desired_connected = True
             self._last_error = None
             self._remove_container()

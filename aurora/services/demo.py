@@ -453,9 +453,65 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     # Run it first so a valid derivation cannot be dropped merely because the
     # model also returned enough ordinary requests to fill the tool budget.
     valid_tool_requests.sort(key=lambda item: {"flag.verify": 0, "flag.submit": 1}.get(item.get("tool_name"), 2))
+    latest_verified_candidate_id: str | None = None
+    batch_request_fingerprints: set[str] = set()
     for tool_request in valid_tool_requests[:max_tool_calls]:
         tool_name = str(tool_request.get("tool_name") or "")
         request = _route_request(project_id, tool_name, tool_request.get("request", {}))
+        if tool_name == "flag.submit" and request.get("candidate_id") == "latest_verified":
+            if latest_verified_candidate_id:
+                request = {**request, "candidate_id": latest_verified_candidate_id}
+            else:
+                skipped_tools += 1
+                summary = "skipped flag.submit because no preceding flag.verify call produced an eligible candidate"
+                tool_calls.append({
+                    "tool_name": tool_name,
+                    "activity_label": _activity_label(tool_request),
+                    "success": False,
+                    "skipped": True,
+                    "summary": summary,
+                    "artifact_refs": [],
+                    "trace_id": None,
+                })
+                structured.setdefault("failed_attempts", []).append({
+                    "reason": "missing_verified_candidate",
+                    "tool_name": tool_name,
+                    "summary": summary,
+                })
+                session.add(WorkerEvent(
+                    project_id=project_id,
+                    worker_id=worker.id,
+                    intent_id=intent.id,
+                    attempt_id=attempt.id,
+                    event_type="tool.skipped.missing_verified_candidate",
+                    payload_json={"tool_name": tool_name},
+                ))
+                session.commit()
+                continue
+        request_fingerprint = f"{tool_name}:{route_fingerprint(request)}"
+        if request_fingerprint in batch_request_fingerprints:
+            skipped_tools += 1
+            summary = "skipped duplicate request in the same worker result"
+            tool_calls.append({
+                "tool_name": tool_name,
+                "activity_label": _activity_label(tool_request),
+                "success": False,
+                "skipped": True,
+                "summary": summary,
+                "artifact_refs": [],
+                "trace_id": None,
+            })
+            session.add(WorkerEvent(
+                project_id=project_id,
+                worker_id=worker.id,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                event_type="tool.skipped.duplicate_request",
+                payload_json={"tool_name": tool_name, "request_fingerprint": request_fingerprint},
+            ))
+            session.commit()
+            continue
+        batch_request_fingerprints.add(request_fingerprint)
         repeat_failures = _repeat_failure_count(
             session,
             project_id=project_id,
@@ -545,6 +601,10 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
         )
         session.commit()
         structured.setdefault("artifact_refs", []).extend(result.artifact_refs)
+        if tool_request["tool_name"] == "flag.verify" and result.success:
+            candidate_id = result.metrics.get("candidate_id")
+            if isinstance(candidate_id, str) and candidate_id:
+                latest_verified_candidate_id = candidate_id
         if tool_request["tool_name"] == "flag.verify" and not result.success:
             structured.setdefault("failed_attempts", []).append({
                 "reason": "flag_verification_failed",

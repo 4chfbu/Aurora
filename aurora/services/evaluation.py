@@ -27,6 +27,10 @@ from aurora.services.agent_runtime import agent_runtime_settings
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.tsecbench import TSecBenchClient
 from aurora.services.tool_profiles import manifest_sha256
+from aurora.services.tsecbench_phase_policy import (
+    TSECBENCH_MAX_MINUTES_PER_CHALLENGE,
+    TSECBENCH_PHASE_MINUTES,
+)
 
 
 @dataclass(frozen=True)
@@ -173,8 +177,8 @@ class EvaluationService:
             "prompt_contract": "strict-v1",
             "tool_manifest_sha256": manifest_sha256(),
             "suite_content_hash": suite.content_hash,
-            "max_minutes_per_challenge": 50,
-            "phase_minutes": [5, 20, 25],
+            "max_minutes_per_challenge": TSECBENCH_MAX_MINUTES_PER_CHALLENGE,
+            "phase_minutes": list(TSECBENCH_PHASE_MINUTES),
             "max_route_repeats": 2,
         }
         run = EvaluationRun(

@@ -219,7 +219,7 @@ class ContextBuilder:
                     }
                     for candidate in verified_candidates
                 ],
-                "same_batch_candidate_id": "latest_verified",
+                "same_batch_candidate_id": "latest_verified" if "flag.verify" in visible_tool_names and "flag.submit" in visible_tool_names else None,
             },
             "harvester_task": harvester_task.payload_json if harvester_task else None,
             "current_intent": {

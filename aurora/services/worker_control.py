@@ -83,7 +83,17 @@ class WorkerControlService:
         category: str,
         confidence: float,
         evidence_refs: list[str],
+        request_id: str | None = None,
     ) -> dict[str, Any]:
+        prior = self._prior_write_result(session, attempt=attempt, event_type="blackboard.fact_appended", request_id=request_id)
+        if prior is not None:
+            return {
+                "fact_id": prior.get("fact_id"),
+                "created": bool(prior.get("created")),
+                "evidence_refs": list(prior.get("evidence_refs") or []),
+                "version": int(prior.get("blackboard_version") or attempt.blackboard_version),
+                "deduplicated": True,
+            }
         refs = self._normalize_artifact_refs(
             session,
             worker=worker,
@@ -101,7 +111,13 @@ class WorkerControlService:
             source_intent_id=worker.intent_id,
             source_attempt_id=attempt.id,
         )
-        self._advance(session, worker=worker, attempt=attempt, event_type="blackboard.fact_appended", payload={"fact_id": result.item.id, "created": result.created})
+        self._advance(
+            session,
+            worker=worker,
+            attempt=attempt,
+            event_type="blackboard.fact_appended",
+            payload={"fact_id": result.item.id, "created": result.created, "evidence_refs": refs, "request_id": request_id},
+        )
         return {
             "fact_id": result.item.id,
             "created": result.created,
@@ -120,7 +136,16 @@ class WorkerControlService:
         failed_routes: list[str],
         next_step: str,
         artifact_refs: list[str],
+        request_id: str | None = None,
     ) -> dict[str, Any]:
+        prior = self._prior_write_result(session, attempt=attempt, event_type="checkpoint.saved", request_id=request_id)
+        if prior is not None:
+            return {
+                "status": "saved",
+                "artifact_refs": list(prior.get("artifact_refs") or []),
+                "version": int(prior.get("blackboard_version") or attempt.blackboard_version),
+                "deduplicated": True,
+            }
         refs = self._normalize_artifact_refs(
             session,
             worker=worker,
@@ -134,6 +159,7 @@ class WorkerControlService:
             "failed_routes": self._strings(failed_routes),
             "next_step": next_step.strip()[:1000],
             "artifact_refs": refs,
+            "request_id": request_id,
         }
         self._advance(session, worker=worker, attempt=attempt, event_type="checkpoint.saved", payload=payload)
         ProjectCoordinationService().record_graph_change(session, project_id=worker.project_id)
@@ -228,6 +254,31 @@ class WorkerControlService:
     @staticmethod
     def _strings(values: list[str]) -> list[str]:
         return [str(value).strip()[:1000] for value in values if str(value).strip()][:20]
+
+    @staticmethod
+    def _prior_write_result(
+        session: Session,
+        *,
+        attempt: Attempt,
+        event_type: str,
+        request_id: str | None,
+    ) -> dict[str, Any] | None:
+        if not request_id:
+            return None
+        events = session.exec(
+            select(WorkerEvent)
+            .where(WorkerEvent.attempt_id == attempt.id, WorkerEvent.event_type == event_type)
+            .order_by(WorkerEvent.created_at.desc())
+            .limit(100)
+        ).all()
+        return next(
+            (
+                event.payload_json
+                for event in events
+                if isinstance(event.payload_json, dict) and event.payload_json.get("request_id") == request_id
+            ),
+            None,
+        )
 
     @staticmethod
     def _advance(session: Session, *, worker: Worker, attempt: Attempt, event_type: str, payload: dict[str, Any]) -> None:

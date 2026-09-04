@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, AttemptCheckpoint, Fact, Finding, Intent, Project, ToolTrace, WorkerEvent, now_utc
+from aurora.models import Artifact, AttemptCheckpoint, Fact, Finding, FlagCandidate, Intent, Project, ToolTrace, WorkerEvent, now_utc
 from aurora.services.multi_agent import run_project_exploration_step
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.manager import ManagerDecision, ManagerService
@@ -25,6 +25,8 @@ class AutoRunLimits:
     stop_on_observer_escalate: bool = True
     phase: int | None = None
     deadline_at: datetime | None = None
+    allow_multi_agent: bool = True
+    handoff_phase: int | None = None
 
 
 @dataclass
@@ -128,23 +130,18 @@ class AutoRunnerService:
                 events.append(payload)
                 return AutoRunResult("blocked", "observer_escalate", iteration - 1, project_id, events)
 
-            reason_decision = ProjectReasoner().run(
-                session,
-                project_id=project_id,
-                phase=limits.phase,
+            reason_decision = (
+                ProjectReasoner().run(
+                    session,
+                    project_id=project_id,
+                    phase=limits.phase,
+                )
+                if limits.allow_multi_agent
+                else {"status": "deferred", "reason": "multi_agent_disabled_for_phase"}
             )
             manager_decision = None
             if not self._has_pending_intent(session, project_id):
-                if reason_decision.get("status") == "noop":
-                    self._event(
-                        session,
-                        project_id,
-                        "autorun.stopped",
-                        {"reason": "no_runnable_work", "iteration": iteration - 1},
-                    )
-                    return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
-                manager_decision = ManagerService().run_project(session, project_id=project_id)
-                if not self._has_pending_intent(session, project_id) and not recovery_intent_seeded:
+                if not limits.allow_multi_agent:
                     self._seed_fallback_intent(
                         session,
                         project_id=project_id,
@@ -152,7 +149,29 @@ class AutoRunnerService:
                         deadline_at=deadline_at,
                     )
                     recovery_intent_seeded = True
-                    manager_decision = ManagerDecision("PROPOSED", "Scheduler seeded one fallback continuation intent to avoid an empty phase.")
+                    manager_decision = ManagerDecision(
+                        "PROPOSED",
+                        "Scheduler seeded the single serial phase intent.",
+                    )
+                elif reason_decision.get("status") == "noop":
+                    self._event(
+                        session,
+                        project_id,
+                        "autorun.stopped",
+                        {"reason": "no_runnable_work", "iteration": iteration - 1},
+                    )
+                    return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
+                else:
+                    manager_decision = ManagerService().run_project(session, project_id=project_id)
+                    if not self._has_pending_intent(session, project_id) and not recovery_intent_seeded:
+                        self._seed_fallback_intent(
+                            session,
+                            project_id=project_id,
+                            phase=limits.phase or 1,
+                            deadline_at=deadline_at,
+                        )
+                        recovery_intent_seeded = True
+                        manager_decision = ManagerDecision("PROPOSED", "Scheduler seeded one fallback continuation intent to avoid an empty phase.")
                 if not self._has_pending_intent(session, project_id):
                     self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration - 1})
                     return AutoRunResult("stopped", "no_runnable_work", iteration - 1, project_id, events)
@@ -171,6 +190,7 @@ class AutoRunnerService:
                 session,
                 project_id=project_id,
                 run_id=run_id,
+                allow_multi_agent=limits.allow_multi_agent,
                 on_dispatch=lambda: self._event(
                     session,
                     project_id,
@@ -199,7 +219,7 @@ class AutoRunnerService:
                         return AutoRunResult("stopped", "manual_stop", iteration, project_id, events)
                     time.sleep(max(0.0, min(0.1, wait_until - time.monotonic())))
                 continue
-            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"] or progress["new_checkpoints"]:
+            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"] or progress["new_candidates"]:
                 no_progress_count = 0
             else:
                 no_progress_count += 1
@@ -240,6 +260,13 @@ class AutoRunnerService:
                 self._event(session, project_id, "autorun.blocked", {"reason": "no_progress", "iteration": iteration})
                 return AutoRunResult("blocked", "no_progress", iteration, project_id, events)
 
+        if limits.handoff_phase is not None and not self._has_pending_intent(session, project_id):
+            self._seed_fallback_intent(
+                session,
+                project_id=project_id,
+                phase=limits.handoff_phase,
+                deadline_at=None,
+            )
         self._event(session, project_id, "autorun.stopped", {"reason": "max_iterations", "iterations": limits.max_iterations})
         return AutoRunResult("stopped", "max_iterations", limits.max_iterations, project_id, events)
 
@@ -286,6 +313,14 @@ class AutoRunnerService:
                 ).all()
             ),
             "findings": len(session.exec(select(Finding).where(Finding.project_id == project_id)).all()),
+            "candidates": len(
+                session.exec(
+                    select(FlagCandidate).where(
+                        FlagCandidate.project_id == project_id,
+                        FlagCandidate.status.in_(["LOCAL_VERIFIED", "ACCEPTED", "AWAITING_MANUAL_VALIDATION"]),
+                    )
+                ).all()
+            ),
             "checkpoints": len(
                 session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id)).all()
             ),
@@ -440,6 +475,7 @@ class AutoRunnerService:
             "new_facts": after["facts"] - before["facts"],
             "new_artifacts": after["artifacts"] - before["artifacts"],
             "new_findings": after["findings"] - before["findings"],
+            "new_candidates": after["candidates"] - before["candidates"],
             "new_checkpoints": after["checkpoints"] - before["checkpoints"],
             "new_attempts": after["attempts"] - before["attempts"],
         }

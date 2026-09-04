@@ -47,6 +47,74 @@ def test_worker_control_is_scoped_and_versions_live_updates(tmp_path) -> None:
     assert {event.event_type for event in events} >= {"blackboard.fact_appended", "checkpoint.saved"}
 
 
+def test_worker_control_write_request_ids_are_idempotent(tmp_path) -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        worker = Worker(id="worker_idempotent", project_id="proj_idempotent", intent_id="intent_idempotent", status="RUNNING")
+        attempt = Attempt(id="attempt_idempotent", project_id=worker.project_id, intent_id=worker.intent_id, worker_id=worker.id)
+        evidence_file = tmp_path / "evidence.txt"
+        evidence_file.write_text("observed", encoding="utf-8")
+        artifact = Artifact(project_id=worker.project_id, path=str(evidence_file), sha256="hash", type="tool-output")
+        session.add_all([worker, attempt, artifact])
+        session.commit()
+
+        service = WorkerControlService()
+        first_fact = service.append_fact(
+            session,
+            worker=worker,
+            attempt=attempt,
+            statement="The target is reachable.",
+            category="web",
+            confidence=0.9,
+            evidence_refs=[artifact.id],
+            request_id="request-fact-0001",
+        )
+        repeated_fact = service.append_fact(
+            session,
+            worker=worker,
+            attempt=attempt,
+            statement="The target is reachable.",
+            category="web",
+            confidence=0.9,
+            evidence_refs=[artifact.id],
+            request_id="request-fact-0001",
+        )
+        first_checkpoint = service.save_checkpoint(
+            session,
+            worker=worker,
+            attempt=attempt,
+            summary="Target checked",
+            completed_steps=["probe"],
+            failed_routes=[],
+            next_step="continue",
+            artifact_refs=[artifact.id],
+            request_id="request-checkpoint-0001",
+        )
+        repeated_checkpoint = service.save_checkpoint(
+            session,
+            worker=worker,
+            attempt=attempt,
+            summary="Target checked",
+            completed_steps=["probe"],
+            failed_routes=[],
+            next_step="continue",
+            artifact_refs=[artifact.id],
+            request_id="request-checkpoint-0001",
+        )
+        write_events = session.exec(
+            select(WorkerEvent).where(
+                WorkerEvent.attempt_id == attempt.id,
+                WorkerEvent.event_type.in_(["blackboard.fact_appended", "checkpoint.saved"]),
+            )
+        ).all()
+
+    assert repeated_fact == {**first_fact, "deduplicated": True}
+    assert repeated_checkpoint == {**first_checkpoint, "deduplicated": True}
+    assert len(write_events) == 2
+    assert attempt.blackboard_version == 2
+
+
 def test_worker_control_rejects_foreign_evidence(tmp_path) -> None:
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)

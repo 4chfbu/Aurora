@@ -216,10 +216,6 @@ class NetworkProxyRequest(BaseModel):
     no_proxy: str | None = Field(default=None, max_length=2_000)
 
 
-class OpenVPNUnlockRequest(BaseModel):
-    vault_password: str = Field(min_length=10, max_length=1_024)
-
-
 class TSecBenchConfigRequest(BaseModel):
     base_url: str = Field(min_length=1, max_length=2_048)
     token: str | None = Field(default=None, max_length=4_096)
@@ -301,6 +297,7 @@ class WorkerFactRequest(BaseModel):
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
     category: str = Field(default="analysis", min_length=1, max_length=100)
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    request_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class WorkerCheckpointRequest(BaseModel):
@@ -309,6 +306,7 @@ class WorkerCheckpointRequest(BaseModel):
     failed_routes: list[str] = Field(default_factory=list, max_length=20)
     next_step: str = Field(default="", max_length=1_000)
     artifact_refs: list[str] = Field(default_factory=list, max_length=100)
+    request_id: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class ImportProgressRegistry:
@@ -327,6 +325,7 @@ class ImportProgressRegistry:
 
 
 import_progress_registry = ImportProgressRegistry()
+worker_control_write_lock = Lock()
 
 
 def _run_import_batch(batch_id: str, *, cookie: str | None, username: str | None, password: str | None, login_url: str | None) -> None:
@@ -450,7 +449,6 @@ def create_app() -> FastAPI:
     @app.put("/api/settings/openvpn")
     async def save_openvpn_config(
         ovpn: UploadFile = File(...),
-        vault_password: str = Form(..., min_length=10, max_length=1_024),
         routes: str = Form(..., max_length=16_384),
         username: str | None = Form(default=None, max_length=1_024),
         password: str | None = Form(default=None, max_length=4_096),
@@ -462,26 +460,11 @@ def create_app() -> FastAPI:
             return openvpn_gateway_registry.save(
                 session,
                 ovpn=content,
-                vault_password=vault_password,
                 routes=route_values,
                 username=username,
                 password=password,
             )
         except (ValueError, OpenVPNError) as exc:
-            raise openvpn_error(exc) from exc
-
-    @app.post("/api/settings/openvpn/unlock")
-    def unlock_openvpn(payload: OpenVPNUnlockRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
-        try:
-            return openvpn_gateway_registry.unlock(session, payload.vault_password)
-        except (ValueError, OpenVPNError) as exc:
-            raise openvpn_error(exc) from exc
-
-    @app.post("/api/settings/openvpn/lock")
-    def lock_openvpn(session: Session = Depends(get_session)) -> dict[str, Any]:
-        try:
-            return openvpn_gateway_registry.lock(session)
-        except OpenVPNError as exc:
             raise openvpn_error(exc) from exc
 
     @app.post("/api/settings/openvpn/connect")
@@ -1048,8 +1031,9 @@ def create_app() -> FastAPI:
     def worker_append_fact(worker_id: str, payload: WorkerFactRequest, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:
         service = WorkerControlService()
         try:
-            worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
-            return service.append_fact(session, worker=worker, attempt=attempt, **payload.model_dump())
+            with worker_control_write_lock:
+                worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+                return service.append_fact(session, worker=worker, attempt=attempt, **payload.model_dump())
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1059,8 +1043,9 @@ def create_app() -> FastAPI:
     def worker_save_checkpoint(worker_id: str, payload: WorkerCheckpointRequest, authorization: str | None = Header(default=None), session: Session = Depends(get_session)) -> dict[str, Any]:
         service = WorkerControlService()
         try:
-            worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
-            return service.save_checkpoint(session, worker=worker, attempt=attempt, **payload.model_dump())
+            with worker_control_write_lock:
+                worker, attempt = service.authenticate(session, worker_id=worker_id, token=_bearer_token(authorization))
+                return service.save_checkpoint(session, worker=worker, attempt=attempt, **payload.model_dump())
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:

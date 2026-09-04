@@ -66,6 +66,8 @@ def test_blackboard_mcp_forwards_worker_control_environment() -> None:
         "AURORA_WORKER_CONTROL_BASE_URL",
         "AURORA_WORKER_ID",
         "AURORA_WORKER_CONTROL_TOKEN",
+        "AURORA_WORKER_CONTROL_TIMEOUT_SECONDS",
+        "AURORA_WORKER_CONTROL_MAX_ATTEMPTS",
     }
     assert "env_vars" not in servers["aurora_reverse"]
     assert "env_vars" not in servers["aurora_debug"]
@@ -85,6 +87,24 @@ def test_worker_container_runs_as_workspace_owner(monkeypatch, tmp_path) -> None
     assert command[user_index + 1] == f"{stat.st_uid}:{stat.st_gid}"
     assert "HOME=/workspace/runtime/home" in command
     assert workspace.joinpath("runtime", "home").is_dir()
+
+
+def test_worker_container_enforces_memory_and_swap_limits(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_CONTAINER_MEMORY", "2g")
+    monkeypatch.setenv("AURORA_WORKER_CONTAINER_MEMORY_SWAP", "2g")
+    get_settings.cache_clear()
+    monkeypatch.chdir(tmp_path)
+    workspace = tmp_path / "codex-workspaces" / "proj_test" / "worker_test"
+    workspace.mkdir(parents=True)
+    runner = KaliContainerRunner()
+    runner.engine = "docker"
+
+    command, _, _ = runner._build_command("true", workspace)
+
+    memory_index = command.index("--memory")
+    swap_index = command.index("--memory-swap")
+    assert command[memory_index + 1] == "2g"
+    assert command[swap_index + 1] == "2g"
 
 
 def test_streaming_runner_enforces_soft_timeout(monkeypatch, tmp_path) -> None:
@@ -233,6 +253,51 @@ def test_codex_harness_accepts_markdown_fenced_last_message(monkeypatch, tmp_pat
     assert output["summary"] == "flag recovered"
     assert diagnostic["source"] == "last_message_file"
     assert diagnostic["tolerant_json"] is True
+
+
+def test_codex_harness_repairs_structural_final_message_errors(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
+    get_settings.cache_clear()
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    output_file = tmp_path / "aurora-last-message.json"
+    output_file.write_text(
+        json.dumps({
+            "status": "SUCCESS",
+            "summary": "recovered",
+            "artifact_refs": "artifact_evidence",
+            "candidate_flags": {"value": "flag{example}", "artifact_ref": "artifact_evidence"},
+            "decision_summary": {
+                "selected_intent": "extract",
+                "reason_summary": "done",
+                "next_tool_plan": "flag.submit",
+                "internal_notes": "must not escape",
+            },
+            "analysis": "unknown top-level field",
+        }),
+        encoding="utf-8",
+    )
+    snapshot = SimpleNamespace(
+        sections_json={"current_intent": {"objective": "extract"}},
+        visible_tools_json=[],
+    )
+
+    output, diagnostic = runtime._parse_or_synthesize(
+        output_file=output_file,
+        stdout="",
+        stderr="",
+        exit_code=0,
+        failure_kind=None,
+        artifact_id="artifact_transcript",
+        snapshot=snapshot,
+    )
+
+    assert output["status"] == "success"
+    assert output["artifact_refs"] == ["artifact_evidence", "artifact_transcript"]
+    assert output["candidate_flags"] == [{"value": "flag{example}", "artifact_ref": "artifact_evidence"}]
+    assert output["decision_summary"]["next_tool_plan"] == ["flag.submit"]
+    assert set(output["decision_summary"]) == {"selected_intent", "reason_summary", "next_tool_plan"}
+    assert diagnostic["repaired"] is True
+    assert any("unknown fields" in repair for repair in diagnostic["repairs"])
 
 
 def test_codex_harness_normalizes_parameters_tool_payload(monkeypatch) -> None:

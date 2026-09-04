@@ -96,7 +96,7 @@ curl http://localhost:8000/api/projects/<project_id>/reliability
 配置 TSecBench 后，通过 `POST /api/evaluations/suites` 冻结尚未完成的互联网题目清单，再通过
 `POST /api/evaluations/suites/{suite_id}/runs` 分别创建 `baseline` 和 `candidate` 运行。运行报告以平台确认的
 完整解题为成功条件；`GET /api/evaluations/comparisons` 只有在同一冻结集上成功率提升至少 15 个百分点且
-错误候选率不升高时才返回 `promoted=true`。默认单题最多执行 5/20/25 分钟三个阶段，共 50 分钟。
+错误候选率不升高时才返回 `promoted=true`。默认单题最多执行 12/25/40 分钟三个阶段，共 77 分钟；P1 单 Agent，P2/P3 可多 Agent，hint 仅在 P3 获取。
 同一套件禁止重叠运行；创建下一次运行前，平台会话必须没有已接受进度。当前不运行含远程附件但尚未物化为
 Artifact 的套件，避免 baseline/candidate 输入不一致。少于 30 个有效题目时仍返回 95% Wilson 置信区间，
 但 `promotion_eligible=false`，不会自动晋级。

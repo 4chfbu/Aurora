@@ -32,7 +32,11 @@ BASE_TOOLS = (
             "type": "object",
             "required": ["source_artifact_refs", "verification_script"],
             "properties": {
-                "source_artifact_refs": {"type": "array", "items": {"type": "string"}},
+                "source_artifact_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Current-project Artifact IDs or evidence files inside the current Worker's /workspace.",
+                },
                 "verification_script": {
                     "type": "string",
                     "description": "Python script path in the Worker workspace (preferred), or inline Python source for compatibility.",

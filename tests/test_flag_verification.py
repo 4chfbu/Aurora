@@ -211,6 +211,46 @@ def test_flag_verify_accepts_container_workspace_script_path(monkeypatch, tmp_pa
         assert "hard-coded" in result.summary
 
 
+def test_flag_verify_registers_worker_workspace_source_path(monkeypatch, tmp_path) -> None:
+    gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspaces" / project_id / worker_id
+    workspace.mkdir(parents=True)
+    workspace.joinpath("evidence.txt").write_text("synt{jbexfcnpr}", encoding="utf-8")
+    workspace.joinpath("solve.py").write_text(
+        "import codecs, json, pathlib, sys\n"
+        "manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        "raw = pathlib.Path(manifest[0]['path']).read_text().strip()\n"
+        "print(codecs.decode(raw, 'rot_13'))\n",
+        encoding="utf-8",
+    )
+
+    with Session(engine) as session:
+        session.add_all([Project(id=project_id, name="verify", goal="derive"), AuthorizationScope(project_id=project_id)])
+        session.commit()
+        result = gateway.execute(
+            session,
+            project_id=project_id,
+            worker_id=worker_id,
+            attempt_id="attempt_workspace_source",
+            tool_name="flag.verify",
+            request={
+                "source_artifact_refs": ["/workspace/evidence.txt"],
+                "verification_script": "/workspace/solve.py",
+            },
+        )
+        source = session.exec(
+            select(Artifact).where(
+                Artifact.project_id == project_id,
+                Artifact.type == "worker-evidence",
+            )
+        ).one()
+
+    assert result.success is True
+    assert result.metrics["candidate_id"] in result.summary
+    assert source.origin_kind == "worker_observation"
+    assert source.id in result.artifact_refs
+
+
 def test_flag_verify_packages_source_with_original_extension(monkeypatch, tmp_path) -> None:
     gateway, engine, project_id, worker_id = _gateway(tmp_path, monkeypatch)
     workspace = tmp_path / "workspaces" / project_id / worker_id

@@ -94,13 +94,31 @@ def test_evaluation_run_uses_platform_completion_and_compares_same_suite() -> No
         session.add(baseline_group)
         session.commit()
         candidate = service.create_run(session, suite_id=suite.id, label="after", variant="candidate", client=FakeClient())
+        assert candidate.config_json["phase_minutes"] == [12, 25, 40]
+        assert candidate.config_json["max_minutes_per_challenge"] == 77
 
         candidate_result = session.exec(select(EvaluationItemResult).where(EvaluationItemResult.run_id == candidate.id)).one()
         project = session.get(Project, candidate_result.project_id)
         ChallengeGroupRunner._apply_phase_attempt_budget(session, project_id=project.id, phase=1)
         intent = session.exec(select(Intent).where(Intent.project_id == project.id, Intent.status == "PENDING")).one()
-        assert intent.budget["soft_timeout_seconds"] == 240
-        assert intent.budget["hard_timeout_seconds"] == 300
+        assert intent.budget["soft_timeout_seconds"] == 660
+        assert intent.budget["hard_timeout_seconds"] == 720
+        assert intent.budget["max_handoff_intents"] == 1
+        intent.budget = {}
+        session.add(intent)
+        session.commit()
+        ChallengeGroupRunner._apply_phase_attempt_budget(session, project_id=project.id, phase=2)
+        session.refresh(intent)
+        assert intent.budget["soft_timeout_seconds"] == 1440
+        assert intent.budget["hard_timeout_seconds"] == 1500
+        assert "max_handoff_intents" not in intent.budget
+        intent.budget = {}
+        session.add(intent)
+        session.commit()
+        ChallengeGroupRunner._apply_phase_attempt_budget(session, project_id=project.id, phase=3)
+        session.refresh(intent)
+        assert intent.budget["soft_timeout_seconds"] == 2340
+        assert intent.budget["hard_timeout_seconds"] == 2400
         project.status = "COMPLETED"
         item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project.id)).one()
         item.submission_status = "ACCEPTED"

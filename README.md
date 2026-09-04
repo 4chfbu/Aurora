@@ -338,7 +338,7 @@ npm audit --audit-level=moderate
 
 ## Frozen Evaluation
 
-The TSecBench evaluation API freezes eligible clean challenges and runs `baseline` or `candidate` variants in 5/20/25-minute phases (50 minutes per challenge). A suite permits only one active run, rejects live platform state with accepted progress, and currently refuses remote-attachment items until attachment materialization is implemented. Baseline and candidate therefore require independent clean platform sessions, or an explicit platform reset between runs. Promotion requires at least 30 eligible items, a 15-point success-rate improvement, no worse wrong-submission rate, the repeated-request reduction gate, and complete derived-verification and terminal-checkpoint coverage.
+The TSecBench evaluation API freezes eligible clean challenges and runs `baseline` or `candidate` variants in 12/25/40-minute phases (77 minutes per challenge). Phase 1 is one serial direct-solve attempt that checkpoints one continuation Intent; phases 2 and 3 may use multi-agent exploration, and the platform hint is fetched only on entry to phase 3. A suite permits only one active run, rejects live platform state with accepted progress, and currently refuses remote-attachment items until attachment materialization is implemented. Baseline and candidate therefore require independent clean platform sessions, or an explicit platform reset between runs. Promotion requires at least 30 eligible items, a 15-point success-rate improvement, no worse wrong-submission rate, the repeated-request reduction gate, and complete derived-verification and terminal-checkpoint coverage.
 
 ## Third-party licensing
 

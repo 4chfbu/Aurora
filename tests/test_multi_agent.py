@@ -43,6 +43,49 @@ def test_multi_agent_policy_requires_global_and_project_opt_in(monkeypatch) -> N
         assert enabled_policy["max_parallel_explorers"] == 3
 
 
+def test_phase_gate_forces_serial_execution_despite_multi_agent_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
+    get_settings.cache_clear()
+    serial_calls: list[str] = []
+    monkeypatch.setattr(
+        "aurora.services.multi_agent.run_one_demo_step",
+        lambda session, project_id, run_id: serial_calls.append(project_id) or {"status": "serial"},
+    )
+    monkeypatch.setattr(
+        "aurora.services.multi_agent._execute_one",
+        lambda project_id: (_ for _ in ()).throw(AssertionError("phase 1 must not start peer explorers")),
+    )
+    with Session(engine) as session:
+        project = Project(name="serial-phase", goal="solve directly")
+        session.add(project)
+        session.commit()
+        session.add_all([
+            ProjectRuntimePolicy(
+                project_id=project.id,
+                multi_agent_exploration_enabled=True,
+                max_parallel_explorers=2,
+            ),
+            Intent(project_id=project.id, objective="route one"),
+            Intent(project_id=project.id, objective="route two"),
+        ])
+        session.commit()
+        claim = project_run_control.acquire(project_id=project.id, owner="test")
+        assert claim is not None
+        try:
+            result = run_project_exploration_step(
+                session,
+                project_id=project.id,
+                run_id=claim.run_id,
+                allow_multi_agent=False,
+            )
+        finally:
+            project_run_control.release(project_id=project.id, run_id=claim.run_id)
+
+    assert result["status"] == "serial"
+    assert serial_calls == [project.id]
+    get_settings.cache_clear()
+
+
 def test_parallel_explorers_claim_distinct_intents_and_overlap(monkeypatch) -> None:
     monkeypatch.setenv("AURORA_MULTI_AGENT_EXPLORATION_ENABLED", "true")
     monkeypatch.setenv("AURORA_MULTI_AGENT_MAX_GLOBAL_WORKERS", "4")

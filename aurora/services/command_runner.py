@@ -373,6 +373,8 @@ class KaliContainerRunner(CommandRunner):
             str(self.settings.worker_container_cpus),
             "--memory",
             self.settings.worker_container_memory,
+            "--memory-swap",
+            self.settings.worker_container_memory_swap,
             "--user",
             f"{workspace_stat.st_uid}:{workspace_stat.st_gid}",
             *self._label_args(relative_cwd),

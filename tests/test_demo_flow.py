@@ -624,6 +624,44 @@ def test_planner_reflection_caps_generated_intents_at_three(monkeypatch) -> None
             assert len(checkpoint.generated_intent_ids) == 3
 
 
+def test_phase_one_reflection_keeps_only_one_handoff_intent() -> None:
+    with Session(engine) as session:
+        project = Project(name="single-handoff", goal="solve directly")
+        intent = Intent(project_id=project.id, objective="bootstrap")
+        session.add_all([project, intent])
+        session.commit()
+        worker = Worker(project_id=project.id, intent_id=intent.id, status="COMPLETED")
+        session.add(worker)
+        session.commit()
+        attempt = Attempt(
+            project_id=project.id,
+            intent_id=intent.id,
+            worker_id=worker.id,
+            status="PARTIAL",
+            result_summary="Need a handoff",
+        )
+        session.add(attempt)
+        session.commit()
+
+        checkpoint = RoundReflectionService().create(
+            session,
+            attempt=attempt,
+            output={
+                "status": "partial",
+                "summary": "Need a handoff",
+                "suggested_intents": [
+                    {"objective": f"Follow-up route {index}", "capabilities": ["blackboard.query"]}
+                    for index in range(3)
+                ],
+                "decision_summary": {"next_tool_plan": []},
+            },
+            budget={"phase": 1, "max_handoff_intents": 1},
+            skip_planner=True,
+        )
+
+        assert len(checkpoint.generated_intent_ids) == 1
+
+
 def test_blackboard_suppresses_duplicate_intents_and_merges_facts() -> None:
     client = TestClient(create_app())
     with client:
