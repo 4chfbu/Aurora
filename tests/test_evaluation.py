@@ -6,7 +6,7 @@ from aurora.config import get_settings
 from aurora.db import engine
 import pytest
 
-from aurora.models import ChallengeGroup, ChallengeGroupItem, EvaluationItemResult, FlagCandidate, Intent, Project, ProjectRuntimePolicy, now_utc
+from aurora.models import ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, EvaluationItemResult, EvaluationRun, EvaluationSuite, FlagCandidate, Intent, Project, ProjectRuntimePolicy, now_utc
 from aurora.services.challenge_group_runner import ChallengeGroupRunner
 from aurora.services.evaluation import EvaluationService
 from aurora.services.tsecbench import TSecBenchChallenge
@@ -55,6 +55,26 @@ def test_evaluation_suite_is_frozen_and_excludes_completed_challenges() -> None:
         assert [item["unique_code"] for item in suite.items_json] == ["fresh-web"]
         assert suite.items_json[0]["version_hash"]
         assert suite.content_hash
+
+
+def test_started_evaluation_api_returns_run_identifiers(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from aurora.api import create_app
+
+    monkeypatch.setattr("aurora.services.evaluation.TSecBenchClient.list_challenges", lambda self: FakeClient().list_challenges())
+    monkeypatch.setattr("aurora.api.challenge_group_registry.start", lambda group_id: SimpleNamespace(group_id=group_id, status="RUNNING"))
+    with TestClient(create_app()) as client:
+        suite = client.post("/api/evaluations/suites", json={"name": "api-run"}).json()
+        response = client.post(f"/api/evaluations/suites/{suite['id']}/runs", json={
+            "label": "baseline", "variant": "baseline", "start": True,
+        })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["run"]["id"]
+    assert data["run"]["group_id"] == data["background"]["group_id"]
+    assert data["run"]["status"] == "RUNNING"
 
 
 def test_evaluation_projects_opt_into_multi_agent_when_globally_enabled(monkeypatch) -> None:
@@ -180,3 +200,79 @@ def test_evaluation_rejects_overlapping_runs_dirty_platform_state_and_unmaterial
         suite = service.create_suite(session, name="attachments", client=AttachmentClient())
         with pytest.raises(ValueError, match="materialization is not implemented"):
             service.create_run(session, suite_id=suite.id, label="attachments", client=AttachmentClient())
+
+
+@pytest.mark.parametrize("submission_status", ["MANUALLY_ACCEPTED", "SUBMITTED"])
+def test_evaluation_requires_platform_acceptance(submission_status) -> None:
+    service = EvaluationService()
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="platform-only", client=FakeClient())
+        run = service.create_run(session, suite_id=suite.id, label="candidate", client=FakeClient())
+        result = session.exec(select(EvaluationItemResult).where(EvaluationItemResult.run_id == run.id)).one()
+        project = session.get(Project, result.project_id)
+        item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project.id)).one()
+        project.status = item.fused_status = "COMPLETED"
+        item.submission_status = submission_status
+        session.add_all([project, item])
+        session.commit()
+
+        report = service.refresh(session, run_id=run.id)
+
+        assert report["metrics"]["completed"] == 0
+        assert report["results"][0].platform_correct is None
+
+
+def test_evaluation_keeps_rejected_submission_history_after_success() -> None:
+    service = EvaluationService()
+    with Session(engine) as session:
+        suite = service.create_suite(session, name="submission-history", client=FakeClient())
+        run = service.create_run(session, suite_id=suite.id, label="candidate", client=FakeClient())
+        result = session.exec(select(EvaluationItemResult).where(EvaluationItemResult.run_id == run.id)).one()
+        project = session.get(Project, result.project_id)
+        item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project.id)).one()
+        project.status = item.fused_status = "COMPLETED"
+        item.submission_status = "ACCEPTED"
+        session.add_all([project, item])
+        for index in range(2):
+            session.add(ChallengeGroupEvent(
+                group_id=run.group_id, item_id=item.id,
+                event_type="group.item.flag_submission_rejected",
+                payload_json={"candidate_id": f"rejected-{index}"},
+            ))
+        session.commit()
+
+        report = service.refresh(session, run_id=run.id)
+
+        assert report["metrics"]["completed"] == 1
+        assert report["metrics"]["wrong_submissions"] == 2
+
+
+@pytest.mark.parametrize("candidate_status", ["RUNNING", "COMPLETED"])
+def test_comparison_uses_the_same_eligible_challenges(candidate_status) -> None:
+    service = EvaluationService()
+    with Session(engine) as session:
+        suite = EvaluationSuite(name="paired", content_hash="frozen", items_json=[
+            {"unique_code": str(index)} for index in range(40)
+        ])
+        baseline = EvaluationRun(suite_id=suite.id, label="before", variant="baseline", status="COMPLETED")
+        candidate = EvaluationRun(suite_id=suite.id, label="after", variant="candidate", status=candidate_status)
+        session.add_all([suite, baseline, candidate])
+        for index in range(40):
+            # Candidate loses ten failures to environment errors. This must not
+            # manufacture a 25-point improvement or satisfy the promotion gate.
+            for run in (baseline, candidate):
+                session.add(EvaluationItemResult(
+                    run_id=run.id, challenge_key=str(index),
+                    status="COMPLETED" if index < 30 else "FAILED",
+                    platform_completed=index < 30,
+                    environment_error=run.id == candidate.id and index >= 30,
+                ))
+        session.commit()
+
+        comparison = service.compare(session, baseline_run_id=baseline.id, candidate_run_id=candidate.id)
+
+        assert comparison.sample_size == 30
+        assert comparison.baseline_success_rate == comparison.candidate_success_rate == 1.0
+        assert comparison.improvement_points == 0.0
+        assert comparison.promoted is False
+        assert comparison.promotion_eligible is (candidate_status == "COMPLETED")

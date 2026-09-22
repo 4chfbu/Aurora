@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unicodedata
+from pathlib import Path
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from aurora.models import Artifact
+from aurora.models import Artifact, ToolTrace
 from aurora.services.artifact_store import ArtifactStore
+from aurora.services.evidence_context import current_environment_id
 from aurora.services.flag_prefix_config import current_flag_prefixes, flag_prefixes_for_project
 
 
@@ -95,7 +99,12 @@ class FlagValidator:
                 continue
             if not self.is_trusted_evidence_artifact(artifact):
                 continue
-            content = self.artifact_store.read_text(artifact, max_bytes=128_000)
+            if not self.is_current_evidence(session, artifact):
+                continue
+            try:
+                content = self.artifact_store.read_text(artifact, max_bytes=128_000)
+            except OSError:
+                continue
             content = self._scannable_content(artifact, content)
             if not content:
                 continue
@@ -104,7 +113,9 @@ class FlagValidator:
                     value = match.group(0)
                     if not self.is_valid_flag_value(value, allowed_prefixes):
                         continue
-                    key = value.lower()
+                    if self.is_request_value(session, artifact, value):
+                        continue
+                    key = value
                     if key in seen:
                         continue
                     seen.add(key)
@@ -124,14 +135,72 @@ class FlagValidator:
         if artifact is None or (project_id is not None and artifact.project_id != project_id):
             return False
         return any(
-            candidate["value"].lower() == value.lower()
+            candidate["value"] == value
             for candidate in self.extract_candidate_flags(session, artifact_refs=[artifact_ref], project_id=project_id)
         )
 
     def is_trusted_artifact_ref(self, session: Session, artifact_ref: str | None, project_id: str | None = None) -> bool:
         """Return whether an artifact id can be used as provenance for a derived flag."""
         artifact = session.get(Artifact, artifact_ref) if artifact_ref else None
-        return bool(artifact and (project_id is None or artifact.project_id == project_id) and self.is_trusted_evidence_artifact(artifact))
+        return bool(artifact and (project_id is None or artifact.project_id == project_id) and self.is_trusted_evidence_artifact(artifact) and self.is_current_evidence(session, artifact))
+
+    @staticmethod
+    def request_evidence_context(request_text: str) -> dict:
+        return {"input_flag_hashes": sorted({
+            hashlib.sha256(match.group(0).encode()).hexdigest()
+            for pattern in FLAG_PATTERNS
+            for match in pattern.finditer(FlagValidator._unescape_terminal_content(request_text))
+        })}
+
+    def is_request_value(self, session: Session, artifact: Artifact, value: str) -> bool:
+        if artifact.origin_kind == "operator_observation":
+            return False
+        digest = hashlib.sha256(value.encode()).hexdigest()
+        context = artifact.evidence_context or {}
+        if "input_flag_hashes" in context:
+            return digest in context["input_flag_hashes"]
+        if artifact.type != "terminal":
+            return False
+        statement = select(ToolTrace).where(ToolTrace.project_id == artifact.project_id)
+        if artifact.source_attempt_id:
+            statement = statement.where(ToolTrace.attempt_id == artifact.source_attempt_id)
+        for trace in session.exec(statement).all():
+            if artifact.id in (trace.artifact_refs or []):
+                inputs = self.request_evidence_context(json.dumps(trace.request_json, ensure_ascii=False))
+                if digest in inputs["input_flag_hashes"]:
+                    return True
+        return False
+
+    def is_current_evidence(self, session: Session, artifact: Artifact, *, visited: frozenset[str] = frozenset()) -> bool:
+        if artifact.id in visited or len(visited) >= 20:
+            return False
+        try:
+            with Path(artifact.path).open("rb") as handle:
+                if hashlib.file_digest(handle, "sha256").hexdigest() != artifact.sha256:
+                    return False
+        except OSError:
+            return False
+        if artifact.origin_kind == "verified_derivation":
+            try:
+                payload = json.loads(self.artifact_store.read_text(artifact, max_bytes=128_000))
+            except (OSError, ValueError):
+                return False
+            sources = payload.get("source_artifacts") if isinstance(payload, dict) else None
+            if not isinstance(sources, list) or not sources:
+                return False
+            for source in sources:
+                if not isinstance(source, dict):
+                    return False
+                original = session.get(Artifact, source.get("id")) if isinstance(source.get("id"), str) else None
+                if original is None or original.project_id != artifact.project_id or source.get("sha256") != original.sha256:
+                    return False
+                if not self.is_current_evidence(session, original, visited=visited | {artifact.id}):
+                    return False
+            return True
+        if artifact.origin_kind == "challenge_input" or artifact.type == "imported_attachment":
+            return True
+        environment_id = current_environment_id(session, artifact.project_id)
+        return environment_id is None or (artifact.evidence_context or {}).get("environment_id") == environment_id
 
     @staticmethod
     def is_valid_flag_value(value: str, allowed_prefixes: tuple[str, ...] | list[str] | None = None) -> bool:
@@ -198,6 +267,12 @@ class FlagValidator:
         )
 
     def _scannable_content(self, artifact: Artifact, content: str) -> str:
+        if artifact.origin_kind == "verified_derivation":
+            try:
+                payload = json.loads(content)
+            except ValueError:
+                return ""
+            return str(payload.get("value") or "") if isinstance(payload, dict) else ""
         if "[stdout]" in content:
             after_stdout = content.split("[stdout]", 1)[1]
             content = after_stdout.split("[stderr]", 1)[0]

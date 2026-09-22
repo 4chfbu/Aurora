@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 
 from aurora.config import get_settings
 from aurora.models import Artifact, new_id
+from aurora.services.evidence_context import artifact_environment_context
 
 
 class ArtifactStore:
@@ -24,6 +25,7 @@ class ArtifactStore:
         artifact_type: str = "text",
         sensitivity: str = "normal",
         origin_kind: str = "unclassified",
+        evidence_context: dict | None = None,
     ) -> Artifact:
         artifact_id = new_id("artifact")
         project_dir = self.base_dir / project_id
@@ -43,6 +45,10 @@ class ArtifactStore:
             summary=summary,
             sensitivity=sensitivity,
             origin_kind=origin_kind,
+            evidence_context={
+                **artifact_environment_context(session, project_id=project_id, source_attempt_id=source_attempt_id, origin_kind=origin_kind),
+                **(evidence_context or {}),
+            },
         )
         session.add(artifact)
         session.commit()
@@ -64,18 +70,31 @@ class ArtifactStore:
     ) -> Artifact:
         data = source.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
+        context = {
+            **artifact_environment_context(session, project_id=project_id, source_attempt_id=source_attempt_id, origin_kind=origin_kind),
+            "original_name": source.name,
+        }
         if deduplicate:
-            existing = session.exec(
+            candidates = session.exec(
                 select(Artifact)
                 .where(
                     Artifact.project_id == project_id,
                     Artifact.sha256 == digest,
                     Artifact.type == artifact_type,
+                    Artifact.origin_kind == origin_kind,
+                    Artifact.sensitivity == sensitivity,
                 )
                 .order_by(Artifact.created_at)
-            ).first()
-            if existing is not None and Path(existing.path).is_file():
-                return existing
+            ).all()
+            for existing in candidates:
+                if existing.evidence_context != context:
+                    continue
+                try:
+                    with Path(existing.path).open("rb") as handle:
+                        if hashlib.file_digest(handle, "sha256").hexdigest() == digest:
+                            return existing
+                except OSError:
+                    continue
         artifact_id = new_id("artifact")
         project_dir = self.base_dir / project_id
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +113,7 @@ class ArtifactStore:
             summary=summary,
             sensitivity=sensitivity,
             origin_kind=origin_kind,
+            evidence_context=context,
         )
         session.add(artifact)
         session.commit()
@@ -101,5 +121,10 @@ class ArtifactStore:
         return artifact
 
     def read_text(self, artifact: Artifact, max_bytes: int = 64_000) -> str:
-        data = Path(artifact.path).read_bytes()[:max_bytes]
+        with Path(artifact.path).open("rb") as handle:
+            data = handle.read(max(0, max_bytes))
         return data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def original_name(artifact: Artifact) -> str:
+        return Path(str((artifact.evidence_context or {}).get("original_name") or artifact.path)).name

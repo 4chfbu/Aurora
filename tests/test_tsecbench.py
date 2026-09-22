@@ -152,6 +152,15 @@ def test_tsecbench_start_authorizes_returned_container(tmp_path: Path) -> None:
         scope = session.exec(select(AuthorizationScope).where(AuthorizationScope.project_id == project.id)).one()
         assert project.target_url == "https://target.example:8443"
         assert scope.allowed_hosts == ["target.example"]
+        item = session.exec(select(ChallengeGroupItem).where(ChallengeGroupItem.project_id == project.id)).one()
+        first_environment = item.competition_meta["environment_id"]
+        assert adapter.ensure_environment(session, project_id=project.id).available
+        assert item.competition_meta["environment_id"] == first_environment
+        item.competition_meta = {**item.competition_meta, "container_status": "stopped", "container_addr": []}
+        session.add(item)
+        session.commit()
+        assert adapter.ensure_environment(session, project_id=project.id).available
+        assert item.competition_meta["environment_id"] != first_environment
 
 
 def test_tsecbench_close_releases_target_and_authorization(tmp_path: Path) -> None:
@@ -786,7 +795,7 @@ def test_capacity_only_blocker_uses_waiting_resource(tmp_path: Path, monkeypatch
     SQLModel.metadata.create_all(test_engine)
     monkeypatch.setattr("aurora.services.challenge_group_runner.engine", test_engine)
     with Session(test_engine) as session:
-        group = ChallengeGroup(name="resource-wait", max_concurrent=2)
+        group = ChallengeGroup(name="resource-wait", max_concurrent=2, limits={"resource_retry_limit": 0})
         project = Project(name="one", goal="solve")
         session.add_all([group, project])
         session.commit()
@@ -1375,7 +1384,7 @@ def test_partial_flag_submission_updates_progress_without_completing_project(tmp
         assert item.competition_meta["is_completed"] is False
 
 
-def test_runner_continues_after_partial_tsecbench_flag() -> None:
+def test_runner_continues_after_partial_tsecbench_flag(tmp_path) -> None:
     class PartialAdapter:
         def submit_flag(self, session, *, project_id, value):
             assert value == "flag{one}"
@@ -1401,12 +1410,19 @@ def test_runner_continues_after_partial_tsecbench_flag() -> None:
             fused_status="RUNNING",
             competition_meta={"platform": "tsecbench", "unique_code": "multi-flag", "flag_count": 2},
         )
+        from aurora.services.artifact_store import ArtifactStore
+
+        evidence = ArtifactStore(tmp_path).write_text(
+            session, project_id=project.id, content="flag{one}", summary="target response",
+            origin_kind="target_observation",
+        )
         candidate = FlagCandidate(
             project_id=project.id,
             value="flag{one}",
             value_hash=hashlib.sha256(b"flag{one}").hexdigest(),
             status="LOCAL_VERIFIED",
             provenance_kind="OBSERVED",
+            artifact_refs=[evidence.id],
         )
         session.add_all([item, candidate])
         session.commit()
@@ -1435,7 +1451,7 @@ def test_runner_continues_after_partial_tsecbench_flag() -> None:
             )
         ).one()
         assert project.status == "WORKING"
-        assert (item.status, item.fused_status, item.phase, item.submission_status) == ("PENDING", "PENDING", 1, "PARTIAL")
+        assert (item.status, item.fused_status, item.phase, item.submission_status) == ("PENDING", "PENDING", 2, "PARTIAL")
         assert group.current_item_id is None
         assert candidate.status == "ACCEPTED"
         assert "1/2" in continuation.objective

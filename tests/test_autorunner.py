@@ -150,7 +150,7 @@ def test_autorun_passes_scheduler_phase_to_reasoner(monkeypatch) -> None:
     phases: list[int | None] = []
     monkeypatch.setattr(
         "aurora.services.autorunner.ProjectReasoner.run",
-        lambda self, session, project_id, phase=None: phases.append(phase) or {"status": "unchanged"},
+        lambda self, session, project_id, phase=None, deadline_at=None: phases.append(phase) or {"status": "unchanged"},
     )
     monkeypatch.setattr(
         "aurora.services.autorunner.run_project_exploration_step",
@@ -223,7 +223,7 @@ def test_phase_one_defers_reasoning_runs_once_and_seeds_phase_two_handoff(monkey
 def test_autorun_preserves_reason_noop_without_seeding_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         "aurora.services.autorunner.ProjectReasoner.run",
-        lambda self, session, project_id, phase=None: {"status": "noop"},
+        lambda self, session, project_id, phase=None, deadline_at=None: {"status": "noop"},
     )
     monkeypatch.setattr(
         "aurora.services.autorunner.ManagerService.run_project",

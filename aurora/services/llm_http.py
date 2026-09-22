@@ -4,9 +4,11 @@ import json
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any
 
 from aurora.config import Settings, get_settings
+from aurora.services.deadlines import remaining_seconds
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
@@ -26,6 +28,7 @@ def chat_completion(
     temperature: float = 0.2,
     json_mode: bool = True,
     max_retries: int = 3,
+    deadline_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Send an OpenAI-compatible chat completion request with bounded retry.
 
@@ -49,6 +52,10 @@ def chat_completion(
 
     last_error: str | None = None
     for attempt in range(max_retries):
+        remaining = remaining_seconds(deadline_at)
+        if remaining is not None and remaining <= 0:
+            raise LLMRequestError("LLM request deadline exceeded")
+        attempt_timeout = min(resolved_timeout, remaining) if remaining is not None else resolved_timeout
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -59,7 +66,7 @@ def chat_completion(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=resolved_timeout) as response:
+            with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -69,20 +76,28 @@ def chat_completion(
                 pass
             last_error = f"HTTP {exc.code}: {detail[:1000]}"
             if exc.code in RETRYABLE_STATUS_CODES and attempt < max_retries - 1:
-                time.sleep(min(8.0, 1.5 ** (attempt + 1)))
+                _retry_sleep(attempt, deadline_at)
                 continue
             raise LLMRequestError(f"LLM API request failed: {last_error}") from exc
         except urllib.error.URLError as exc:
             last_error = str(exc)
             if attempt < max_retries - 1:
-                time.sleep(min(8.0, 1.5 ** (attempt + 1)))
+                _retry_sleep(attempt, deadline_at)
                 continue
             raise LLMRequestError(f"LLM API request failed: {last_error}") from exc
         except Exception as exc:  # noqa: BLE001 - surface any remaining transport fault
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < max_retries - 1:
-                time.sleep(min(8.0, 1.5 ** (attempt + 1)))
+                _retry_sleep(attempt, deadline_at)
                 continue
             raise LLMRequestError(f"LLM API request failed: {last_error}") from exc
 
     raise LLMRequestError(f"LLM API request failed after {max_retries} attempts: {last_error}")
+
+
+def _retry_sleep(attempt: int, deadline_at: datetime | None) -> None:
+    delay = min(8.0, 1.5 ** (attempt + 1))
+    remaining = remaining_seconds(deadline_at)
+    if remaining is not None:
+        delay = min(delay, remaining)
+    time.sleep(delay)

@@ -553,7 +553,7 @@ def test_reflection_is_the_only_automatic_intent_authority_and_is_idempotent() -
             assert len(first.generated_intent_ids) == 1
             generated = session.get(Intent, first.generated_intent_ids[0])
             assert generated is not None and generated.capability_tags == ["blackboard.query"]
-            assert generated.budget == {"model_role": "planner", "max_tool_calls": 2}
+            assert generated.budget == {"model_role": "planner", "max_tool_calls": 2, "continuation_attempt_id": attempt.id}
             assert len(session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.attempt_id == attempt.id)).all()) == 1
 
 

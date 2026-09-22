@@ -16,13 +16,20 @@ from typing import Any, Protocol
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, Attempt, ContextSnapshot, Intent, LLMTrace, Project, ToolTrace, Worker, WorkerEvent, now_utc
+from aurora.models import Artifact, Attempt, ContextSnapshot, Fact, Intent, LLMTrace, Project, ProjectCoordinationState, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.llm_http import LLMRequestError, chat_completion
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.blackboard_repository import route_fingerprint
+from aurora.services.flag_validator import FlagValidator
 from aurora.services.command_runner import AutoCommandRunner, CommandResult, CommandRunner
 from aurora.services.prompt_renderer import PromptRenderer
 from aurora.services.tool_profiles import image_for_profile
+from aurora.services.deadlines import execution_deadline, remaining_seconds
+from aurora.services.progress import is_sync_request, target_transport_failed, transport_failed
+from aurora.services.context_memory import parent_attempt_candidates
+from aurora.services.evidence_context import current_environment_id
+from aurora.services.resume_store import restore_resume_manifest
+from aurora.services.runtime_usage import session_token_usage, session_usage_delta
 
 
 @dataclass
@@ -91,7 +98,7 @@ class OpenAICompatibleRuntime:
 
         prompt = self._build_prompt(worker, snapshot)
         model = self.settings.model_for_role(str(worker.budgets.get("model_role", "solver")))
-        response = self._call_llm(prompt, model=model)
+        response = self._call_llm(prompt, model=model, deadline_at=execution_deadline(session, worker.project_id, worker.id))
         structured = self._parse_structured_output(response["content"])
         structured = self._normalize_structured_output(structured, snapshot)
         output_json = json.dumps(structured, ensure_ascii=False, sort_keys=True)
@@ -121,13 +128,14 @@ class OpenAICompatibleRuntime:
     def _build_prompt(self, worker: Worker, snapshot: ContextSnapshot) -> list[dict[str, str]]:
         return PromptRenderer().render_messages(worker=worker, snapshot=snapshot)
 
-    def _call_llm(self, messages: list[dict[str, str]], *, model: str | None = None) -> dict[str, Any]:
+    def _call_llm(self, messages: list[dict[str, str]], *, model: str | None = None, deadline_at: datetime | None = None) -> dict[str, Any]:
         try:
             body = chat_completion(
                 settings=self.settings,
                 model=model or self.model,
                 messages=messages,
                 timeout=self.settings.llm_timeout_seconds,
+                deadline_at=deadline_at,
             )
         except LLMRequestError as exc:
             raise RuntimeError(str(exc)) from exc
@@ -289,23 +297,39 @@ class CodexHarnessRuntime:
         self.command_runner = command_runner
 
     def execute(self, session: Session, *, worker: Worker, snapshot: ContextSnapshot) -> RuntimeOutput:
-        prompt_file = self._write_prompt(session, worker, snapshot)
+        started = time.monotonic()
+        workspace = self.settings.codex_workspace_dir / snapshot.project_id / worker.id
         model_role = str(worker.budgets.get("model_role", "solver"))
         model = self.settings.model_for_role(model_role)
         model_context_window, auto_compact_token_limit = self.settings.codex_metadata_for_role(model_role)
-        command = self._render_command(prompt_file, model=model)
-        started = time.monotonic()
         attempt = session.exec(
             select(Attempt).where(Attempt.worker_id == worker.id, Attempt.status == "RUNNING").order_by(Attempt.started_at.desc())
         ).first()
+        requested_parent_id = attempt.parent_attempt_id if attempt else None
         control_token = secrets.token_urlsafe(32)
         resume_thread_id = self._prepare_attempt(
             session,
             worker=worker,
             attempt=attempt,
             control_token=control_token,
-            workspace=prompt_file.parent,
+            workspace=workspace,
         )
+        restored_work = session.exec(select(WorkerEvent).where(
+            WorkerEvent.attempt_id == attempt.id, WorkerEvent.event_type == "codex.work_state_restored",
+        )).first() if attempt else None
+        if attempt is not None and (attempt.parent_attempt_id != requested_parent_id or restored_work is not None):
+            # A corrupt preferred bundle may select a different valid parent.
+            # Render and record the handoff belonging to the state actually restored.
+            from aurora.services.context_builder import ContextBuilder
+            ContextBuilder().build(session, project_id=worker.project_id, intent_id=worker.intent_id,
+                                   worker_id=worker.id, existing_snapshot=snapshot)
+        prompt_file = self._write_prompt(session, worker, snapshot, preserve_inputs=(workspace / "inputs" / "manifest.json").is_file())
+        command = self._render_command(prompt_file, model=model)
+        if attempt is not None:
+            try:
+                self._sync_blackboard(session, worker=worker, attempt=attempt)
+            except Exception:
+                session.rollback()
         tool_environment = snapshot.sections_json.get("tool_environment") or {}
         subagent_policy = (snapshot.sections_json.get("operating_mode") or {}).get("subagents") or {}
         profile = str(tool_environment.get("profile") or "heavy")
@@ -329,6 +353,8 @@ class CodexHarnessRuntime:
                 "AURORA_SUBAGENTS_MAX_CONCURRENT": str(max(1, int(subagent_policy.get("max_concurrent") or 1))),
             },
         )
+        usage_before = session_token_usage(workspace, resume_thread_id)
+        primary_started = time.monotonic()
         try:
             completed = self._run_command(
                 command,
@@ -336,6 +362,7 @@ class CodexHarnessRuntime:
                 timeout_seconds=worker.budgets.get("hard_timeout_seconds"),
                 soft_timeout_seconds=worker.budgets.get("soft_timeout_seconds"),
                 finalize_grace_seconds=worker.budgets.get("finalize_grace_seconds"),
+                deadline_at=execution_deadline(session, worker.project_id, worker.id),
                 runner=runner,
                 on_output=lambda stream, line: self._record_codex_event(
                     session,
@@ -351,6 +378,7 @@ class CodexHarnessRuntime:
                 attempt.codex_control_token_hash = None
                 session.add(attempt)
                 session.commit()
+        primary_finished = time.monotonic()
         transcript = self._bounded_transcript(self._transcript(command, completed))
         artifact = self.artifact_store.write_text(
             session,
@@ -442,19 +470,36 @@ class CodexHarnessRuntime:
         output_json = json.dumps(structured, ensure_ascii=False, sort_keys=True)
         prompt_text = prompt_file.read_text(encoding="utf-8")
         decision_summary = structured.get("decision_summary") or {}
+        usage = dict(attempt.token_usage or {}) if attempt is not None else {}
+        usage_source = "turn.completed" if usage else "unavailable"
+        session_usage = session_usage_delta(usage_before, session_token_usage(workspace, attempt.codex_thread_id)) if attempt else {}
+        if session_usage and all(session_usage.get(key, 0) >= value for key, value in usage.items()):
+            usage = session_usage
+            usage_source = "session.token_count"
+            attempt.token_usage = usage
+            session.add(attempt)
         trace = LLMTrace(
             project_id=snapshot.project_id,
             worker_id=worker.id,
             intent_id=worker.intent_id,
+            attempt_id=attempt.id if attempt else None,
             context_snapshot_id=snapshot.id,
             prompt_hash=hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
             model=model,
             input_chars=len(prompt_text),
-            estimated_input_tokens=max(1, len(prompt_text) // 4),
+            estimated_input_tokens=usage.get("input_tokens", max(1, len(prompt_text) // 4)),
             output_chars=len(output_json),
-            estimated_output_tokens=max(1, len(output_json) // 4),
+            estimated_output_tokens=usage.get("output_tokens", max(1, len(output_json) // 4)),
             provider_usage_json={
                 "runtime": "codex",
+                "usage": usage,
+                "usage_source": usage_source,
+                "usage_complete": bool(usage) and completed.exit_code == 0 and not completed.finalization_reason,
+                "timing_ms": {
+                    "setup": round((primary_started - started) * 1000),
+                    "primary_command": round((primary_finished - primary_started) * 1000),
+                    "finalization": round((time.monotonic() - primary_finished) * 1000),
+                },
                 "command": command,
                 "backend": completed.backend,
                 "exit_code": completed.exit_code,
@@ -493,24 +538,30 @@ class CodexHarnessRuntime:
         if attempt is None:
             return None
         requested_parent = session.get(Attempt, attempt.parent_attempt_id) if attempt.parent_attempt_id else None
-        candidates = [requested_parent] if requested_parent is not None and requested_parent.codex_thread_id else []
-        fallback_candidates = session.exec(
-            select(Attempt)
-            .where(
-                Attempt.project_id == attempt.project_id,
-                Attempt.id != attempt.id,
-                Attempt.codex_thread_id.is_not(None),
-                Attempt.resume_manifest_artifact_id.is_not(None),
-                Attempt.status.in_(["SUCCESS", "COMPLETED", "PARTIAL", "FAILED", "TIMEOUT"]),
-            )
-            .order_by(Attempt.started_at.desc())
-        ).all()
-        candidates.extend(candidate for candidate in fallback_candidates if all(candidate.id != current.id for current in candidates))
+        if requested_parent is not None and requested_parent.project_id != attempt.project_id:
+            requested_parent = None
+        candidates = parent_attempt_candidates(
+            session, project_id=attempt.project_id, intent=session.get(Intent, attempt.intent_id), current_attempt=attempt,
+        )
         attempt.codex_control_token_hash = hashlib.sha256(control_token.encode("utf-8")).hexdigest()
         attempt.last_event_at = now_utc()
         parent: Attempt | None = None
         resume_thread_id: str | None = None
+        active_environment = current_environment_id(session, attempt.project_id)
+        environment_id = active_environment or attempt.environment_id
+        if active_environment:
+            attempt.environment_id = active_environment
         for candidate in candidates:
+            if candidate.environment_id != environment_id:
+                session.add(WorkerEvent(
+                    project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id,
+                    attempt_id=attempt.id, event_type="codex.resume_rejected",
+                    payload_json={"reason": "environment_changed", "parent_attempt_id": candidate.id,
+                                  "source_environment_id": candidate.environment_id, "current_environment_id": environment_id},
+                ))
+                continue
+            if not candidate.codex_thread_id:
+                continue
             valid = True
             diagnostic: dict[str, Any] = {}
             if workspace is not None:
@@ -535,6 +586,28 @@ class CodexHarnessRuntime:
             resume_thread_id = candidate.codex_thread_id
             break
         attempt.codex_thread_id = resume_thread_id
+        attempt.resume_count = 0
+        if resume_thread_id is None and workspace is not None:
+            # Native state is optional for continuity. Keep verified work and
+            # inputs when a thread is unavailable or its target instance changed.
+            logical_candidates = parent_attempt_candidates(
+                session, project_id=attempt.project_id, intent=session.get(Intent, attempt.intent_id),
+                current_attempt=attempt, resumable_only=False,
+            )
+            for candidate in logical_candidates:
+                if not candidate.resume_manifest_artifact_id:
+                    continue
+                restored, diagnostic = restore_resume_manifest(
+                    session, parent=candidate, workspace=workspace, native_session=False,
+                    legacy_home=self.settings.codex_workspace_dir / candidate.project_id / candidate.worker_id / "runtime" / "codex-home",
+                )
+                if restored:
+                    attempt.parent_attempt_id = candidate.id
+                    session.add(WorkerEvent(
+                        project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id,
+                        attempt_id=attempt.id, event_type="codex.work_state_restored", payload_json=diagnostic,
+                    ))
+                    break
         if parent is not None and resume_thread_id:
             if requested_parent is None or parent.id != requested_parent.id:
                 session.add(
@@ -567,110 +640,12 @@ class CodexHarnessRuntime:
         return resume_thread_id
 
     def _restore_resume_manifest(
-        self,
-        session: Session,
-        *,
-        parent: Attempt,
-        workspace: Path,
+        self, session: Session, *, parent: Attempt, workspace: Path,
     ) -> tuple[bool, dict[str, Any]]:
-        workspace.mkdir(parents=True, exist_ok=True)
-        manifest_artifact = session.get(Artifact, parent.resume_manifest_artifact_id) if parent.resume_manifest_artifact_id else None
-        if manifest_artifact is None or manifest_artifact.project_id != parent.project_id:
-            return False, {"reason": "resume_manifest_missing", "parent_attempt_id": parent.id}
-        try:
-            raw = Path(manifest_artifact.path).read_bytes()
-            if hashlib.sha256(raw).hexdigest() != manifest_artifact.sha256:
-                raise ValueError("manifest artifact hash mismatch")
-            manifest = json.loads(raw)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            return False, {"reason": "resume_manifest_invalid", "detail": str(exc)[:500], "parent_attempt_id": parent.id}
-        if manifest.get("project_id") != parent.project_id or manifest.get("attempt_id") != parent.id:
-            return False, {"reason": "resume_manifest_scope_mismatch", "parent_attempt_id": parent.id}
-
-        errors: list[dict[str, str]] = []
-        if not manifest.get("inputs_complete"):
-            errors.append({"path": "inputs/manifest.json", "reason": "input_manifest_incomplete"})
-        if not manifest.get("work_state_complete"):
-            errors.append({"path": "work", "reason": "work_state_incomplete"})
-        for item in manifest.get("inputs", []):
-            if not isinstance(item, dict):
-                continue
-            relative = Path(str(item.get("path") or ""))
-            if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "inputs":
-                errors.append({"path": str(relative), "reason": "unsafe_input_path"})
-                continue
-            target = workspace / relative
-            if not target.is_file():
-                errors.append({"path": str(item.get("path") or ""), "reason": "missing_input"})
-                continue
-            if self._sha256_file(target) != item.get("sha256"):
-                errors.append({"path": str(item.get("path") or ""), "reason": "input_hash_mismatch"})
-
-        work_dir = workspace / "work"
-        work_dir.mkdir(exist_ok=True)
-        for item in manifest.get("work_files", []):
-            if not isinstance(item, dict):
-                continue
-            relative = Path(str(item.get("path") or ""))
-            if relative.is_absolute() or ".." in relative.parts:
-                errors.append({"path": str(relative), "reason": "unsafe_work_path"})
-                continue
-            artifact = session.get(Artifact, item.get("artifact_id"))
-            if artifact is None or artifact.project_id != parent.project_id or artifact.sha256 != item.get("sha256"):
-                errors.append({"path": str(relative), "reason": "work_artifact_invalid"})
-                continue
-            source = Path(artifact.path)
-            if not source.is_file() or self._sha256_file(source) != artifact.sha256:
-                errors.append({"path": str(relative), "reason": "work_artifact_hash_mismatch"})
-                continue
-            target = work_dir / relative
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
-            except OSError as exc:
-                errors.append({"path": str(relative), "reason": f"work_restore_failed:{exc}"})
-
-        source_home = self.settings.codex_workspace_dir / parent.project_id / parent.worker_id / "runtime" / "codex-home"
-        target_home = workspace / "runtime" / "codex-home"
-        if not manifest.get("codex_state_complete") or not source_home.is_dir():
-            errors.append({"path": "runtime/codex-home", "reason": "codex_state_incomplete"})
-        else:
-            skipped = self._copy_resume_home(source_home, target_home)
-            errors.extend({"path": path, "reason": "unreadable_codex_state"} for path in skipped)
-            expected_state_paths = {
-                str(item.get("path") or "")
-                for item in manifest.get("codex_state", [])
-                if isinstance(item, dict)
-            }
-            for item in manifest.get("codex_state", []):
-                relative = Path(str(item.get("path") or ""))
-                if relative.is_absolute() or ".." in relative.parts:
-                    errors.append({"path": str(relative), "reason": "unsafe_codex_state_path"})
-                    continue
-                target = target_home / relative
-                if not target.is_file() or self._sha256_file(target) != item.get("sha256"):
-                    errors.append({"path": str(item.get("path") or ""), "reason": "codex_state_hash_mismatch"})
-            actual_state_paths = {
-                str(path.relative_to(target_home))
-                for path in target_home.rglob("*")
-                if path.is_file()
-            }
-            for extra in sorted(actual_state_paths - expected_state_paths):
-                errors.append({"path": extra, "reason": "unexpected_codex_state_file"})
-        if errors:
-            shutil.rmtree(target_home, ignore_errors=True)
-            shutil.rmtree(work_dir, ignore_errors=True)
-            return False, {
-                "reason": "resume_integrity_failed",
-                "parent_attempt_id": parent.id,
-                "manifest_artifact_id": manifest_artifact.id,
-                "errors": errors[:100],
-            }
-        return True, {
-            "reason": "resume_integrity_verified",
-            "parent_attempt_id": parent.id,
-            "manifest_artifact_id": manifest_artifact.id,
-        }
+        return restore_resume_manifest(
+            session, parent=parent, workspace=workspace,
+            legacy_home=self.settings.codex_workspace_dir / parent.project_id / parent.worker_id / "runtime" / "codex-home",
+        )
 
     @staticmethod
     def _copy_resume_home(source_home: Path, target_home: Path) -> list[str]:
@@ -726,6 +701,20 @@ class CodexHarnessRuntime:
         if not isinstance(event, dict):
             return None
         event_type = str(event.get("type") or "unknown")[:100]
+        if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = {
+                key: value for key, value in event["usage"].items()
+                if key.endswith("tokens") and isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            }
+            if usage:
+                attempt.token_usage = {
+                    **dict(attempt.token_usage or {}),
+                    **{key: int((attempt.token_usage or {}).get(key, 0)) + value for key, value in usage.items()},
+                }
+                session.add(WorkerEvent(
+                    project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id,
+                    attempt_id=attempt.id, event_type="codex.usage", payload_json={"usage": usage},
+                ))
         thread_id = event.get("thread_id") or event.get("session_id")
         turn_id = event.get("turn_id")
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
@@ -762,6 +751,7 @@ class CodexHarnessRuntime:
                         summary=f"codex.shell {command[:120]} exit={exit_code}",
                         artifact_type="terminal",
                         origin_kind=origin_kind,
+                        evidence_context=FlagValidator.request_evidence_context(str(item.get("command") or event.get("command") or "")),
                     )
                     artifact_refs = [shell_artifact.id]
                 except Exception:
@@ -783,6 +773,21 @@ class CodexHarnessRuntime:
             )
             session.add(trace)
             session.flush()
+            if transport_failed(trace) and target_transport_failed(session, worker.project_id):
+                finalization_reason = "target_unreachable"
+            if artifact_refs and exit_code == 0 and not is_sync_request(trace) and not transport_failed(trace):
+                observed = session.get(Artifact, artifact_refs[0])
+                validator = FlagValidator()
+                if observed and observed.origin_kind == "target_observation" and validator.is_current_evidence(session, observed):
+                    matching = session.exec(select(Artifact).where(
+                        Artifact.project_id == worker.project_id, Artifact.sha256 == observed.sha256,
+                        Artifact.id != observed.id, Artifact.origin_kind == "target_observation",
+                    )).all()
+                    if not any(validator.is_current_evidence(session, previous) for previous in matching):
+                        session.add(WorkerEvent(
+                            project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id,
+                            attempt_id=attempt.id, event_type="evidence.progress", payload_json={"artifact_id": observed.id},
+                        ))
             action_count = session.exec(
                 select(ToolTrace).where(ToolTrace.attempt_id == attempt.id, ToolTrace.tool_name == "codex.shell")
             ).all()
@@ -847,14 +852,14 @@ class CodexHarnessRuntime:
                     select(WorkerEvent)
                     .where(
                         WorkerEvent.attempt_id == attempt.id,
-                        WorkerEvent.event_type.in_(["checkpoint.saved", "blackboard.fact_appended", "artifact.read", "hypothesis.eliminated"]),
+                        WorkerEvent.event_type == "evidence.progress",
                     )
                     .order_by(WorkerEvent.created_at.desc())
                 ).first()
                 actions_without_progress = sum(
                     1
                     for candidate in action_count
-                    if latest_progress is None or _utc_datetime(candidate.created_at) > _utc_datetime(latest_progress.created_at)
+                    if not is_sync_request(candidate) and (latest_progress is None or _utc_datetime(candidate.created_at) > _utc_datetime(latest_progress.created_at))
                 )
                 if actions_without_progress >= max_no_progress:
                     finalization_reason = finalization_reason or "no_progress_exhausted"
@@ -880,6 +885,11 @@ class CodexHarnessRuntime:
             # Streaming Codex progress is non-authoritative. A busy SQLite
             # database must not abort the actual solver command.
             session.rollback()
+        if item_type == "command_execution" or event_type == "thread.started":
+            try:
+                CodexHarnessRuntime._sync_blackboard(session, worker=worker, attempt=attempt)
+            except Exception:
+                session.rollback()
         if finalization_reason:
             CodexHarnessRuntime._begin_finalization(
                 session,
@@ -896,6 +906,28 @@ class CodexHarnessRuntime:
             command,
             re.IGNORECASE,
         ) is not None
+
+    @staticmethod
+    def _sync_blackboard(session: Session, *, worker: Worker, attempt: Attempt) -> None:
+        from aurora.services.worker_control import WorkerControlService
+
+        workspace = get_settings().codex_workspace_dir / worker.project_id / worker.id
+        runtime_dir = workspace / "runtime"
+        if not runtime_dir.is_dir():
+            return
+        snapshot_path = runtime_dir / "blackboard.json"
+        version = session.exec(select(ProjectCoordinationState.graph_version).where(ProjectCoordinationState.project_id == worker.project_id)).first()
+        try:
+            previous = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict) and previous.get("version") == version:
+                return
+        except (OSError, ValueError):
+            pass
+        snapshot = WorkerControlService().query(session, worker=worker, attempt=attempt)
+        snapshot["synced_at"] = now_utc().isoformat()
+        temporary = snapshot_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(snapshot_path)
 
     @staticmethod
     def _begin_finalization(session: Session, *, worker: Worker, attempt: Attempt, reason: str) -> None:
@@ -968,7 +1000,7 @@ class CodexHarnessRuntime:
         command = re.sub(r"(?i)(authorization|cookie|token|password|api[_-]?key)\s*[:=]\s*[^\s]+", r"\1=<redacted>", command)
         return command[:2000]
 
-    def _write_prompt(self, session: Session, worker: Worker, snapshot: ContextSnapshot) -> Path:
+    def _write_prompt(self, session: Session, worker: Worker, snapshot: ContextSnapshot, *, preserve_inputs: bool = False) -> Path:
         workspace = self.settings.codex_workspace_dir / snapshot.project_id / worker.id
         workspace.mkdir(parents=True, exist_ok=True)
         prompt_file = workspace / "aurora-intent.md"
@@ -994,7 +1026,7 @@ class CodexHarnessRuntime:
             ),
             encoding="utf-8",
         )
-        self._materialize_project_inputs(session, snapshot, workspace)
+        self._materialize_project_inputs(session, snapshot, workspace, preserve_existing=preserve_inputs)
         runtime_dir = workspace / "runtime"
         runtime_dir.mkdir(exist_ok=True)
         event_log = runtime_dir / "mcp-events.jsonl"
@@ -1028,6 +1060,9 @@ class CodexHarnessRuntime:
         primary_diagnostic: dict[str, Any],
     ) -> ConcludeFallbackOutcome:
         seconds = self.settings.codex_conclude_fallback_seconds
+        remaining = remaining_seconds(execution_deadline(session, worker.project_id, worker.id))
+        if remaining is not None:
+            seconds = min(seconds, int(remaining))
         diagnostic: dict[str, Any] = {
             "attempted": False,
             "recovered": False,
@@ -1036,8 +1071,11 @@ class CodexHarnessRuntime:
         if primary_diagnostic.get("source") in VALID_STRUCTURED_OUTPUT_SOURCES:
             diagnostic["skip_reason"] = "primary_output_valid"
             return ConcludeFallbackOutcome(False, False, diagnostic)
+        if primary_completed.finalization_reason == "target_unreachable":
+            diagnostic["skip_reason"] = "target_unreachable"
+            return ConcludeFallbackOutcome(False, False, diagnostic)
         if seconds <= 0:
-            diagnostic["skip_reason"] = "disabled"
+            diagnostic["skip_reason"] = "deadline_exhausted" if remaining is not None and remaining < 1 else "disabled"
             return ConcludeFallbackOutcome(False, False, diagnostic)
         if attempt is None:
             diagnostic["skip_reason"] = "attempt_missing"
@@ -1111,6 +1149,7 @@ class CodexHarnessRuntime:
                 workspace,
                 timeout_seconds=seconds,
                 finalize_grace_seconds=min(5, max(1, seconds // 5)),
+                deadline_at=execution_deadline(session, worker.project_id, worker.id),
                 runner=runner,
                 on_output=lambda stream, line: self._record_codex_event(
                     session,
@@ -1305,27 +1344,68 @@ class CodexHarnessRuntime:
         return {"calls": calls, "invalid_lines": invalid_lines, "artifact_id": artifact.id, "servers_used": sorted(servers_used)}
 
     @staticmethod
-    def _materialize_project_inputs(session: Session, snapshot: ContextSnapshot, workspace: Path) -> None:
+    def _materialize_project_inputs(session: Session, snapshot: ContextSnapshot, workspace: Path, *, preserve_existing: bool = False) -> None:
         """Expose only evidence owned by the active project to the container."""
         input_dir = workspace / "inputs"
         input_dir.mkdir(exist_ok=True)
-        manifest: list[dict[str, str]] = []
-        artifacts = session.exec(
-            select(Artifact).where(
-                Artifact.project_id == snapshot.project_id,
-                Artifact.type.not_in(["codex-transcript", "resume-manifest", "resume-work-file"]),
-            )
-        ).all()
+        manifest: list[dict[str, Any]] = []
+        settings = get_settings()
+        sections = snapshot.sections_json or {}
+        required_refs = {
+            str(artifact["id"]) for artifact in sections.get("handoff_artifacts", [])
+            if isinstance(artifact, dict) and artifact.get("id")
+        }
+        memory_ref = (sections.get("context_memory") or {}).get("artifact_id")
+        if isinstance(memory_ref, str):
+            required_refs.add(memory_ref)
+        intent = session.get(Intent, snapshot.intent_id)
+        if intent and intent.project_id == snapshot.project_id:
+            facts = session.exec(select(Fact).where(Fact.project_id == snapshot.project_id, Fact.id.in_(intent.dependency_fact_ids))).all()
+            required_refs.update(ref for fact in facts for ref in fact.evidence_refs)
+        base = select(Artifact).where(
+            Artifact.project_id == snapshot.project_id,
+            Artifact.type.not_in(["codex-transcript", "codex-conclude-transcript", "subagent-transcript", "resume-manifest", "resume-work-file", "resume-codex-state", "mcp-events"]),
+        )
+        mandatory = session.exec(base.where((Artifact.origin_kind == "challenge_input") | Artifact.id.in_(required_refs)).order_by(Artifact.created_at.desc())).all()
+        required_ids = {artifact.id for artifact in mandatory}
+        recent = session.exec(base.where(Artifact.id.not_in(required_ids), Artifact.origin_kind != "runtime_state").order_by(Artifact.created_at.desc()).limit(settings.worker_input_max_files)).all()
+        artifacts = [*mandatory, *recent]
+        optional_bytes = 0
         for artifact in artifacts:
             source = Path(artifact.path)
             if not source.is_file():
                 continue
-            if CodexHarnessRuntime._sha256_file(source) != artifact.sha256:
+            if artifact.id not in required_ids and optional_bytes + source.stat().st_size > settings.worker_input_max_bytes:
                 continue
-            target = input_dir / f"{artifact.id}_{source.name}"
+            current = FlagValidator().is_current_evidence(session, artifact)
+            if artifact.id not in required_ids:
+                if not current:
+                    continue
+                optional_bytes += source.stat().st_size
+            if not current and CodexHarnessRuntime._sha256_file(source) != artifact.sha256:
+                continue
+            target = input_dir / f"{artifact.id}_{ArtifactStore.original_name(artifact)}"
             shutil.copy2(source, target)
-            manifest.append({"artifact_id": artifact.id, "path": f"inputs/{target.name}", "sha256": artifact.sha256})
-        (input_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            manifest.append({
+                "artifact_id": artifact.id, "path": f"inputs/{target.name}", "sha256": artifact.sha256,
+                "environment_id": (artifact.evidence_context or {}).get("environment_id"),
+                "current_evidence": current,
+            })
+        manifest_path = input_dir / "manifest.json"
+        if preserve_existing and manifest_path.is_file():
+            # These entries were verified and restored before prompt creation.
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            by_path = {}
+            for entry in existing:
+                artifact = session.get(Artifact, entry.get("artifact_id"))
+                path = workspace / entry["path"]
+                if (artifact and artifact.project_id == snapshot.project_id
+                        and path.resolve().is_relative_to(input_dir.resolve())
+                        and path.is_file() and CodexHarnessRuntime._sha256_file(path) == artifact.sha256 == entry.get("sha256")):
+                    by_path[entry["path"]] = entry
+            by_path.update({entry["path"]: entry for entry in manifest})
+            manifest = list(by_path.values())
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _persist_resume_manifest(self, session: Session, *, attempt: Attempt, workspace: Path) -> Artifact:
         input_manifest = workspace / "inputs" / "manifest.json"
@@ -1355,48 +1435,81 @@ class CodexHarnessRuntime:
         work_files: list[dict[str, Any]] = []
         work_dir = workspace / "work"
         total_bytes = 0
-        candidates = sorted(path for path in work_dir.rglob("*") if path.is_file()) if work_dir.is_dir() else []
-        work_state_complete = len(candidates) <= self.settings.resume_max_files
-        for path in candidates[: self.settings.resume_max_files]:
-            if path.is_symlink():
-                work_state_complete = False
-                continue
-            size = path.stat().st_size
-            if total_bytes + size > self.settings.resume_max_bytes:
-                work_state_complete = False
-                break
+        candidates = sorted((path for path in work_dir.rglob("*") if path.is_file() or path.is_symlink()), key=lambda path: (
+            0 if re.search(r"(?:solve|exploit|verify|decode|derive|poc)", path.stem, re.I) else
+            1 if path.suffix in {".py", ".sh", ".sage", ".c", ".cpp", ".rs"} else
+            2 if path.parent == work_dir else 3, str(path.relative_to(work_dir)),
+        )) if work_dir.is_dir() else []
+        work_issues = []
+        omitted_count = 0
+        for path in candidates:
             relative = path.relative_to(work_dir)
-            artifact = self.artifact_store.write_file(
-                session,
-                project_id=attempt.project_id,
-                source_attempt_id=attempt.id,
-                source=path,
-                summary=f"Resumable worker file: {relative}",
-                artifact_type="resume-work-file",
-                sensitivity="restricted",
-                origin_kind="runtime_state",
-                deduplicate=True,
-            )
+            reason = None
+            try:
+                if path.is_symlink():
+                    reason = "symlink"
+                elif len(work_files) >= self.settings.resume_max_files:
+                    reason = "file_limit"
+                elif total_bytes + path.stat().st_size > self.settings.resume_max_bytes:
+                    reason = "byte_limit"
+                else:
+                    artifact = self.artifact_store.write_file(
+                        session, project_id=attempt.project_id, source_attempt_id=attempt.id,
+                        source=path, summary=f"Resumable worker file: {relative}",
+                        artifact_type="resume-work-file", sensitivity="restricted",
+                        origin_kind="runtime_state", deduplicate=True,
+                    )
+            except OSError:
+                reason = "read_failed"
+            if reason:
+                omitted_count += 1
+                if len(work_issues) < 50:
+                    work_issues.append({"path": str(relative), "reason": reason})
+                continue
             work_files.append({
                 "path": str(relative),
                 "artifact_id": artifact.id,
                 "sha256": artifact.sha256,
                 "size": artifact.size,
             })
-            total_bytes += size
+            total_bytes += artifact.size
 
-        codex_state, codex_complete = self._codex_state_manifest(workspace / "runtime" / "codex-home")
+        work_state_complete = omitted_count == 0
+
+        codex_home = workspace / "runtime" / "codex-home"
+        codex_state, codex_complete = self._codex_state_manifest(codex_home)
+        state_bytes = 0
+        for entry in codex_state:
+            state_bytes += entry["size"]
+            if state_bytes > self.settings.resume_max_bytes:
+                codex_complete = False
+                break
+            try:
+                state_artifact = self.artifact_store.write_file(
+                    session, project_id=attempt.project_id, source_attempt_id=attempt.id,
+                    source=codex_home / entry["path"], summary=f"Resumable session state: {entry['path']}",
+                    artifact_type="resume-codex-state", sensitivity="restricted", origin_kind="runtime_state", deduplicate=True,
+                )
+                if state_artifact.sha256 != entry["sha256"]:
+                    codex_complete = False
+                entry["artifact_id"] = state_artifact.id
+            except OSError:
+                codex_complete = False
         payload = {
-            "version": 1,
+            "version": 2,
             "project_id": attempt.project_id,
             "attempt_id": attempt.id,
             "parent_attempt_id": attempt.parent_attempt_id,
             "codex_thread_id": attempt.codex_thread_id,
+            "environment_id": attempt.environment_id,
             "inputs": inputs if isinstance(inputs, list) else [],
             "inputs_complete": inputs_complete,
             "work_files": work_files,
             "work_files_total_bytes": total_bytes,
             "work_state_complete": work_state_complete,
+            "partial_work_state_available": bool(work_files) and not work_state_complete,
+            "work_files_omitted": omitted_count,
+            "work_state_issues": work_issues,
             "codex_state": codex_state,
             "codex_state_complete": codex_complete,
         }
@@ -1466,8 +1579,6 @@ class CodexHarnessRuntime:
                     })
                 except OSError:
                     complete = False
-            if len(entries) >= self.settings.resume_max_files:
-                break
         if walk_errors:
             complete = False
         return entries, complete and bool(entries)
@@ -1475,7 +1586,7 @@ class CodexHarnessRuntime:
     @staticmethod
     def _is_resumable_codex_state(relative: Path) -> bool:
         """Exclude immutable bundled assets and volatile locks from resume state."""
-        return bool(relative.parts) and relative.parts[0] not in {"skills", ".tmp", "thread-writer-locks"}
+        return bool(relative.parts) and relative.parts[0] not in {"skills", ".tmp", "tmp", "thread-writer-locks"}
 
     @staticmethod
     def _has_model_metadata_warning(text: str) -> bool:
@@ -1594,8 +1705,10 @@ class CodexHarnessRuntime:
     ) -> str:
         model = model or self.settings.llm_model
         workspace = Path.cwd().resolve()
-        relative_prompt = prompt_file.resolve().relative_to(workspace)
-        container_prompt = Path("/workspace") / relative_prompt
+        relative_prompt = Path(os.path.relpath(prompt_file.resolve(), workspace))
+        # The container mounts only this Worker's directory at /workspace,
+        # regardless of where the operator stores workspaces on the host.
+        container_prompt = Path("/workspace") / prompt_file.name
         return self.settings.codex_command_template.format(
             prompt_file=prompt_file.name,
             prompt_filename=prompt_file.name,
@@ -1626,12 +1739,24 @@ class CodexHarnessRuntime:
         timeout_seconds: object = None,
         soft_timeout_seconds: object = None,
         finalize_grace_seconds: object = None,
+        deadline_at: datetime | None = None,
         runner: CommandRunner | None = None,
         on_output=None,
     ) -> CommandResult:
         configured = self.settings.codex_timeout_seconds if self.settings.codex_timeout_seconds > 0 else None
         budget_timeout = int(timeout_seconds) if timeout_seconds else None
         timeout = min(value for value in (configured, budget_timeout) if value is not None) if configured or budget_timeout else None
+        remaining = remaining_seconds(deadline_at)
+        if remaining is not None:
+            if remaining < 1:
+                return CommandResult(command, command, str(cwd), "", "Execution deadline exhausted", 124, "deadline", failure_kind="timeout")
+            timeout = min(timeout, int(remaining)) if timeout is not None else int(remaining)
+        soft_timeout = int(soft_timeout_seconds) if soft_timeout_seconds else None
+        if timeout is not None and soft_timeout is not None:
+            soft_timeout = min(soft_timeout, max(1, timeout - 1))
+        grace = int(finalize_grace_seconds) if finalize_grace_seconds else 10
+        if timeout is not None:
+            grace = min(grace, max(1, timeout - (soft_timeout or timeout)))
         selected_runner = runner or self.command_runner
         if selected_runner is None:
             selected_runner = AutoCommandRunner(prefer_kali=True, allow_local_fallback=False)
@@ -1641,8 +1766,8 @@ class CodexHarnessRuntime:
                 cwd=cwd,
                 timeout=timeout,
                 on_output=on_output,
-                soft_timeout=int(soft_timeout_seconds) if soft_timeout_seconds else None,
-                finalize_grace=int(finalize_grace_seconds) if finalize_grace_seconds else 10,
+                soft_timeout=soft_timeout,
+                finalize_grace=grace,
             )
         return selected_runner.run(command=command, cwd=cwd, timeout=timeout)
 

@@ -419,6 +419,10 @@ AURORA_SUBAGENTS_MAX_PER_WORKER=2
 
 每个项目始终先运行唯一的 Bootstrap Worker；导入信息、靶机状态或 Hint 形成的初始 Fact 不会提前触发 Reason。Bootstrap 结束后，Reason 才按当前阶段和全局容量提出非重叠 Intent；合法空计划表示本轮无需继续，不会被固定 fallback 覆盖。同题 Explore Worker 可在 Blackboard 中直接引用同项目 Artifact ID，或引用自己 `/workspace` 内的文件，控制面会安全登记为 Artifact；其他 Worker 可用 `read_artifact` 读取有界文本预览。调度器为并发项目保留公平份额，并在项目进入 `FLAG_READY` 或其他终态后立即停止同批 Worker。Web 新建项目区域也提供对应开关和并发数输入。
 
+Reason 提示词提供 Intent JSON Schema，`priority` 使用 0–100 的数值。为兼容模型旧输出，规划入口将
+`low/medium/high` 分别转换为 `1/2/3`，数值及数值字符串保留原排序；布尔值、空值、越界值和其他文本仍拒绝。
+单个分支格式错误不会丢弃其他有效分支，`reason.completed` 的拒绝诊断包含具体字段名。
+
 TSecBench 批量导入和 Evaluation 在全局开关启用时会自动为新项目开启该机制，无需逐题设置项目开关。
 
 ## 10. 冻结评测
@@ -432,14 +436,24 @@ baseline 与 candidate 必须使用相互独立的干净平台会话：baseline 
 当前版本也会拒绝运行，因为 Evaluation 尚未实现附件物化，不能保证两组输入一致。
 
 每题按 12/25/40 分钟三个阶段执行，Worker hard timeout 同步钳制到对应阶段，总上限 77 分钟。P1 只进行一次单 Agent 直解并把 checkpoint 和一个续跑 Intent 交给 P2；P2/P3 才启用多 Agent，平台 hint 仅在 P3 自动获取。报告以平台确认完成为成功，
-并统计错误提交、重复请求、派生候选验证覆盖率和终态 checkpoint 覆盖率。比较结果只有同时满足以下条件才会 `promoted=true`：
+并统计错误提交、重复请求、派生候选验证覆盖率和终态 checkpoint 覆盖率。人工确认与尚未裁决的提交不计为平台成功；错误提交按平台拒绝事件累计，之后答对也不会清除历史错误。
 
-- baseline/candidate 来自同一冻结套件，且两边有效样本数至少 30；
+有完整可恢复会话和明确续跑任务，且为未尝试题留有容量及时间时，默认在同一实例继续一个阶段，并记录 `group.item.environment_retained`。
+该阶段结束后释放实例，让其他题目继续调度；手动停止和题组截止也会清理已保留的实例。
+可通过 `AURORA_TSECBENCH_RETAIN_ENVIRONMENT_FOR_CONTINUATION=false` 关闭此策略。
+
+资源排队不消耗阶段解题预算；容量不足和控制面暂时不可用都会退避重试，默认最多三次。多 Flag 题的部分成功不重置阶段及截止时间；平台返回重复位置时记录为无新增进展。后续上下文包含已解决位置、路线与证据引用，续跑 Intent 绑定来源 Attempt。
+
+Token 用量优先保留已观测数据；会话 `token_count` 可以补充没有 `turn.completed` 的中断记录，恢复会话会扣除原有累计用量，并避免与 stdout 重复相加。`usage_source` 标明来源，`usage_complete=false` 表示中断时仍可能缺少最后一次请求的用量。评测另给出 `worker_elapsed_seconds`（并行 Worker 累计时间）、`resource_wait_seconds` 和 `zero_attempt`；历史缺少等待记录时无法追溯全部等待时间。
+
+比较按题目编码取两轮均无环境错误的交集，在同一组题上计算全部指标，并返回 `paired_challenge_keys` 与 `excluded_challenge_keys`。比较结果只有同时满足以下条件才会 `promoted=true`：
+
+- baseline/candidate 来自同一冻结套件，两轮都已完成，且共同有效题目至少 30；
 - 成功率至少提升 15 个百分点，错误提交率不变差；
 - baseline 有重复请求时至少减少 50%；baseline 为零时 candidate 也必须为零；
 - 派生候选验证覆盖率与终态 checkpoint 覆盖率均为 100%。
 
-少于 30 个有效样本仍会给出 95% Wilson 置信区间，但 `promotion_eligible=false`。
+单轮报告提供 95% Wilson 置信区间。共同有效样本少于 30 或任一轮尚未完成时，比较结果 `promotion_eligible=false`。
 
 ## 11. 常见问题
 
@@ -491,3 +505,11 @@ npm audit --audit-level=moderate
 ```
 
 生产部署前，请在反向代理层添加认证、TLS 和访问控制。当前 API 开放全量 CORS、没有内置认证，而且目标授权策略已禁用，不能直接暴露到不受信任的公网。不要提交 `.env`、数据库、Artifact、Codex workspace 或运行历史；仓库已忽略 ffuf 的运行时配置目录。
+
+## 有界执行与诊断
+
+- 设置题组 `deadline_at` 后，阶段和 Worker/Planner 使用同一绝对截止时间；暂停恢复不会突破全局截止时间。
+- 连续目标断连会暂停当前阶段并退避探测；三次探测仍失败时进入 `WAITING_INPUT` 并释放托管实例。修复网络或平台环境后重新启动题组，阶段编号不变。
+- `AURORA_WORKER_INPUT_MAX_FILES`（默认 100）和 `AURORA_WORKER_INPUT_MAX_BYTES`（默认 64 MiB）限制可选输入；原始附件、明确依赖和 checkpoint 交接证据不受此裁剪。未物化证据可通过黑板读取最多 64 KB 文本预览；需要完整二进制时，应将其列为依赖或交接证据供下一轮使用。
+- 调试列表 `debug/context-snapshots`、`debug/llm-traces`、`debug/tool-traces` 接受 `limit`（默认 100，上限 500）和 `offset`；前两者支持 `summary=true`，完整记录可用 `summary=false` 按页读取。
+- 评测中的 `runtime_usage_coverage` 表示真实 Token 用量的覆盖率；缺失历史用量不是零消耗。`repeated_requests` 保持旧口径，`repeated_experiments` 排除黑板和 manifest 同步读取。双方均为 v2 指标时，晋级比较使用后者；混合历史数据时保留旧口径，响应的 `repeated_request_metric` 明示所用指标。

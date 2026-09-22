@@ -432,7 +432,9 @@ class OpenVPNGatewayRegistry:
     def _connection_failure_detail(logs: str, timeout_seconds: int) -> str:
         tail = logs[-1600:]
         upper = logs.upper()
-        if "AUTH_FAILED" in upper:
+        if "AUTH_FAILED" in upper and "EXCEEDED NUMBER OF CLIENTS" in upper:
+            summary = "OpenVPN server connection limit reached; disconnect unused VPN clients or wait for platform capacity before retrying"
+        elif "AUTH_FAILED" in upper:
             summary = "OpenVPN authentication failed; check the VPN username, password, and client certificate"
         elif "TLS KEY NEGOTIATION FAILED" in upper and "VERIFY OK" not in upper:
             summary = "OpenVPN server did not reply to the UDP TLS handshake; check that the VPN instance is active and UDP reachability to the remote endpoint"
@@ -451,6 +453,13 @@ class OpenVPNGatewayRegistry:
             name = get_settings().openvpn_container_name
             owned = self._run(["inspect", "--format", "{{index .Config.Labels \"aurora.vpn\"}}", name], timeout=5)
             if owned.returncode == 0 and owned.stdout.strip().lower() == "true":
+                # SIGTERM lets profiles with explicit-exit-notify release the
+                # server-side session. Immediate SIGKILL can leave a client
+                # slot occupied until the server detects the dead connection.
+                try:
+                    self._run(["stop", "--timeout", "5", name], timeout=10)
+                except (OpenVPNRuntimeError, subprocess.SubprocessError):
+                    pass
                 self._run(["rm", "-f", name], timeout=15)
         except Exception:
             pass

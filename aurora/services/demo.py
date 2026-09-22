@@ -12,13 +12,15 @@ from aurora.services.blackboard_repository import BlackboardRepository, route_fi
 from aurora.services.browser_sessions import browser_session_registry
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.context_builder import ContextBuilder
+from aurora.services.context_memory import parent_attempt_candidates
+from aurora.services.evidence_context import current_environment_id
 from aurora.services.flag_validator import FlagValidator
 from aurora.services.result_processor import ResultProcessor
 from aurora.services.round_summary import RoundReflectionService
 from aurora.services.scheduler import Scheduler
 from aurora.services.subagent_collector import SubagentCollector
 from aurora.services.worker_runtime import get_worker_runtime
-from aurora.services.tool_profiles import worker_preflight
+from aurora.services.tool_profiles import effective_challenge_type, worker_preflight
 from aurora.services.project_run_control import project_run_control
 from aurora.services.agent_runtime import agent_runtime_settings
 
@@ -72,41 +74,8 @@ def _lease_seconds_for_intent(intent: object) -> int:
 
 
 def _select_parent_attempt(session: Session, *, project_id: str, intent: Intent) -> Attempt | None:
-    """Select the newest resumable project state, preferring the explicit parent."""
-    terminal_statuses = ["SUCCESS", "COMPLETED", "PARTIAL", "FAILED", "TIMEOUT"]
-    resumable = (
-        Attempt.project_id == project_id,
-        Attempt.codex_thread_id.is_not(None),
-        Attempt.resume_manifest_artifact_id.is_not(None),
-        Attempt.status.in_(terminal_statuses),
-    )
-    retry = session.exec(
-        select(Attempt)
-        .where(*resumable, Attempt.intent_id == intent.id)
-        .order_by(Attempt.started_at.desc())
-    ).first()
-    if retry is not None:
-        return retry
-    policy = session.exec(
-        select(ProjectRuntimePolicy).where(ProjectRuntimePolicy.project_id == project_id)
-    ).first()
-    if policy is not None and policy.multi_agent_exploration_enabled:
-        # Peer branches share facts and artifacts, never another branch's
-        # conversational state or worker-local filesystem assumptions.
-        return None
-    if intent.parent_intent_id:
-        parent = session.exec(
-            select(Attempt)
-            .where(*resumable, Attempt.intent_id == intent.parent_intent_id)
-            .order_by(Attempt.started_at.desc())
-        ).first()
-        if parent is not None:
-            return parent
-    return session.exec(
-        select(Attempt)
-        .where(*resumable, Attempt.intent_id != intent.id)
-        .order_by(Attempt.started_at.desc())
-    ).first()
+    candidates = parent_attempt_candidates(session, project_id=project_id, intent=intent)
+    return candidates[0] if candidates else None
 
 
 class _WorkerLeaseHeartbeat:
@@ -232,7 +201,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
     if project is None:
         return {"status": "project_missing", "message": "project not found"}
 
-    preflight = worker_preflight(get_settings(), project.challenge_type)
+    preflight = worker_preflight(get_settings(), effective_challenge_type(project.challenge_type, f"{project.name} {project.goal}"))
     session.add(WorkerEvent(project_id=project_id, event_type="worker.preflight", payload_json=preflight))
     session.commit()
     if not preflight["ready"]:
@@ -288,6 +257,7 @@ def _run_one_demo_step_claimed(session: Session, *, project_id: str) -> dict:
         worker_id=worker.id,
         parent_attempt_id=parent_attempt.id if parent_attempt else None,
         lease_generation=worker.lease_generation,
+        environment_id=current_environment_id(session, project_id),
     )
     session.add(attempt)
     session.commit()

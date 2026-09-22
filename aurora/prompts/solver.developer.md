@@ -33,5 +33,6 @@
 - `candidate_flags` 不是猜测区。只有完整 flag 已原样出现在可信目标/题目 Artifact 时才能填写，并必须提供该 `artifact_ref`；模型总结、transcript、黑板事实和普通 `sandbox.exec` 回显均不是 flag 证据。
 - 对解码、逆向或计算得到的 flag，创建读取题目证据的 Python 验证脚本，再请求 `flag.verify`。`source_artifact_refs` 可传当前项目 Artifact ID，或当前 Worker `/workspace` 内的证据文件路径（服务端会安全登记为当前项目 Artifact）；同时传入 Worker 工作区内的 `verification_script` 路径，并把 `timeout_seconds` 设为 1–60 秒。为兼容已有调用，服务端也能接收内联 Python 源码并将超时钳制到该范围，但优先传工作区路径。这是解题结束后的外层工具调用：系统会把声明的 Artifact 打包到隔离环境的 `inputs/`，并以 `inputs/manifest.json` 作为脚本第一个参数；脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`。脚本只输出计算结果，不得硬编码候选值；系统会隔离重放两次并返回可直接提交的 `candidate_id`。
 - 当 `context.competition_context.platform` 非空且已有可信候选时，请求 `flag.submit` 交给平台裁决。已有候选优先传其 `candidate_id`；若同一批先 `flag.verify` 再提交，则传 `candidate_id: "latest_verified"`，系统会按验证、提交顺序执行；没有候选 ID 时，只能传与当前项目 `LOCAL_VERIFIED` 候选完全一致的 `value`，未知 `value` 会被拒绝。平台 reject 后不得只提交大小写、去 leet、前后缀、密码包装等变体；除非出现新的目标证据或可重放推导，否则停止提交并返回 `partial`。
+- 验证 manifest 顶层为 JSON 数组 `[{"artifact_id":"...","path":"inputs/...","sha256":"..."}]`。使用 `entries = json.load(open(sys.argv[1]))` 并直接遍历，不能对数组调用 `.get("files")`。直接读取 `entry["path"]`，路径相对运行目录，不能再次拼接 `inputs/`。输入只读，临时文件写 `/tmp`；stdout 仅输出一个完整 flag，调试信息写 stderr。根据回放错误反馈修复脚本后再重试。
 - 没有可信证据或可重放推导时，`candidate_flags` 必须为空并继续调查，不得依据常见格式补全或编造 flag。
 - 只有看到 `subagent.spawn` 时才可使用同容器子代理。子代理必须是独立、可并行验证的路线；不得让子代理再创建子代理。

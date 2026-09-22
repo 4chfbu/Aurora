@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 
 from aurora.config import get_settings
 from aurora.models import (
+    Attempt,
     ChallengeGroup,
     ChallengeGroupEvent,
     ChallengeGroupItem,
@@ -89,6 +90,34 @@ class FlagSubmissionService:
                 "candidate has already been decided by the competition platform", {},
             )
 
+        validator = FlagValidator()
+        refs = [candidate.verification_artifact_ref] if candidate.provenance_kind == "DERIVED_REPLAY" else candidate.artifact_refs
+        if candidate.status != "LOCAL_VERIFIED" or not any(
+            validator.is_verified_candidate(session, value=candidate.value, artifact_ref=ref, project_id=project_id)
+            for ref in refs
+        ):
+            reason = "candidate lacks current, independent flag evidence; reacquire or verify it before submission"
+            candidate.status = "PROPOSED"
+            candidate.rejection_reason = reason
+            candidate.updated_at = now_utc()
+            session.add(candidate)
+            session.flush()
+            project = session.get(Project, project_id)
+            other_candidate = session.exec(select(FlagCandidate).where(
+                FlagCandidate.project_id == project_id, FlagCandidate.status == "LOCAL_VERIFIED",
+            )).first()
+            if project is not None and project.status == "FLAG_READY" and other_candidate is None:
+                project.status = "WORKING"
+                project.updated_at = now_utc()
+                session.add(project)
+            session.add(WorkerEvent(
+                project_id=project_id, worker_id=worker_id, attempt_id=attempt_id,
+                event_type="finding.flag_evidence_invalidated",
+                payload_json={"candidate_id": candidate.id, "reason": reason},
+            ))
+            session.commit()
+            return FlagSubmissionOutcome("invalid_candidate", candidate.id, None, False, reason, {})
+
         candidate.submission_count += 1
         candidate.status = "SUBMITTED"
         candidate.updated_at = now_utc()
@@ -96,6 +125,7 @@ class FlagSubmissionService:
         session.flush()
 
         competition = adapter or self._configured_adapter(item)
+        previous_correct_count = int((item.competition_meta or {}).get("correct_flag_count", 0) or 0)
         try:
             result = competition.submit_flag(session, project_id=project_id, value=candidate.value)
         except Exception as exc:
@@ -113,8 +143,19 @@ class FlagSubmissionService:
         completed = result.completed if isinstance(result, CompetitionSubmissionResult) else bool(result)
         detail = dict(result.detail) if isinstance(result, CompetitionSubmissionResult) else {}
         if accepted:
+            detail["new_progress"] = not detail.get("duplicate", False) and (
+                completed or "correct_flag_count" not in detail
+                or int(detail["correct_flag_count"] or 0) > previous_correct_count
+            )
+        session.add(WorkerEvent(
+            project_id=project_id, worker_id=worker_id, intent_id=intent_id, attempt_id=attempt_id,
+            event_type="flag.platform_decided", payload_json={"candidate_id": candidate.id, "accepted": accepted, "completed": completed,
+                                                            "new_progress": detail.get("new_progress", False), "duplicate": bool(detail.get("duplicate"))},
+        ))
+        if accepted:
             outcome = self._accepted(
                 session, item=item, candidate=candidate, completed=completed, detail=detail,
+                source_attempt_id=attempt_id or candidate.source_attempt_id,
             )
         else:
             outcome = self._rejected(
@@ -194,11 +235,34 @@ class FlagSubmissionService:
         candidate: FlagCandidate,
         completed: bool,
         detail: dict[str, Any],
+        source_attempt_id: str | None = None,
     ) -> FlagSubmissionOutcome:
         accepted_at = now_utc()
         item.submission_status = "ACCEPTED" if completed else "PARTIAL"
         candidate.status = "ACCEPTED"
         candidate.updated_at = accepted_at
+        parent = session.get(Attempt, source_attempt_id) if source_attempt_id else None
+        if parent and parent.project_id != item.project_id:
+            parent = None
+        parent_intent = session.get(Intent, parent.intent_id) if parent else None
+        if parent_intent and parent_intent.project_id != item.project_id:
+            parent_intent = None
+        meta = dict(item.competition_meta or {})
+        for source_key, target_key in (("correct_flag_count", "correct_flag_count"), ("total_flag_count", "flag_count")):
+            if detail.get(source_key) is not None:
+                meta[target_key] = detail[source_key]
+        slots = list(meta.get("accepted_flag_slots") or [])
+        matched_index = detail.get("matched_flag_index")
+        if detail.get("new_progress") and isinstance(matched_index, int) and not isinstance(matched_index, bool) and matched_index >= 0:
+            if not any(slot.get("index") == matched_index for slot in slots):
+                slots.append({"index": matched_index, "candidate_id": candidate.id,
+                              "source_attempt_id": parent.id if parent else candidate.source_attempt_id,
+                              "environment_id": parent.environment_id if parent else meta.get("environment_id"),
+                              "route": parent_intent.objective[:1200] if parent_intent else None,
+                              "artifact_refs": candidate.artifact_refs,
+                              "verification_artifact_ref": candidate.verification_artifact_ref})
+        meta["accepted_flag_slots"] = slots
+        item.competition_meta = meta
         project = session.get(Project, item.project_id)
         if project is not None:
             project.status = "COMPLETED" if completed else "WORKING"
@@ -258,14 +322,18 @@ class FlagSubmissionService:
                     objective=(
                         "Continue solving the remaining platform flags after "
                         f"{detail.get('correct_flag_count', 0)}/{detail.get('total_flag_count', '?')} were accepted."
+                        f" Solved platform positions: {[slot['index'] for slot in slots]}. "
+                        "Use a different route for an unsolved position; a changed flag value from the same position is not new progress."
                     ),
                     capability_tags=["sandbox.exec", "blackboard.query"],
+                    parent_intent_id=parent_intent.id if parent_intent else None,
                     priority=2.0,
                     risk_level="low",
-                    budget={"model_role": "solver"},
+                    budget={"model_role": "solver", "phase": item.phase,
+                            **({"continuation_attempt_id": parent.id} if parent and parent_intent else {})},
                 ))
             self._event(
-                session, item, "group.item.flag_progress",
+                session, item, "group.item.flag_progress" if detail.get("new_progress", True) else "group.item.flag_duplicate",
                 {"project_id": item.project_id, "candidate_id": candidate.id, **detail},
             )
         session.add_all([item, candidate])
@@ -274,7 +342,10 @@ class FlagSubmissionService:
             candidate.id,
             True,
             completed,
-            "competition platform accepted the candidate flag" if completed else "platform accepted one flag; additional flags remain",
+            "competition platform accepted the candidate flag" if completed else (
+                "platform accepted one flag; additional flags remain" if detail.get("new_progress", True)
+                else "platform reports an already solved flag position; no new progress, solve a different position"
+            ),
             detail,
         )
 

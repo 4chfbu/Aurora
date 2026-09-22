@@ -15,6 +15,9 @@ from aurora.services.manager import ManagerDecision, ManagerService
 from aurora.services.observer import ObserverService
 from aurora.services.project_run_control import project_run_control
 from aurora.services.project_reasoner import ProjectReasoner
+from aurora.services.progress import evidence_progress_counts, target_transport_failed
+from aurora.services.deadlines import as_utc, record_timeout_configuration, timeout_configuration
+from aurora.services.target_probe import TargetProbeService
 
 
 @dataclass
@@ -84,7 +87,7 @@ class AutoRunnerService:
             return AutoRunResult(project.status.lower(), "project_terminal", 0, project_id)
 
         started_at = now_utc()
-        deadline_at = limits.deadline_at
+        deadline_at = as_utc(limits.deadline_at) if limits.deadline_at else None
         if deadline_at is None and limits.max_minutes > 0:
             deadline_at = started_at + timedelta(minutes=limits.max_minutes)
         no_progress_count = 0
@@ -114,6 +117,9 @@ class AutoRunnerService:
                 self._event(session, project_id, "autorun.stopped", {"reason": "max_minutes", "iteration": iteration - 1})
                 return AutoRunResult("stopped", "max_minutes", iteration - 1, project_id, events)
 
+            if self._transport_blocked(session, project=project, deadline_at=deadline_at):
+                return AutoRunResult("waiting_resource", "target_unreachable", iteration - 1, project_id, events)
+
             # The outer loop is deliberately a dispatcher, not another solver.
             # Keep the one hard safety gate (a recorded policy denial), but do
             # not let Observer route heuristics or Manager-authored advice run
@@ -135,6 +141,7 @@ class AutoRunnerService:
                     session,
                     project_id=project_id,
                     phase=limits.phase,
+                    deadline_at=deadline_at,
                 )
                 if limits.allow_multi_agent
                 else {"status": "deferred", "reason": "multi_agent_disabled_for_phase"}
@@ -219,7 +226,7 @@ class AutoRunnerService:
                         return AutoRunResult("stopped", "manual_stop", iteration, project_id, events)
                     time.sleep(max(0.0, min(0.1, wait_until - time.monotonic())))
                 continue
-            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_findings"] or progress["new_candidates"]:
+            elif progress["new_facts"] or progress["new_artifacts"] or progress["new_candidates"]:
                 no_progress_count = 0
             else:
                 no_progress_count += 1
@@ -253,6 +260,9 @@ class AutoRunnerService:
             if run_result.get("status") == "idle":
                 self._event(session, project_id, "autorun.stopped", {"reason": "no_runnable_work", "iteration": iteration})
                 return AutoRunResult("stopped", "no_runnable_work", iteration, project_id, events)
+            if target_transport_failed(session, project_id):
+                self._event(session, project_id, "autorun.environment_unavailable", {"reason": "target_unreachable", "iteration": iteration})
+                return AutoRunResult("waiting_resource", "target_unreachable", iteration, project_id, events)
             if run_result.get("status") in {"runtime_error", "runtime_preflight_failed"}:
                 self._event(session, project_id, "autorun.blocked", {"reason": "runtime_error", "iteration": iteration, "message": run_result.get("message")})
                 return AutoRunResult("blocked", "runtime_error", iteration, project_id, events)
@@ -301,20 +311,38 @@ class AutoRunnerService:
         ).first()
         return {"project_status": project.status if project else "missing", "latest_autorun_event": latest}
 
+    def _transport_blocked(self, session: Session, *, project: Project, deadline_at: datetime | None) -> bool:
+        if not target_transport_failed(session, project.id):
+            return False
+        last = session.exec(select(WorkerEvent).where(
+            WorkerEvent.project_id == project.id, WorkerEvent.event_type == "autorun.environment_unavailable",
+        ).order_by(WorkerEvent.created_at.desc())).first()
+        if last:
+            if (now_utc() - as_utc(last.created_at)).total_seconds() < 15:
+                return True
+            remaining = (deadline_at - now_utc()).total_seconds() if deadline_at else 7
+            if remaining < 3:
+                return True
+            probe = TargetProbeService().probe_transport(project.target_url, timeout=min(5, int(remaining) - 2))
+            if probe.success:
+                self._event(session, project.id, "target.transport_recovered", {"probe": probe.public_dict()})
+                return False
+        self._event(session, project.id, "autorun.environment_unavailable", {"reason": "target_unreachable", "retry_after_seconds": 15})
+        return True
+
     def _counts(self, session: Session, project_id: str) -> dict[str, int]:
+        fact_count, artifact_count = evidence_progress_counts(session, project_id)
+        duplicates = {
+            event.payload_json.get("candidate_id") for event in session.exec(select(WorkerEvent).where(
+                WorkerEvent.project_id == project_id, WorkerEvent.event_type == "flag.platform_decided",
+            )).all() if event.payload_json.get("accepted") and event.payload_json.get("new_progress") is False
+        }
         return {
-            "facts": len(session.exec(select(Fact).where(Fact.project_id == project_id)).all()),
-            "artifacts": len(
-                session.exec(
-                    select(Artifact).where(
-                        Artifact.project_id == project_id,
-                        Artifact.origin_kind.in_(["challenge_input", "target_observation", "operator_observation", "verified_derivation"]),
-                    )
-                ).all()
-            ),
+            "facts": fact_count,
+            "artifacts": artifact_count,
             "findings": len(session.exec(select(Finding).where(Finding.project_id == project_id)).all()),
-            "candidates": len(
-                session.exec(
+            "candidates": sum(
+                candidate.id not in duplicates for candidate in session.exec(
                     select(FlagCandidate).where(
                         FlagCandidate.project_id == project_id,
                         FlagCandidate.status.in_(["LOCAL_VERIFIED", "ACCEPTED", "AWAITING_MANUAL_VALIDATION"]),
@@ -417,7 +445,7 @@ class AutoRunnerService:
         deadline_at: datetime,
     ) -> bool:
         """Apply the remaining absolute phase budget to every new runnable Intent."""
-        remaining_seconds = int((deadline_at - now_utc()).total_seconds())
+        remaining_seconds = int((as_utc(deadline_at) - now_utc()).total_seconds())
         if remaining_seconds < 2:
             return False
         intents = session.exec(
@@ -425,18 +453,19 @@ class AutoRunnerService:
         ).all()
         for intent in intents:
             budget = dict(intent.budget or {})
-            configured_hard = budget.get("hard_timeout_seconds")
+            configured = timeout_configuration(budget)
+            configured_hard = configured.get("hard_timeout_seconds")
             try:
                 hard_timeout = min(int(configured_hard), remaining_seconds) if configured_hard is not None else remaining_seconds
             except (TypeError, ValueError):
                 hard_timeout = remaining_seconds
             hard_timeout = max(2, hard_timeout)
-            configured_grace = budget.get("finalize_grace_seconds", 60)
+            configured_grace = configured.get("finalize_grace_seconds")
             try:
-                finalize_grace = max(1, min(int(configured_grace), hard_timeout - 1))
+                finalize_grace = max(1, min(int(configured_grace) if configured_grace is not None else 60, hard_timeout - 1))
             except (TypeError, ValueError):
                 finalize_grace = min(60, hard_timeout - 1)
-            configured_soft = budget.get("soft_timeout_seconds")
+            configured_soft = configured.get("soft_timeout_seconds")
             default_soft = max(1, hard_timeout - finalize_grace)
             try:
                 soft_timeout = min(int(configured_soft), default_soft) if configured_soft is not None else default_soft
@@ -446,6 +475,7 @@ class AutoRunnerService:
             budget["soft_timeout_seconds"] = max(1, min(soft_timeout, hard_timeout - 1))
             budget["finalize_grace_seconds"] = finalize_grace
             budget["phase_deadline_at"] = deadline_at.isoformat()
+            record_timeout_configuration(budget, configured)
             if phase is not None:
                 budget["phase"] = phase
             intent.budget = budget

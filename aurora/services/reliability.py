@@ -7,6 +7,8 @@ from sqlmodel import Session, select
 from aurora.models import Attempt, AttemptCheckpoint, FlagCandidate, Intent, LLMTrace, ToolTrace, Worker, WorkerEvent, now_utc
 from aurora.services.blackboard_repository import route_fingerprint
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
+from aurora.services.progress import evidence_progress_counts, is_sync_request, repeated_experiments
+from aurora.services.evaluation_metrics import handoff_metrics, runtime_metrics
 
 
 TERMINAL_ATTEMPT_STATUSES = {"SUCCESS", "PARTIAL", "FAILED", "TIMEOUT"}
@@ -82,6 +84,8 @@ class ReliabilityService:
         })
         return {
             "project_id": project_id,
+            "handoffs": handoff_metrics(attempts, checkpoints, events),
+            "runtime_usage": runtime_metrics(traces),
             "attempts": {
                 "total": len(attempts),
                 "terminal": len(terminal),
@@ -101,6 +105,7 @@ class ReliabilityService:
                 "verified_rate": resume_scheduled / resume_total if resume_total else None,
             },
             "progress": {
+                "unique_supported_facts": evidence_progress_counts(session, project_id)[0],
                 "evidence_events": len(progress_events),
                 "codex_actions": len(actions),
                 "evidence_per_action": len(progress_events) / len(actions) if actions else None,
@@ -108,6 +113,8 @@ class ReliabilityService:
             "state": {"active_workers": len(active_workers), "stale_worker_ids": stale_workers},
             "model": {"metadata_fallbacks": model_fallbacks},
             "routes": {
+                "sync_reads": sum(is_sync_request(trace) for trace in tool_traces),
+                "repeated_experiments": repeated_experiments(tool_traces),
                 "codex_actions": len(actions),
                 "failed_codex_actions": sum(trace.tool_name == "codex.shell" and trace.exit_code not in (None, 0) for trace in tool_traces),
                 "redundant_requests": redundant_requests,

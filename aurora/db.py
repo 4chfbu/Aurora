@@ -6,7 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from aurora.config import get_settings
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 settings = get_settings()
@@ -50,13 +50,14 @@ def _add_sqlite_columns() -> None:
             "last_event_at": "DATETIME",
             "resume_count": "INTEGER DEFAULT 0",
             "blackboard_version": "INTEGER DEFAULT 0",
+            "environment_id": "TEXT",
             "lease_generation": "INTEGER DEFAULT 0",
             "finalization_reason": "TEXT",
             "resume_manifest_artifact_id": "TEXT",
         },
         "attemptcheckpoint": {"generated_intent_ids": "JSON DEFAULT '[]'"},
         "fact": {"evidence_items": "JSON DEFAULT '[]'"},
-        "artifact": {"origin_kind": "TEXT DEFAULT 'unclassified'"},
+        "artifact": {"origin_kind": "TEXT DEFAULT 'unclassified'", "evidence_context": "JSON DEFAULT '{}'"},
         "discoveredtarget": {
             "source": "TEXT DEFAULT 'automatic'",
             "confidence": "FLOAT DEFAULT 0.0",
@@ -122,6 +123,8 @@ def _add_sqlite_columns() -> None:
         )
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_attempt_resume_manifest_artifact_id ON attempt (resume_manifest_artifact_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_challengegroupitem_phase_deadline_at ON challengegroupitem (phase_deadline_at)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_workerevent_project_cursor ON workerevent (project_id, created_at, id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_artifact_project_digest ON artifact (project_id, sha256)"))
 
 
 def _record_schema_version() -> None:

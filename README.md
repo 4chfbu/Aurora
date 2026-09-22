@@ -338,7 +338,13 @@ npm audit --audit-level=moderate
 
 ## Frozen Evaluation
 
+For network observations, flag validation excludes candidate values supplied in a tool request and rechecks evidence at every submission entry point. Explicit operator observations retain their existing trust policy. Managed target allocations receive an environment ID; observations from an older allocation cannot verify a current dynamic flag. Offline derivations retain their source references, and unchanged static attachments remain usable across allocations. Existing SQLite databases gain the evidence metadata columns on normal application startup.
+
+Workers read a project-wide blackboard version, including evidence updates to existing facts. The runtime refreshes `runtime/blackboard.json` after shell actions; the blackboard MCP can fall back to this snapshot with an explicit stale-state warning. Evidence-backed continuation tasks receive priority and reference their original attempt so the saved branch can resume. Independent peer branches do not automatically inherit each other's conversation or workspace. Rebuild Worker images to load the updated MCP server. These checks do not establish the correctness of arbitrary model-authored shell output; platform acceptance remains authoritative.
+
 The TSecBench evaluation API freezes eligible clean challenges and runs `baseline` or `candidate` variants in 12/25/40-minute phases (77 minutes per challenge). Phase 1 is one serial direct-solve attempt that checkpoints one continuation Intent; phases 2 and 3 may use multi-agent exploration, and the platform hint is fetched only on entry to phase 3. A suite permits only one active run, rejects live platform state with accepted progress, and currently refuses remote-attachment items until attachment materialization is implemented. Baseline and candidate therefore require independent clean platform sessions, or an explicit platform reset between runs. Promotion requires at least 30 eligible items, a 15-point success-rate improvement, no worse wrong-submission rate, the repeated-request reduction gate, and complete derived-verification and terminal-checkpoint coverage.
+
+Comparisons use the same eligible challenge IDs in both runs and expose paired and excluded IDs. Both runs must be completed before promotion. Manual acceptance and pending submissions do not count as platform success; earlier platform rejections remain counted after a later successful submission.
 
 ## Third-party licensing
 

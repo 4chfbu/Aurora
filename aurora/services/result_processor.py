@@ -50,7 +50,11 @@ class ResultProcessor:
             evidence_refs = self._project_artifact_refs(
                 session,
                 project_id=attempt.project_id,
-                refs=artifact_refs or candidate_refs,
+                refs=candidate_refs or [
+                    ref
+                    for item in self._objects(candidate.get("evidence_items"))
+                    for ref in (item.get("artifact_refs") if isinstance(item.get("artifact_refs"), list) else [])
+                ],
             )
             repository.upsert_fact(
                 session,

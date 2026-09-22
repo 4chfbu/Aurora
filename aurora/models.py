@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Column, UniqueConstraint
+from sqlalchemy import Column, Index, UniqueConstraint
 from sqlalchemy.types import JSON, LargeBinary
 from sqlmodel import Field, SQLModel
 
@@ -174,6 +174,7 @@ class Attempt(SQLModel, table=True):
     last_event_at: datetime | None = None
     resume_count: int = 0
     blackboard_version: int = 0
+    environment_id: str | None = None
     lease_generation: int = 0
     status: str = "RUNNING"
     finalization_reason: str | None = None
@@ -228,6 +229,8 @@ class Worker(SQLModel, table=True):
 
 
 class Artifact(SQLModel, table=True):
+    __table_args__ = (Index("ix_artifact_project_digest", "project_id", "sha256"),)
+
     id: str = Field(default_factory=lambda: new_id("artifact"), primary_key=True)
     project_id: str = Field(index=True)
     source_attempt_id: str | None = Field(default=None, index=True)
@@ -239,6 +242,7 @@ class Artifact(SQLModel, table=True):
     summary: str | None = None
     sensitivity: str = "normal"
     origin_kind: str = "unclassified"
+    evidence_context: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=now_utc)
 
 
@@ -470,6 +474,8 @@ class ToolTrace(SQLModel, table=True):
 
 
 class WorkerEvent(SQLModel, table=True):
+    __table_args__ = (Index("ix_workerevent_project_cursor", "project_id", "created_at", "id"),)
+
     id: str = Field(default_factory=lambda: new_id("event"), primary_key=True)
     project_id: str = Field(index=True)
     worker_id: str | None = Field(default=None, index=True)

@@ -39,7 +39,14 @@ BASE_TOOLS = (
                 },
                 "verification_script": {
                     "type": "string",
-                    "description": "Python script path in the Worker workspace (preferred), or inline Python source for compatibility.",
+                    "description": (
+                        "Python script path in the Worker workspace (preferred), or inline Python source. "
+                        "Receives inputs/manifest.json as sys.argv[1]: a JSON array of objects with artifact_id, path, sha256. "
+                        "Use entries = json.load(open(sys.argv[1])); iterate entries directly (no files key or .get on the array). "
+                        "Read each entry['path'] relative to the working directory without prepending inputs/. "
+                        "Only declared inputs exist; they are read-only. Write scratch files in /tmp. "
+                        "Print exactly one computed flag to stdout, diagnostics to stderr; never hard-code the flag."
+                    ),
                 },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
             },
@@ -90,6 +97,14 @@ SUBAGENT_TOOL = MCPToolDefinition(
     "Start a bounded, non-recursive Solver subagent in this Worker container.",
     {"type": "object", "required": ["objective"], "properties": {"objective": {"type": "string"}, "capability_tags": {"type": "array"}}},
 )
+
+
+def scheduling_capabilities(settings: Settings) -> set[str]:
+    names = {tool.name for tool in BASE_TOOLS}
+    names.add("codex.shell")
+    if settings.fofa_configured:
+        names.add(FOFA_TOOL.name)
+    return names
 
 
 def visible_mcp_tools(

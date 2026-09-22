@@ -1,12 +1,14 @@
 from pathlib import Path
+import pytest
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from aurora.config import get_settings
-from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupItem, Fact, FlagCandidate, Project, ToolTrace, WorkerEvent
+from aurora.models import Attempt, AuthorizationScope, ChallengeGroup, ChallengeGroupEvent, ChallengeGroupItem, Fact, FlagCandidate, Intent, Project, ToolTrace, WorkerEvent
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.capability_gateway import CapabilityGateway
 from aurora.services.command_runner import LocalCommandRunner
+from aurora.services.flag_submission import FlagSubmissionService
 
 
 class RecordingAdapter:
@@ -17,6 +19,23 @@ class RecordingAdapter:
     def submit_flag(self, session, *, project_id, value):
         self.values.append(value)
         return self.result
+
+
+@pytest.mark.parametrize("mode", ["id", "latest", "value"])
+def test_all_submission_entry_points_recheck_evidence(monkeypatch, tmp_path, mode) -> None:
+    gateway, adapter, engine = _setup(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        project_id, worker_id = _verify(gateway, session, tmp_path)
+        candidate = session.exec(select(FlagCandidate)).one()
+        candidate.verification_artifact_ref = "missing-verification"
+        session.add(candidate)
+        session.commit()
+        target = {"candidate_id": candidate.id} if mode == "id" else {"candidate_id": "latest_verified"} if mode == "latest" else {"value": candidate.value}
+        outcome = FlagSubmissionService().submit(session, project_id=project_id, attempt_id="attempt_submit", adapter=adapter, **target)
+        assert outcome.status == "invalid_candidate"
+        assert adapter.values == []
+        assert candidate.submission_count == 0
+        assert candidate.status == "PROPOSED"
 
 
 def _setup(tmp_path: Path, monkeypatch, *, adapter_result: object = True):
@@ -154,6 +173,36 @@ def test_flag_submit_rejects_ambiguous_targets_and_duplicate_submission(monkeypa
         assert duplicate.success is False
         assert duplicate.metrics["status"] == "duplicate"
         assert adapter.values == ["flag{submitted}"]
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_partial_submission_tracks_slots_and_binds_handoff(monkeypatch, tmp_path, duplicate):
+    from aurora.services.competition_adapter import CompetitionSubmissionResult
+
+    result = CompetitionSubmissionResult(correct=True, completed=False, detail={
+        "correct_flag_count": 1, "total_flag_count": 4, "matched_flag_index": 0, "duplicate": duplicate,
+    })
+    gateway, adapter, engine = _setup(tmp_path, monkeypatch, adapter_result=result)
+    with Session(engine) as session:
+        project_id, worker_id = _verify(gateway, session, tmp_path)
+        parent_intent = Intent(project_id=project_id, objective="verified route", status="COMPLETED")
+        parent = Attempt(id="attempt_submit", project_id=project_id, worker_id=worker_id,
+                         intent_id=parent_intent.id, status="SUCCESS", environment_id="instance")
+        item = session.get(ChallengeGroupItem, "item_submit")
+        item.competition_meta = {"platform": "test", "correct_flag_count": int(duplicate), "flag_count": 4}
+        session.add_all([parent_intent, parent, item])
+        session.commit()
+        outcome = FlagSubmissionService().submit(session, project_id=project_id, value="flag{submitted}",
+                                                attempt_id=parent.id, adapter=adapter)
+        assert outcome.detail["new_progress"] is (not duplicate)
+        progress = session.exec(select(ChallengeGroupEvent).where(ChallengeGroupEvent.event_type == "group.item.flag_progress")).all()
+        assert len(progress) == int(not duplicate)
+        handoff = session.exec(select(Intent).where(Intent.project_id == project_id, Intent.status == "PENDING")).one()
+        assert handoff.parent_intent_id == parent_intent.id
+        assert handoff.budget["continuation_attempt_id"] == parent.id
+        if not duplicate:
+            assert item.competition_meta["accepted_flag_slots"][0]["index"] == 0
+            assert item.competition_meta["accepted_flag_slots"][0]["route"] == "verified route"
 
 
 def test_flag_submit_accepts_raw_value_and_records_platform_decisions(monkeypatch, tmp_path) -> None:

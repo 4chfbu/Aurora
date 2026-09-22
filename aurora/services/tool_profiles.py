@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,20 @@ def profile_for_challenge(challenge_type: str | None) -> str:
     manifest = load_tool_manifest()
     normalized = (challenge_type or "unknown").strip().lower()
     return str(manifest["routing"].get(normalized, manifest["routing"]["unknown"]))
+
+
+def effective_challenge_type(challenge_type: str | None, evidence_text: str = "") -> str:
+    normalized = (challenge_type or "unknown").strip().lower()
+    normalized = {"webapp": "web", "web_app": "web", "web application": "web", "rev": "reverse", "re": "reverse", "forensic": "forensics"}.get(normalized, normalized)
+    if normalized in load_tool_manifest()["routing"] and normalized != "unknown":
+        return normalized
+    text = re.sub(r"https?://\S+", " ", evidence_text.lower())
+    heavy_signals = r"\b(?:pwn|rop|heap|elf|binary|firmware|reverse|apk|exe|rsa|aes|crypto|pcap)\b|逆向|溢出|固件|取证|加密"
+    if re.search(heavy_signals, text):
+        return "unknown"
+    if re.search(r"\b(?:web|website|webapp|ssrf|sqli|xss|csrf|flask|django|php|sql injection)\b|网站|网页|注入|前端|后端", text):
+        return "web"
+    return "unknown"
 
 
 def profile_capabilities(profile: str) -> dict[str, Any]:

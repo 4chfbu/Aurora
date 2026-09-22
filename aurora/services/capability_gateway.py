@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlmodel import Session, select
 
-from aurora.models import Artifact, FlagCandidate, Intent, ToolTrace, WorkerEvent
+from aurora.models import Artifact, FlagCandidate, Intent, Project, ToolTrace, WorkerEvent
 from aurora.services.command_runner import AutoCommandRunner, CommandRunner
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.policy import PolicyEngine
@@ -27,6 +27,7 @@ from aurora.services.flag_prefix_config import flag_prefixes_for_project
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.flag_submission import FlagSubmissionService
 from aurora.services.competition_adapter import CompetitionAdapter
+from aurora.services.deadlines import execution_deadline, remaining_seconds
 
 
 DENIED_TOKENS = ["rm -rf", "mkfs", ":(){", "dd if=", "shutdown", "reboot", "docker.sock"]
@@ -94,6 +95,14 @@ class CapabilityGateway:
         intent_id: str | None = None,
         attempt_id: str | None = None,
     ) -> ToolResult:
+        remaining = remaining_seconds(execution_deadline(session, project_id, worker_id))
+        if remaining is not None and tool_name not in {"blackboard.query", "flag.submit"}:
+            if remaining < 1:
+                return self._tool_error_result(session, project_id, tool_name, request, worker_id, intent_id, attempt_id, "execution deadline exhausted")
+            try:
+                request = {**request, "timeout_seconds": min(int(request.get("timeout_seconds", 30)), int(remaining))}
+            except (TypeError, ValueError):
+                return self._tool_error_result(session, project_id, tool_name, request, worker_id, intent_id, attempt_id, "invalid timeout_seconds")
         policy = self.policy_engine.check_tool_request(session, project_id=project_id, tool_name=tool_name, request=request)
         if not policy.allowed:
             trace = ToolTrace(
@@ -260,6 +269,7 @@ class CapabilityGateway:
             return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification_script must name an existing Python file in the worker workspace")
 
         artifacts: list[Artifact] = []
+        source_names: dict[str, str] = {}
         for ref in dict.fromkeys(ref for ref in refs if isinstance(ref, str)):
             artifact = session.get(Artifact, ref)
             if artifact is None:
@@ -275,6 +285,10 @@ class CapabilityGateway:
                         origin_kind="worker_observation",
                         deduplicate=True,
                     )
+                    # Artifact storage uses an opaque ID as its filename.
+                    # Keep the declared basename for scripts that select
+                    # named inputs such as flag.2.out or archive.tar.gz.
+                    source_names[artifact.id] = source_path.name
                 except (OSError, ValueError) as exc:
                     return self._verification_failure(
                         session,
@@ -287,6 +301,38 @@ class CapabilityGateway:
                     )
             if artifact.project_id != project_id or artifact.type in {"codex-transcript", "subagent-transcript", "blackboard-query", "tool-request"}:
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, f"untrusted or foreign source artifact: {ref}")
+            if not FlagValidator().is_current_evidence(session, artifact):
+                inventory = self._current_evidence_inventory(session, project_id=project_id)
+                repeats = self._stale_verification_repeats(session, project_id=project_id, request=request)
+                session.add(WorkerEvent(
+                    project_id=project_id,
+                    worker_id=worker_id,
+                    intent_id=intent_id,
+                    attempt_id=attempt_id,
+                    event_type="flag.verify.stale_evidence",
+                    payload_json={
+                        "ref": ref,
+                        "prior_stale_attempts": repeats,
+                        "current_evidence": [entry["id"] for entry in inventory],
+                    },
+                ))
+                name = ArtifactStore.original_name(artifact)
+                target = session.get(Project, project_id)
+                target_url = (target.target_url if target is not None else None) or "the current instance"
+                reason = f"stale or unavailable source evidence: {ref}"
+                if name and name != ref:
+                    reason = f"{reason} (input {name!r})"
+                reason = f"{reason}; reacquire it from {target_url} before verifying again"
+                if repeats:
+                    reason = (
+                        f"{reason}. This exact verification already failed with stale evidence "
+                        f"{repeats} time(s); do not repeat it. Re-run the command that produced the "
+                        "missing input against the live instance to create a NEW artifact, then verify with that artifact"
+                    )
+                if inventory:
+                    listed = "; ".join(f"{entry['id']} ({entry['name']}, {entry['type']})" for entry in inventory)
+                    reason = f"{reason}. Current valid evidence: {listed}"
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, reason)
             artifacts.append(artifact)
         if not artifacts:
             return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "no valid source artifacts were declared")
@@ -310,21 +356,27 @@ class CapabilityGateway:
                     # scripts commonly need to identify archive/file formats,
                     # and stripping ``.zip`` made correctly declared evidence
                     # indistinguishable inside the isolated replay workspace.
-                    target = input_dir / f"{artifact.id}_{source.name}"
+                    target = input_dir / f"{artifact.id}_{source_names.get(artifact.id, ArtifactStore.original_name(artifact))}"
                     shutil.copyfile(source, target)
                     target.chmod(0o444)
                     manifest.append({"artifact_id": artifact.id, "path": f"inputs/{target.name}", "sha256": artifact.sha256})
                 (input_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-                completed = self.verification_runner.run(command="PYTHONDONTWRITEBYTECODE=1 python3 verify.py inputs/manifest.json", cwd=run_dir, timeout=timeout)
+                remaining = remaining_seconds(execution_deadline(session, project_id, worker_id))
+                if remaining is not None and remaining < 1:
+                    return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification deadline exhausted", runs=runs)
+                replay_timeout = min(timeout, int(remaining)) if remaining is not None else timeout
+                completed = self.verification_runner.run(command="PYTHONDONTWRITEBYTECODE=1 python3 verify.py inputs/manifest.json", cwd=run_dir, timeout=replay_timeout)
                 output = completed.stdout.strip()
                 runs.append({"exit_code": completed.exit_code, "stdout": output, "stderr": completed.stderr[-1000:]})
                 if completed.exit_code != 0 or not FlagValidator.is_valid_flag_value(output, flag_prefixes_for_project(session, project_id)):
                     return self._verification_failure(
                         session, project_id, request, worker_id, intent_id, attempt_id,
-                        "verification replay must exit successfully and print exactly one flag",
+                        self._replay_failure_reason(completed.exit_code, completed.stderr),
                         runs=runs,
                     )
             value = runs[0]["stdout"]
+            if any(FlagValidator().is_request_value(session, artifact, value) for artifact in artifacts):
+                return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification output originates in a request input, not independent target evidence", runs=runs)
             if runs[1]["stdout"] != value:
                 return self._verification_failure(session, project_id, request, worker_id, intent_id, attempt_id, "verification replay produced inconsistent results", runs=runs)
             value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -483,6 +535,99 @@ class CapabilityGateway:
         }
         return ToolResult(executed, outcome.summary, artifact_refs, metrics, [] if executed else [outcome.summary], trace.id)
 
+    @staticmethod
+    def _replay_failure_reason(exit_code: int, stderr: str) -> str:
+        reason = "verification replay must exit successfully and print exactly one flag"
+        # The full traceback stays in the evidence artifact. Give the solver
+        # enough feedback to repair common contract mistakes in its next turn,
+        # without copying arbitrary script output into the context summary.
+        if "AttributeError: 'list' object has no attribute 'get'" in stderr or "TypeError: list indices must be integers or slices, not str" in stderr:
+            hint = (
+                "inputs/manifest.json is a JSON array, not an object with a files key. "
+                "Use entries = json.load(open(sys.argv[1])); iterate entries and read entry['path']"
+            )
+        elif "FileNotFoundError:" in stderr:
+            hint = (
+                "read each manifest entry's path relative to the replay working directory, "
+                "without prepending inputs/ again. Only declared source artifacts are available"
+            )
+        elif "ModuleNotFoundError:" in stderr or "ImportError:" in stderr:
+            hint = "a script dependency is unavailable in the isolated replay; inspect the failure artifact and use supported modules"
+        elif "Read-only file system" in stderr or "PermissionError:" in stderr:
+            hint = "replay inputs are read-only; write scratch files under /tmp and keep declared inputs unchanged"
+        elif exit_code == 124:
+            hint = "replay exceeded its time limit; reduce the derivation work or supply a timeout_seconds value up to 60"
+        elif exit_code == 0:
+            hint = "stdout must contain only one complete flag with an allowed prefix; send diagnostics to stderr"
+        else:
+            hint = f"script exited with code {exit_code}; inspect the failure artifact's runs[].stderr before retrying"
+        return f"{reason}; {hint}"
+
+    @staticmethod
+    def _current_evidence_inventory(session: Session, *, project_id: str, limit: int = 8) -> list[dict[str, str]]:
+        """List currently-valid trusted evidence so a stale verify can re-target.
+
+        A worker that only sees ``stale or unavailable source evidence`` has no
+        way to know which of its previously collected artifacts are still valid
+        after the platform re-provisions the instance.  Returning the live
+        inventory turns a blind retry loop into an actionable next step.
+        """
+        validator = FlagValidator()
+        artifacts = session.exec(
+            select(Artifact)
+            .where(Artifact.project_id == project_id)
+            .order_by(Artifact.created_at.desc())
+            .limit(60)
+        ).all()
+        inventory: list[dict[str, str]] = []
+        for artifact in artifacts:
+            if not validator.is_trusted_evidence_artifact(artifact):
+                continue
+            if not validator.is_current_evidence(session, artifact):
+                continue
+            inventory.append({
+                "id": artifact.id,
+                "name": ArtifactStore.original_name(artifact),
+                "type": artifact.type,
+            })
+            if len(inventory) >= limit:
+                break
+        return inventory
+
+    @staticmethod
+    def _verify_request_fingerprint(request: dict[str, Any]) -> str:
+        refs = request.get("source_artifact_refs")
+        payload = {
+            "refs": sorted(str(ref) for ref in refs) if isinstance(refs, list) else refs,
+            "script": request.get("verification_script"),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def _stale_verification_repeats(self, session: Session, *, project_id: str, request: dict[str, Any]) -> int:
+        """Count earlier failures of the identical verification request.
+
+        The platform re-provisions a challenge instance between phases, which
+        invalidates previously downloaded evidence. Workers then re-issue the
+        exact same ``flag.verify`` call against the stale inputs. Counting those
+        repeats lets the failure feedback escalate from ``reacquire`` to a hard
+        "do not repeat this call" instruction.
+        """
+        fingerprint = self._verify_request_fingerprint(request)
+        traces = session.exec(
+            select(ToolTrace)
+            .where(
+                ToolTrace.project_id == project_id,
+                ToolTrace.tool_name == "flag.verify",
+                ToolTrace.exit_code != 0,
+            )
+            .order_by(ToolTrace.created_at.desc())
+            .limit(25)
+        ).all()
+        return sum(
+            1 for trace in traces
+            if self._verify_request_fingerprint(trace.request_json or {}) == fingerprint
+        )
+
     def _verification_failure(
         self,
         session: Session,
@@ -532,7 +677,7 @@ class CapabilityGateway:
             }
         )
         try:
-            with urllib.request.urlopen(f"{settings.fofa_base_url}?{params}", timeout=settings.fofa_timeout_seconds) as response:
+            with urllib.request.urlopen(f"{settings.fofa_base_url}?{params}", timeout=min(settings.fofa_timeout_seconds, request.get("timeout_seconds", settings.fofa_timeout_seconds))) as response:
                 body = response.read().decode("utf-8", errors="replace")
                 payload = json.loads(body)
         except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
@@ -669,6 +814,7 @@ class CapabilityGateway:
             summary=f"{tool_name} {completed.backend} exit={completed.exit_code}: {command[:120]}",
             artifact_type="terminal",
             origin_kind=origin_kind,
+            evidence_context=FlagValidator.request_evidence_context(json.dumps(request, ensure_ascii=False)),
         )
         summary_source = stdout or stderr or "no output"
         summary = summary_source.replace("\n", " ")[:300]

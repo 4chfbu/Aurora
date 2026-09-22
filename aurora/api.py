@@ -19,6 +19,7 @@ from pathlib import Path
 
 from aurora.config import get_settings
 from aurora.db import SCHEMA_VERSION, engine, get_session, init_db
+from aurora.services.event_stream import event_page
 from aurora.models import (
     Artifact,
     AgentRuntimeSetting,
@@ -638,6 +639,7 @@ def create_app() -> FastAPI:
             run.started_at = now_utc()
             session.add(run)
             session.commit()
+            session.refresh(run)
         return {"run": run, "background": background.__dict__ if background else None}
 
     @app.get("/api/evaluations/runs")
@@ -1490,11 +1492,11 @@ def create_app() -> FastAPI:
         return session.exec(select(Attempt).where(Attempt.project_id == project_id).order_by(Attempt.started_at.desc())).all()
 
     @app.get("/api/projects/{project_id}/debug/context-snapshots")
-    def list_context_snapshots(project_id: str, session: Session = Depends(get_session)) -> list[ContextSnapshot]:
+    def list_context_snapshots(project_id: str, limit: int = 100, offset: int = 0, summary: bool = False, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
         _require_project(session, project_id)
-        return session.exec(
-            select(ContextSnapshot).where(ContextSnapshot.project_id == project_id).order_by(ContextSnapshot.created_at.desc())
-        ).all()
+        statement = select(ContextSnapshot.id, ContextSnapshot.project_id, ContextSnapshot.total_chars, ContextSnapshot.estimated_tokens, ContextSnapshot.created_at) if summary else select(ContextSnapshot)
+        rows = session.exec(statement.where(ContextSnapshot.project_id == project_id).order_by(ContextSnapshot.created_at.desc(), ContextSnapshot.id.desc()).limit(min(max(limit, 1), 500)).offset(max(offset, 0))).all()
+        return [dict(row._mapping) if summary else row.model_dump() for row in rows]
 
     @app.get("/api/context-snapshots/{snapshot_id}")
     def get_context_snapshot(snapshot_id: str, session: Session = Depends(get_session)) -> ContextSnapshot:
@@ -1504,14 +1506,16 @@ def create_app() -> FastAPI:
         return snapshot
 
     @app.get("/api/projects/{project_id}/debug/llm-traces")
-    def list_llm_traces(project_id: str, session: Session = Depends(get_session)) -> list[LLMTrace]:
+    def list_llm_traces(project_id: str, limit: int = 100, offset: int = 0, summary: bool = False, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
         _require_project(session, project_id)
-        return session.exec(select(LLMTrace).where(LLMTrace.project_id == project_id).order_by(LLMTrace.created_at.desc())).all()
+        statement = select(LLMTrace.id, LLMTrace.model, LLMTrace.estimated_input_tokens, LLMTrace.estimated_output_tokens, LLMTrace.decision_summary, LLMTrace.created_at) if summary else select(LLMTrace)
+        rows = session.exec(statement.where(LLMTrace.project_id == project_id).order_by(LLMTrace.created_at.desc(), LLMTrace.id.desc()).limit(min(max(limit, 1), 500)).offset(max(offset, 0))).all()
+        return [dict(row._mapping) if summary else row.model_dump() for row in rows]
 
     @app.get("/api/projects/{project_id}/debug/tool-traces")
-    def list_project_tool_traces(project_id: str, session: Session = Depends(get_session)) -> list[ToolTrace]:
+    def list_project_tool_traces(project_id: str, limit: int = 100, offset: int = 0, session: Session = Depends(get_session)) -> list[ToolTrace]:
         _require_project(session, project_id)
-        return session.exec(select(ToolTrace).where(ToolTrace.project_id == project_id).order_by(ToolTrace.created_at.desc())).all()
+        return session.exec(select(ToolTrace).where(ToolTrace.project_id == project_id).order_by(ToolTrace.created_at.desc(), ToolTrace.id.desc()).limit(min(max(limit, 1), 500)).offset(max(offset, 0))).all()
 
     @app.get("/api/projects/{project_id}/events")
     def list_project_events(project_id: str, limit: int = 100, session: Session = Depends(get_session)) -> list[WorkerEvent]:
@@ -1534,28 +1538,21 @@ def create_app() -> FastAPI:
             _require_project(session, project_id)
 
         def stream():
-            cursor = last_event_id
-            sent_initial_batch = False
+            cursor = None
+            if last_event_id:
+                with Session(engine) as session:
+                    previous = session.get(WorkerEvent, last_event_id)
+                    if previous and previous.project_id == project_id:
+                        cursor = (previous.created_at, previous.id)
             while True:
                 with Session(engine) as session:
-                    events = session.exec(
-                        select(WorkerEvent)
-                        .where(WorkerEvent.project_id == project_id)
-                        .order_by(WorkerEvent.created_at, WorkerEvent.id)
-                    ).all()
-
-                if cursor:
-                    cursor_index = next((index for index, event in enumerate(events) if event.id == cursor), None)
-                    pending = events[cursor_index + 1 :] if cursor_index is not None else events[-100:]
-                else:
-                    pending = events[-100:] if not sent_initial_batch else []
+                    pending = event_page(session, project_id, cursor)
 
                 if pending:
                     for event in pending:
                         payload = event.model_dump(mode="json")
                         yield f"id: {event.id}\nevent: project-event\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                        cursor = event.id
-                    sent_initial_batch = True
+                        cursor = (event.created_at, event.id)
                 else:
                     yield ": keepalive\n\n"
                 time.sleep(0.5)

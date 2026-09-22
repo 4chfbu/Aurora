@@ -184,8 +184,8 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | `AURORA_DEFAULT_MAX_ROUTE_REPEATS` | `2` | 同一路线连续失败的 Observer 纠偏阈值。 |
 | `AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS` | `5` | 没有新增 Fact 或实时 checkpoint 时允许的连续 Codex shell 动作数；达到后强制收尾。 |
 | `AURORA_DEFAULT_FINALIZE_GRACE_SECONDS` | `60` | 软截止后的收尾宽限时间。 |
-| `AURORA_RESUME_MAX_FILES` | `100` | 单个 Attempt 可进入恢复 manifest 的工作文件和 Codex 状态文件数量上限。 |
-| `AURORA_RESUME_MAX_BYTES` | `67108864` | `/workspace/work` 持久文件的总字节上限。 |
+| `AURORA_RESUME_MAX_FILES` | `100` | 单个 Attempt 的工作文件、Codex 状态文件各自进入恢复 manifest 的数量上限。新清单为 v2：状态文件也归档到 Artifact Store，旧 Worker 目录清理后仍可恢复；v1 清单继续兼容，但仍需要原目录。 |
+| `AURORA_RESUME_MAX_BYTES` | `67108864` | `/workspace/work` 持久文件、Codex 会话状态文件各自的归档总字节上限。 |
 | `AURORA_MAX_CHALLENGE_GROUP_CONCURRENT` | `2` | 题目组并行项目的全局上限（最大并发 Solver Agent 数）；单项目仍保持单 Worker。也可在 Web 题目组控制台直接调整，下次派发生效，重启后回退到环境变量。 |
 
 当前有效预算层级如下，越靠后的阶段钳制优先级越高：
@@ -197,6 +197,18 @@ AURORA_LLM_MODEL=gpt-4.1-mini
 | TSecBench（含 Evaluation） | soft 660s / hard 720s | soft 1440s / hard 1500s | soft 2340s / hard 2400s | 对应 12/25/40 分钟；P1 单 Agent，P2/P3 可多 Agent，hint 仅 P3 获取 |
 
 如果 Intent 显式给出更小的阶段超时，题目组会保留更小值；更大的值会被阶段上限钳制。当前 Phase 1–4 默认关闭固定 shell 动作数与“无进展动作数”截断，因此 `AURORA_DEFAULT_MAX_AGENT_ACTIONS` 和 `AURORA_DEFAULT_MAX_NO_PROGRESS_ACTIONS` 主要是兼容回退值；要启用动作上限，应在 Intent `budget` 中显式设置 `max_agent_actions`。题目组会强制把 `max_no_progress_actions` 设为 `0`。
+
+调度器在 `scheduler_timeouts` 中保留显式超时配置及上次计算值，避免阶段 1 的临时剩余预算成为阶段 2 的永久上限。阶段窗口在环境就绪后启动；资源等待冻结已有窗口的剩余时间，全局截止时间始终生效。题组未设置 `deadline_at` 时，正数 `limits.max_minutes` 会在首次启动时生成持久的全局截止时间，重启不会刷新它。
+
+题组 `limits` 还支持以下调度参数（当前没有对应 Web 输入项）：
+
+| 字段 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `resource_retry_limit` | `3` | 环境分配失败后的自动重试次数，范围 0–10；0 表示不自动重试。耗尽后保留 `WAITING_RESOURCE` 和当前阶段，重新启动题组可重试。 |
+| `resource_retry_base_seconds` | `15` | 资源错误的首次重试间隔，之后翻倍，最大 60 秒；容量释放可提前唤醒容量等待者。 |
+| `first_attempt_reserve_seconds` | `720` | 有全局截止时间时，为每批未尝试题预留的时间；不足时不为后续阶段保留实例。 |
+
+保留实例还要求至少为未尝试题留出一个可调度名额；单并发时先处理未尝试题。会话归档排除可重建的 `tmp` 临时运行文件。工作文件超限时优先保存解题脚本；不能完整恢复的会话不做原生 resume，可降级恢复已校验的部分工作文件，缺失数量和原因记录在 manifest 与 `work_state_restore` 上下文中。
 
 ### Hands-free Cataloger
 
@@ -227,6 +239,12 @@ Hands-free URL 导入优先使用平台适配器和浏览器已观察到的 JSON
 只保存在当前 API 进程内存，重启后回退到环境变量；GET 配置接口不会返回 Token。Token 不会写入
 ImportBatch、Project、ChallengeGroupItem、数据库设置或 Artifact。
 `AURORA_TSECBENCH_TIMEOUT_SECONDS` 控制 API 请求超时，`AURORA_TSECBENCH_MAX_CONCURRENT` 最大为 `3`，对应平台同时最多启动 3 道题的限制。
+
+`AURORA_TSECBENCH_RETAIN_ENVIRONMENT_FOR_CONTINUATION` 默认 `true`：若阶段结束时有服务端绑定的续跑 Intent，
+且父 Attempt 的会话和完整恢复清单属于当前实例，并满足未尝试题的容量及时间预留要求，则保留该实例继续下一个阶段。每个实例最多延续一个阶段，
+之后释放名额，回到通常的阶段调度顺序；续跑仍受 12/25/40 分钟阶段预算和题组截止时间约束。
+目标不可达、无可恢复会话、任务结束或停止题组时不保留。设为 `false` 可恢复每阶段结束即释放实例的行为。
+实际实例发生变化时仍启动新会话，并将继承的旧证据标为需要重新验证。
 
 导入候选保存 `platform=tsecbench` 和 `unique_code`。Runner 在 Solver 前调用 start，使用返回的 `container_addr`
 建立项目目标并同步兼容用的授权主机记录，按阶段获取 Hint、提交 Flag，并在终态调用 close。Token 缺失或认证失败时导入进入
@@ -371,7 +389,7 @@ uv run uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `capture_full_context` | `true` | 预留字段；当前 ContextBuilder 始终生成所需上下文，不单独使用此开关。 |
 | `redact_secrets` | `true` | 写入上下文快照前，按 `api_key`、token、password、secret 等模式脱敏。 |
-| `max_context_snapshot_bytes` | `512000` | 上下文快照超过该大小时裁剪 facts 和 Artifact 摘要。 |
+| `max_context_snapshot_bytes` | `512000` | `sections_json` 序列化后的 UTF-8 字节硬上限。优先保留当前分支和显式依赖；过长正文压缩，完整内容保存在 `context_memory` 引用的 Artifact/工作区文件。预算小到无法容纳必需引用和工具参数时明确报错。系统提示词和工具 Schema 不计入此快照上限。 |
 | `capture_tool_stdout` | `false` | 预留字段；当前未提供环境变量开关。 |
 
 如需改变这些值，需要修改 `aurora/config.py` 或增加显式配置映射。

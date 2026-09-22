@@ -8,10 +8,14 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, Attempt, AttemptCheckpoint, Fact, Worker, WorkerEvent, now_utc
+from aurora.models import Artifact, Attempt, Intent, Worker, WorkerEvent, now_utc
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.project_coordination import ProjectCoordinationService
+from aurora.services.evidence_context import current_environment_id
+from aurora.services.flag_validator import FlagValidator
+from aurora.services.progress import evidence_progress_counts
+from aurora.services.context_memory import select_context_memory
 
 
 class WorkerControlService:
@@ -21,10 +25,10 @@ class WorkerControlService:
 
     def authenticate(self, session: Session, *, worker_id: str, token: str) -> tuple[Worker, Attempt]:
         worker = session.get(Worker, worker_id)
-        if worker is None or worker.status != "RUNNING":
+        if worker is None or worker.status not in {"RUNNING", "CONCLUDING"}:
             raise PermissionError("worker is not active")
         attempt = session.exec(
-            select(Attempt).where(Attempt.worker_id == worker_id, Attempt.status == "RUNNING").order_by(Attempt.started_at.desc())
+            select(Attempt).where(Attempt.worker_id == worker_id, Attempt.status.in_(["RUNNING", "FINALIZING"])).order_by(Attempt.started_at.desc())
         ).first()
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
         if attempt is None or not attempt.codex_control_token_hash or not hmac.compare_digest(digest, attempt.codex_control_token_hash):
@@ -32,23 +36,17 @@ class WorkerControlService:
         return worker, attempt
 
     def query(self, session: Session, *, worker: Worker, attempt: Attempt) -> dict[str, Any]:
-        facts = session.exec(
-            select(Fact).where(Fact.project_id == worker.project_id, Fact.status == "ACTIVE").order_by(Fact.created_at.desc()).limit(50)
-        ).all()
-        checkpoints = session.exec(
-            select(AttemptCheckpoint)
-            .where(AttemptCheckpoint.project_id == worker.project_id)
-            .order_by(AttemptCheckpoint.created_at.desc())
-            .limit(5)
-        ).all()
-        live = session.exec(
-            select(WorkerEvent)
-            .where(WorkerEvent.project_id == worker.project_id, WorkerEvent.event_type == "checkpoint.saved")
-            .order_by(WorkerEvent.created_at.desc())
-            .limit(5)
-        ).all()
+        state = ProjectCoordinationService().ensure(session, project_id=worker.project_id)
+        session.refresh(state)
+        intent = session.get(Intent, worker.intent_id)
+        memory = select_context_memory(session, project_id=worker.project_id, intent=intent, attempt=attempt, fact_limit=50, checkpoint_limit=5)
+        facts, checkpoints, live = memory.facts, memory.checkpoints, memory.live_checkpoints
         return {
-            "version": attempt.blackboard_version,
+            "version": state.graph_version,
+            "attempt_version": attempt.blackboard_version,
+            "environment_id": current_environment_id(session, worker.project_id),
+            "stale": False,
+            "session_handoff": memory.handoff(),
             "facts": [
                 {
                     "id": fact.id,
@@ -56,12 +54,16 @@ class WorkerControlService:
                     "category": fact.category,
                     "confidence": fact.confidence,
                     "evidence_refs": fact.evidence_refs,
+                    "evidence_items": fact.evidence_items,
+                    "source_attempt_id": fact.source_attempt_id,
                 }
                 for fact in facts
             ],
             "checkpoints": [
                 {
                     "id": checkpoint.id,
+                    "attempt_id": checkpoint.attempt_id,
+                    "memory_role": "lineage" if checkpoint.id in memory.pinned_checkpoint_ids else "peer_history",
                     "summary": checkpoint.summary,
                     "failed_routes": checkpoint.failed_routes,
                     "next_steps": checkpoint.next_steps,
@@ -91,9 +93,10 @@ class WorkerControlService:
                 "fact_id": prior.get("fact_id"),
                 "created": bool(prior.get("created")),
                 "evidence_refs": list(prior.get("evidence_refs") or []),
-                "version": int(prior.get("blackboard_version") or attempt.blackboard_version),
+                "version": int(prior.get("graph_version") or prior.get("blackboard_version") or attempt.blackboard_version),
                 "deduplicated": True,
             }
+        before_progress = evidence_progress_counts(session, worker.project_id)
         refs = self._normalize_artifact_refs(
             session,
             worker=worker,
@@ -111,7 +114,13 @@ class WorkerControlService:
             source_intent_id=worker.intent_id,
             source_attempt_id=attempt.id,
         )
-        self._advance(
+        after_progress = evidence_progress_counts(session, worker.project_id)
+        if any(after > before for before, after in zip(before_progress, after_progress)):
+            session.add(WorkerEvent(
+                project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id, attempt_id=attempt.id,
+                event_type="evidence.progress", payload_json={"fact_id": result.item.id, "evidence_refs": refs},
+            ))
+        version = self._advance(
             session,
             worker=worker,
             attempt=attempt,
@@ -122,7 +131,7 @@ class WorkerControlService:
             "fact_id": result.item.id,
             "created": result.created,
             "evidence_refs": refs,
-            "version": attempt.blackboard_version,
+            "version": version,
         }
 
     def save_checkpoint(
@@ -143,7 +152,7 @@ class WorkerControlService:
             return {
                 "status": "saved",
                 "artifact_refs": list(prior.get("artifact_refs") or []),
-                "version": int(prior.get("blackboard_version") or attempt.blackboard_version),
+                "version": int(prior.get("graph_version") or prior.get("blackboard_version") or attempt.blackboard_version),
                 "deduplicated": True,
             }
         refs = self._normalize_artifact_refs(
@@ -161,9 +170,8 @@ class WorkerControlService:
             "artifact_refs": refs,
             "request_id": request_id,
         }
-        self._advance(session, worker=worker, attempt=attempt, event_type="checkpoint.saved", payload=payload)
-        ProjectCoordinationService().record_graph_change(session, project_id=worker.project_id)
-        return {"status": "saved", "artifact_refs": refs, "version": attempt.blackboard_version}
+        version = self._advance(session, worker=worker, attempt=attempt, event_type="checkpoint.saved", payload=payload)
+        return {"status": "saved", "artifact_refs": refs, "version": version}
 
     def read_artifact(
         self,
@@ -188,6 +196,9 @@ class WorkerControlService:
             "mime_type": artifact.mime_type,
             "size": artifact.size,
             "summary": artifact.summary,
+            "origin_kind": artifact.origin_kind,
+            "evidence_context": artifact.evidence_context,
+            "current_evidence": FlagValidator().is_current_evidence(session, artifact),
             "content": content,
             "truncated": artifact.size > limit,
         }
@@ -281,7 +292,12 @@ class WorkerControlService:
         )
 
     @staticmethod
-    def _advance(session: Session, *, worker: Worker, attempt: Attempt, event_type: str, payload: dict[str, Any]) -> None:
+    def _advance(session: Session, *, worker: Worker, attempt: Attempt, event_type: str, payload: dict[str, Any]) -> int:
+        state = ProjectCoordinationService().ensure(session, project_id=worker.project_id)
+        session.refresh(state)
+        version = state.graph_version
+        if event_type == "checkpoint.saved":
+            version = ProjectCoordinationService().record_graph_change(session, project_id=worker.project_id, commit=False)
         attempt.blackboard_version += 1
         attempt.last_event_at = now_utc()
         session.add(attempt)
@@ -292,7 +308,9 @@ class WorkerControlService:
                 intent_id=worker.intent_id,
                 attempt_id=attempt.id,
                 event_type=event_type,
-                payload_json={**payload, "blackboard_version": attempt.blackboard_version},
+                payload_json={**payload, "blackboard_version": attempt.blackboard_version, "graph_version": version},
             )
         )
         session.commit()
+        session.refresh(attempt)
+        return version

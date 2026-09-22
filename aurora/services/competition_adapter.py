@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from sqlmodel import Session, select
 
 from aurora.config import Settings, get_settings
-from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupItem, Project, WorkerEvent, now_utc
+from aurora.models import AuthorizationScope, ChallengeGroup, ChallengeGroupItem, Project, WorkerEvent, new_id, now_utc
 from aurora.services.slab_match import SlabMatchClient, SlabMatchError, SlabMatchNeedsSession
 from aurora.services.tsecbench import TSecBenchClient, TSecBenchError, TSecBenchNeedsSession, TSecBenchSubmission
 
@@ -354,7 +354,9 @@ class TSecBenchCompetitionAdapter:
             addresses = started_addresses or addresses
             address = addresses[0] if addresses else None
             meta["container_status"] = "available"
+            meta["environment_id"] = new_id("environment")
         if address:
+            meta.setdefault("environment_id", new_id("environment"))
             meta["container_addr"] = addresses
             item.competition_meta = meta
             session.add(item)
@@ -753,6 +755,7 @@ class SlabMatchCompetitionAdapter:
                 session.commit()
                 try:
                     client.build_environment(exercise_id)
+                    meta["environment_id"] = new_id("environment")
                 except SlabMatchNeedsSession as exc:
                     meta["container_status"] = "stopped"
                     item.competition_meta = meta
@@ -793,6 +796,7 @@ class SlabMatchCompetitionAdapter:
             return EnvironmentHealth(False, f"{reason}; cleanup failed: {cleanup}" if cleanup else reason)
         meta["container_addr"] = addresses
         meta["container_status"] = "available"
+        meta.setdefault("environment_id", new_id("environment"))
         meta["environment_notes"] = self._environment_note(project.challenge_type if project is not None else "", endpoints)
         item.competition_meta = meta
         session.add(item)

@@ -53,10 +53,7 @@ class PromptRenderer:
             {
                 "context_snapshot_id": snapshot.id,
                 "context": snapshot.sections_json,
-                "visible_zero_nai_tools": snapshot.visible_tools_json,
-                "output_schema": snapshot.output_schema_json,
             },
-            indent=2,
         )
         return self._render(
             self._read(profile.codex_template),

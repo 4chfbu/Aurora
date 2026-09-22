@@ -25,7 +25,10 @@
 - 计算得到的 flag 必须通过解题结束后由外层调用的 `flag.verify`：`source_artifact_refs` 可传当前项目 Artifact ID，或当前 Worker `/workspace` 内的证据文件路径（服务端会安全登记）；`verification_script` 优先传 Worker 工作区内的 Python 脚本路径，`timeout_seconds` 必须为 1–60 秒。服务端仅为兼容已有调用而接受内联源码及自动钳制超时。验证工具把声明的题目 Artifact 打包到隔离环境的 `inputs/`，并将 `inputs/manifest.json` 作为验证脚本的第一个参数。脚本必须按 manifest 中的 `path` 读取输入，不能依赖原 Worker 的 `/workspace/challenge`，且脚本本身不得包含候选值。验证成功会返回可直接提交的 `candidate_id`；没有通过验证时继续调查，不得宣告完成。
 - 当 `context.competition_context.platform` 非空且已有可信候选时，使用 `flag.submit` 交给平台裁决。已有候选优先传 `candidate_id`；同一批 `tool_requests` 中先请求 `flag.verify`、再请求 `flag.submit` 时，后者传 `candidate_id: "latest_verified"`；没有候选 ID 时，只能传与当前项目 `LOCAL_VERIFIED` 候选完全一致的 `value`，未知 `value` 会被拒绝。平台拒绝后禁止只做大小写、去 leet、加前后缀、密码包装或同义格式变体；必须有新的目标证据或可重放推导，否则停止提交并继续调查。
 - 仅可读取当前 Worker 的 `/workspace/inputs/manifest.json` 中列出的证据文件。其他题目、历史工作区或未在清单中的文件都不属于当前题目，不能作为事实或 flag 证据。
+- Worker 和 `flag.verify` 的输入 manifest 顶层都是 JSON 数组：`[{"artifact_id":"...","path":"inputs/...","sha256":"..."}]`。验证脚本使用 `entries = json.load(open(sys.argv[1]))` 后直接遍历 `entries`，不能调用 `entries.get("files")`。`entry["path"]` 相对于运行目录，直接读取，不能再次拼接 `inputs/`。输入只读，临时解压等写入 `/tmp`；stdout 仅输出一个完整 flag，调试信息写 stderr。回放失败先根据错误反馈修复脚本，再验证和提交。
 - 需要跨 Attempt 保留的脚本和中间结果必须写入 `/workspace/work`；其他临时路径不会进入恢复 manifest。
+- 续解优先读取 `session_handoff` 和 `recent_checkpoints` 中标为 `lineage` 的记录；同伴记录是共享观察，不应覆盖当前分支的下一步。`requires_revalidation=true` 表示靶机实例发生变化，历史会话不直接续用，环境相关结论必须重新验证。
+- 若存在 `context_memory`，当前上下文已压缩；完整版本保留在该字段指定的工作区 JSON 文件及 Artifact 中。只定向查询所需字段，不要将整份历史重新读入模型。该文件是记忆索引，不能替代独立证据。
 - `context.tool_environment` 是当前 Worker 镜像的权威能力清单。优先直接调用已注册的 `aurora_reverse`、`aurora_debug` MCP 工具维持逆向或调试会话；这些本地 MCP 调用不要重复写入 `tool_requests`。
 - 二进制题先执行 `aurora_reverse.triage_binary`，然后按“字符串/导入 → `find_string_xrefs` → 单函数 `decompile_function` → 必要时 `aurora_debug`”推进；Pwn 动调优先用白名单 `pwndbg_command` 的高信号命令。不要对整个函数表逐个反编译或无目标单步。
 - 使用 `aurora_blackboard` MCP 的 `query` 获取运行中的最新事实；启动实验前必须查询一次，长操作前再次查询，避免与 `context.exploration_graph.open_intents` 中的同伴重复。获得有 Artifact 支持的新结论或对同伴结论的反证后，立即调用同一 MCP 的 `append_fact`，使仍在运行的同伴可以消费。发现失败路线后以及最终输出前调用 `save_checkpoint`，记录已完成步骤、失败路线和唯一下一步。

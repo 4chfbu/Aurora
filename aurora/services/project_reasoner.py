@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
@@ -20,16 +21,33 @@ from aurora.models import (
 from aurora.services.blackboard_repository import BlackboardRepository, normalize_text
 from aurora.services.intent_dsl import IntentDSL
 from aurora.services.llm_http import LLMRequestError, chat_completion
-from aurora.services.mcp_registry import visible_mcp_tools
+from aurora.services.mcp_registry import scheduling_capabilities
+from aurora.services.blackboard_repository import normalize_fact_category
 from aurora.services.project_coordination import ProjectCoordinationService
+from aurora.services.flag_validator import FlagValidator
 from aurora.services.solver_playbooks import select_playbook
 from aurora.services.agent_runtime import agent_runtime_settings
+from aurora.services.deadlines import execution_deadline
+
+
+class PlannerIntentDSL(IntentDSL):
+    """Accept unambiguous legacy model priorities without weakening the API DSL."""
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("priority must be a number, not a boolean")
+        if isinstance(value, str):
+            value = value.strip()
+            return {"low": 1.0, "medium": 2.0, "high": 3.0}.get(value.lower(), value)
+        return value
 
 
 class ProjectReasoner:
     """Run one Cairn-style Reason pass for each newly committed graph state."""
 
-    def run(self, session: Session, *, project_id: str, phase: int | None = None) -> dict[str, Any]:
+    def run(self, session: Session, *, project_id: str, phase: int | None = None, deadline_at: datetime | None = None) -> dict[str, Any]:
         settings = get_settings()
         runtime = agent_runtime_settings(session)
         policy = session.exec(
@@ -85,7 +103,7 @@ class ProjectReasoner:
             facts = session.exec(
                 select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at)
             ).all()
-            created = self._reason(session, project_id=project_id, policy=policy, facts=facts, phase=phase)
+            created = self._reason(session, project_id=project_id, policy=policy, facts=facts, phase=phase, deadline_at=deadline_at)
             details = getattr(self, "_last_reason_details", {})
             coordination.finish_reason(
                 session,
@@ -139,6 +157,7 @@ class ProjectReasoner:
         policy: ProjectRuntimePolicy,
         facts: list[Fact],
         phase: int | None = None,
+        deadline_at: datetime | None = None,
     ) -> list[str]:
         settings = get_settings()
         project = session.get(Project, project_id)
@@ -185,7 +204,7 @@ class ProjectReasoner:
             checkpoints,
             preferred_phase=phase if phase is not None else (group_item.phase if group_item is not None else None),
         )
-        allowed = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False)}
+        allowed = scheduling_capabilities(settings)
         playbook = select_playbook(
             project.challenge_type,
             " ".join([project.goal, *(fact.statement for fact in facts[-20:])]),
@@ -202,13 +221,16 @@ class ProjectReasoner:
                 "do not return an empty list merely because one broad bootstrap intent already exists. Existing open "
                 "or completed routes must not be duplicated. "
                 f"Return JSON {{\"intents\": [...]}} with exactly {limit} item(s) when that many distinct routes remain. Each item has objective, "
-                "capabilities, depends_on_facts, priority, and risk_level. Return an empty list when existing "
+                "capabilities, depends_on_facts, priority, and risk_level. Follow intent_schema: priority is a "
+                "JSON number from 0 to 100 (default 1.0; larger means earlier), not a label such as high. "
+                "risk_level is low, medium, or high. Return an empty list when existing "
                 "work truly covers every useful direction. Assign one falsifiable experiment per item and include how "
                 "its result complements the other branches. Do not include commands or chain-of-thought."
             ),
             "goal": project.goal,
             "challenge_type": project.challenge_type,
             "current_phase": current_phase,
+            "intent_schema": IntentDSL.model_json_schema(),
             "allowed_capabilities": sorted(allowed),
             "default_capabilities": default_capabilities,
             "facts": [
@@ -252,6 +274,7 @@ class ProjectReasoner:
                     model=settings.model_for_role("planner"),
                     messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
                     timeout=settings.llm_timeout_seconds,
+                    deadline_at=deadline_at or execution_deadline(session, project_id),
                 )
                 payload = json.loads(body["choices"][0]["message"]["content"])
                 if not isinstance(payload, dict) or "intents" not in payload:
@@ -271,12 +294,20 @@ class ProjectReasoner:
         repository = BlackboardRepository()
         created: list[str] = []
         accepted_objectives: set[str] = set()
+        created.extend(self._create_candidates(
+            session, project_id=project_id,
+            candidates=self._continuation_candidates(session, facts=facts, checkpoints=checkpoints),
+            limit=min(1, limit), current_phase=current_phase, allowed=allowed,
+            default_capabilities=default_capabilities, fact_ids=fact_ids,
+            historical_objectives=historical_objectives, accepted_objectives=accepted_objectives,
+            repository=repository,
+        ))
         model_candidate_rejections: list[dict[str, Any]] = []
         model_created = self._create_candidates(
             session,
             project_id=project_id,
             candidates=candidates,
-            limit=limit,
+            limit=limit - len(created),
             current_phase=current_phase,
             allowed=allowed,
             default_capabilities=default_capabilities,
@@ -376,7 +407,7 @@ class ProjectReasoner:
             if not capabilities:
                 capabilities = default_capabilities
             try:
-                intent = IntentDSL(
+                intent = PlannerIntentDSL(
                     objective=candidate.get("objective", ""),
                     capabilities=capabilities,
                     depends_on_facts=candidate.get("depends_on_facts", []),
@@ -386,7 +417,8 @@ class ProjectReasoner:
             except ValidationError as exc:
                 if rejection_diagnostics is not None:
                     rejection_diagnostics.append(
-                        {"index": index, "reason": "validation_error", "detail": str(exc.errors()[0]["type"])[:120]}
+                        {"index": index, "reason": "validation_error", "detail": str(exc.errors()[0]["type"])[:120],
+                         "fields": list(dict.fromkeys(".".join(map(str, error["loc"])) for error in exc.errors()))}
                     )
                 continue
             if not intent.capabilities:
@@ -399,17 +431,23 @@ class ProjectReasoner:
                     rejection_diagnostics.append({"index": index, "reason": "duplicate_objective"})
                 continue
             accepted_objectives.add(normalized)
+            checkpoint_id = candidate.get("continuation_checkpoint_id")
+            checkpoint = session.get(AttemptCheckpoint, checkpoint_id) if isinstance(checkpoint_id, str) else None
+            if checkpoint is not None and checkpoint.project_id != project_id:
+                checkpoint = None
             result = repository.upsert_intent(
                 session,
                 project_id=project_id,
                 objective=intent.objective,
                 capability_tags=intent.capabilities,
                 dependency_fact_ids=[fact_id for fact_id in intent.depends_on_facts if fact_id in fact_ids],
+                parent_intent_id=checkpoint.intent_id if checkpoint else None,
                 priority=intent.priority,
                 risk_level=intent.risk_level,
                 budget={
                     "model_role": "triage" if current_phase == 1 else "reviewer" if current_phase >= 4 else "solver",
                     "phase": current_phase,
+                    **({"continuation_attempt_id": checkpoint.attempt_id} if checkpoint else {}),
                 },
             )
             if result.created:
@@ -417,6 +455,41 @@ class ProjectReasoner:
             elif rejection_diagnostics is not None:
                 rejection_diagnostics.append({"index": index, "reason": "repository_duplicate"})
         return created
+
+    @staticmethod
+    def _continuation_candidates(session: Session, *, facts: list[Fact], checkpoints: list[AttemptCheckpoint]) -> list[dict[str, Any]]:
+        candidates = []
+        validator = FlagValidator()
+        for checkpoint in checkpoints:
+            if checkpoint.status != "PARTIAL" or not checkpoint.next_steps:
+                continue
+            supporting = [
+                fact for fact in facts
+                if fact.source_attempt_id == checkpoint.attempt_id
+                and normalize_fact_category(fact.category) in {"auth", "vuln", "exploit", "rce", "file_read", "privilege", "credential", "memory", "flag"}
+                and fact.confidence >= 0.8 and fact.evidence_refs
+            ]
+            supported = []
+            for fact in supporting:
+                for ref in fact.evidence_refs:
+                    artifact = session.get(Artifact, ref)
+                    if (
+                        artifact is not None
+                        and artifact.project_id == checkpoint.project_id
+                        and artifact.origin_kind in {"target_observation", "challenge_input", "worker_observation"}
+                        and validator.is_current_evidence(session, artifact)
+                    ):
+                        supported.append(fact.id)
+                        break
+            if supported:
+                candidates.append({
+                    "objective": f"Continue from the evidenced breakthrough: {checkpoint.next_steps[0][:1200]}. Reuse the saved reproduction and verify the remaining step before expanding exploration.",
+                    "depends_on_facts": supported,
+                    "priority": 2.5,
+                    "risk_level": "low",
+                    "continuation_checkpoint_id": checkpoint.id,
+                })
+        return candidates
 
     @staticmethod
     def _fallback_candidates(

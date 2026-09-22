@@ -7,13 +7,17 @@ from typing import Any
 from sqlmodel import Session, select
 
 from aurora.config import get_settings
-from aurora.models import Artifact, AttemptCheckpoint, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, Fact, FlagCandidate, Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
+from aurora.models import Artifact, Attempt, AuthorizationScope, ChallengeGroupItem, ContextSnapshot, FlagCandidate, Intent, Project, ProjectCoordinationState, ProjectRuntimePolicy, ToolTrace, Worker, WorkerEvent
+from aurora.services.artifact_store import ArtifactStore
+from aurora.services.context_budget import context_bytes, fit_context
+from aurora.services.context_memory import select_context_memory
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.mcp_registry import visible_mcp_tools
 from aurora.services.tool_contract import tools_for_runtime
-from aurora.services.tool_profiles import tool_environment
+from aurora.services.tool_profiles import effective_challenge_type, tool_environment
 from aurora.services.solver_playbooks import select_playbook
 from aurora.services.agent_runtime import agent_runtime_settings
+from aurora.services.flag_validator import FlagValidator
 
 
 SECRET_PATTERNS = [
@@ -85,7 +89,7 @@ def _redact_sections(value: Any) -> Any:
 
 
 class ContextBuilder:
-    def build(self, session: Session, *, project_id: str, intent_id: str, worker_id: str | None = None) -> ContextSnapshot:
+    def build(self, session: Session, *, project_id: str, intent_id: str, worker_id: str | None = None, existing_snapshot: ContextSnapshot | None = None) -> ContextSnapshot:
         settings = get_settings()
         project = session.get(Project, project_id)
         intent = session.get(Intent, intent_id)
@@ -116,17 +120,16 @@ class ContextBuilder:
             and policy.subagents_enabled
             and (worker is None or worker.execution_kind == "primary")
         )
-        facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").order_by(Fact.created_at.desc()).limit(25)).all()
-        artifacts = session.exec(select(Artifact).where(Artifact.project_id == project_id).order_by(Artifact.created_at.desc()).limit(10)).all()
-        checkpoints = session.exec(
-            select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == project_id).order_by(AttemptCheckpoint.created_at.desc()).limit(3)
-        ).all()
-        handoff_artifact_refs = list(dict.fromkeys(
-            artifact_ref
-            for checkpoint in checkpoints
-            for artifact_ref in checkpoint.artifact_refs
-            if isinstance(artifact_ref, str)
-        ))
+        attempt = session.exec(select(Attempt).where(Attempt.worker_id == worker_id, Attempt.project_id == project_id)
+                               .order_by(Attempt.started_at.desc(), Attempt.id.desc())).first() if worker_id else None
+        memory = select_context_memory(session, project_id=project_id, intent=intent, attempt=attempt)
+        facts, checkpoints = memory.facts, memory.checkpoints
+        artifacts = session.exec(select(Artifact).where(Artifact.project_id == project_id, Artifact.origin_kind != "runtime_state")
+                                 .order_by(Artifact.created_at.desc(), Artifact.id.desc()).limit(10)).all()
+        handoff_artifact_refs = list(dict.fromkeys([
+            *(ref for checkpoint in checkpoints for ref in checkpoint.artifact_refs if isinstance(ref, str)),
+            *(ref for fact in facts if fact.id in memory.pinned_fact_ids for ref in fact.evidence_refs if isinstance(ref, str)),
+        ]))
         handoff_artifacts: list[Artifact] = []
         for artifact_ref in handoff_artifact_refs:
             artifact = session.get(Artifact, artifact_ref)
@@ -149,11 +152,7 @@ class ContextBuilder:
             .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "harvester.task_dispatched")
             .order_by(WorkerEvent.created_at.desc())
         ).first()
-        live_checkpoint = session.exec(
-            select(WorkerEvent)
-            .where(WorkerEvent.project_id == project_id, WorkerEvent.event_type == "checkpoint.saved")
-            .order_by(WorkerEvent.created_at.desc())
-        ).first()
+        live_checkpoint = memory.live_checkpoints[0] if memory.live_checkpoints else None
         rejected_candidates = session.exec(
             select(FlagCandidate)
             .where(FlagCandidate.project_id == project_id, FlagCandidate.status == "REJECTED")
@@ -167,6 +166,11 @@ class ContextBuilder:
             .order_by(FlagCandidate.updated_at.desc())
             .limit(10)
         ).all()
+        validator = FlagValidator()
+        verified_candidates = [candidate for candidate in verified_candidates if any(
+            validator.is_verified_candidate(session, value=candidate.value, artifact_ref=ref, project_id=project_id)
+            for ref in ([candidate.verification_artifact_ref] if candidate.provenance_kind == "DERIVED_REPLAY" else candidate.artifact_refs)
+        )]
         failed_verifications = session.exec(
             select(ToolTrace)
             .where(ToolTrace.project_id == project_id, ToolTrace.tool_name == "flag.verify", ToolTrace.exit_code != 0)
@@ -179,13 +183,21 @@ class ContextBuilder:
 
         sections: dict[str, Any] = {
             "project_goal": project.goal,
+            "session_handoff": memory.handoff(),
+            "work_state_restore": next((event.payload_json for event in session.exec(select(WorkerEvent).where(
+                WorkerEvent.project_id == project_id, WorkerEvent.attempt_id == attempt.id,
+                WorkerEvent.event_type == "codex.work_state_restored",
+            )).all()), None) if attempt else None,
             "target_access": {
                 "status": project.target_verification_status,
                 "url": project.target_url,
                 "reason": project.target_verification_reason,
                 "required_for_solver_start": False,
             },
-            "tool_environment": tool_environment(settings, project.challenge_type),
+            "tool_environment": {
+                **tool_environment(settings, effective_challenge_type(project.challenge_type, f"{project.name} {project.goal}")),
+                "declared_challenge_type": project.challenge_type,
+            },
             "solver_playbook": {
                 "challenge_type": playbook.challenge_type,
                 "confidence": playbook.confidence,
@@ -197,6 +209,7 @@ class ContextBuilder:
             "competition_context": {
                 "platform": str((group_item.competition_meta or {}).get("platform") or ""),
                 "phase": group_item.phase,
+                "environment_id": (group_item.competition_meta or {}).get("environment_id"),
                 "attachments": list((group_item.competition_meta or {}).get("attachments", [])),
                 "notices": list((group_item.competition_meta or {}).get("notices", [])),
                 "target": project.target_url,
@@ -207,6 +220,8 @@ class ContextBuilder:
                     "correct_flag_count": (group_item.competition_meta or {}).get("correct_flag_count", 0),
                     "total_flag_count": (group_item.competition_meta or {}).get("flag_count"),
                     "is_completed": (group_item.competition_meta or {}).get("is_completed", False),
+                    "accepted_flag_slots": list((group_item.competition_meta or {}).get("accepted_flag_slots", [])),
+                    "continuation_policy": "Solve remaining platform positions. Reacquiring a solved position after an instance change does not count as progress.",
                 },
             } if group_item else None,
             "flag_submission": {
@@ -255,10 +270,11 @@ class ContextBuilder:
                 ],
                 "coordination": "Peers coordinate only through committed facts, artifacts, checkpoints, and intents.",
                 "collaboration_cycle": [
-                    "Query the live blackboard before selecting an experiment and before any expensive operation.",
+                    "Query the live blackboard before selecting an experiment, before any expensive operation, and before final conclusions. runtime/blackboard.json contains a local snapshot refreshed after shell actions.",
                     "Avoid work already owned by another open intent or disproved in a checkpoint.",
                     "Append evidence-backed facts immediately so running peers can consume them.",
                     "Publish contradictions and failed routes, not only successful findings.",
+                    "A peer's evidence-backed success and a negative probe are conflicting observations, not proof that the route is impossible. Compare their target instance, request, session, and response before closing the route.",
                     "Save a checkpoint with one concrete next step before final output.",
                 ],
             },
@@ -271,6 +287,7 @@ class ContextBuilder:
                     "confidence": fact.confidence,
                     "evidence_refs": fact.evidence_refs,
                     "evidence_items": fact.evidence_items,
+                    "source_attempt_id": fact.source_attempt_id,
                 }
                 for fact in facts
             ],
@@ -285,6 +302,9 @@ class ContextBuilder:
             "recent_checkpoints": [
                 {
                     "id": checkpoint.id,
+                    "attempt_id": checkpoint.attempt_id,
+                    "intent_id": checkpoint.intent_id,
+                    "memory_role": "lineage" if checkpoint.id in memory.pinned_checkpoint_ids else "peer_history",
                     "status": checkpoint.status,
                     "summary": checkpoint.summary,
                     "conclusions": checkpoint.conclusions,
@@ -321,20 +341,28 @@ class ContextBuilder:
         if settings.debug.redact_secrets:
             sections = _redact_sections(sections)
 
+        if context_bytes(sections) > settings.debug.max_context_snapshot_bytes:
+            archive = ArtifactStore().write_text(
+                session, project_id=project_id, source_attempt_id=attempt.id if attempt else None,
+                content=json.dumps(sections, ensure_ascii=False), summary="Unabridged context memory before compaction",
+                artifact_type="context-memory", origin_kind="runtime_state", sensitivity="restricted",
+            )
+            sections["context_memory"] = {
+                "artifact_id": archive.id,
+                "path": f"inputs/{archive.id}_{ArtifactStore.original_name(archive)}",
+                "usage": "Retrieve omitted history or full text by artifact ID, or search this local JSON file. This is context memory, not independent evidence.",
+            }
+        sections, truncation_report = fit_context(
+            sections, max_bytes=settings.debug.max_context_snapshot_bytes,
+            pinned_fact_ids=memory.pinned_fact_ids, pinned_checkpoint_ids=memory.pinned_checkpoint_ids,
+        )
         serialized = json.dumps(sections, ensure_ascii=False)
-        truncation_report = {"truncated": False, "original_chars": len(serialized)}
-        if len(serialized.encode("utf-8")) > settings.debug.max_context_snapshot_bytes:
-            keep_chars = settings.debug.max_context_snapshot_bytes // 2
-            sections["facts"] = sections["facts"][:10]
-            sections["artifact_summaries"] = sections["artifact_summaries"][:5]
-            truncation_report = {"truncated": True, "original_chars": len(serialized), "kept_chars_approx": keep_chars}
-            serialized = json.dumps(sections, ensure_ascii=False)
 
         section_metrics = {
             name: {"chars": len(json.dumps(value, ensure_ascii=False)), "estimated_tokens": estimate_tokens(json.dumps(value, ensure_ascii=False))}
             for name, value in sections.items()
         }
-        snapshot = ContextSnapshot(
+        values = dict(
             project_id=project_id,
             intent_id=intent_id,
             worker_id=worker_id,
@@ -346,6 +374,12 @@ class ContextBuilder:
             estimated_tokens=estimate_tokens(serialized),
             truncation_report_json=truncation_report,
         )
+        snapshot = existing_snapshot or ContextSnapshot(**values)
+        if existing_snapshot is not None:
+            if (snapshot.project_id, snapshot.intent_id, snapshot.worker_id) != (project_id, intent_id, worker_id):
+                raise ValueError("context snapshot does not belong to this worker intent")
+            for name, value in values.items():
+                setattr(snapshot, name, value)
         session.add(snapshot)
         session.commit()
         session.refresh(snapshot)

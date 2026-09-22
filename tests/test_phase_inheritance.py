@@ -8,6 +8,62 @@ from aurora.services.context_builder import ContextBuilder
 from aurora.services.demo import _select_parent_attempt
 
 
+def test_native_continuation_keeps_local_capabilities_and_authoritative_parent(monkeypatch) -> None:
+    from aurora.config import get_settings
+    from aurora.models import ProjectRuntimePolicy
+    from aurora.services.round_summary import RoundReflectionService
+
+    monkeypatch.setenv("AURORA_TOOL_CONTRACT", "kali_shell")
+    get_settings.cache_clear()
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="native continuation", goal="finish the saved experiment")
+        policy = ProjectRuntimePolicy(project_id=project.id, multi_agent_exploration_enabled=True)
+        original = Intent(project_id=project.id, objective="original experiment", status="COMPLETED")
+        attempt = Attempt(project_id=project.id, intent_id=original.id, worker_id="worker_parent", status="PARTIAL", codex_thread_id="thread_parent", resume_manifest_artifact_id="manifest_parent")
+        session.add_all([project, policy, original, attempt])
+        session.commit()
+        checkpoint = RoundReflectionService().create(session, attempt=attempt, skip_planner=True, budget={"phase": 1}, output={
+            "summary": "continue local analysis",
+            "suggested_intents": [{"objective": "Verify the saved experiment", "capabilities": ["sandbox.exec", "blackboard.query"], "budget": {"continuation_attempt_id": "foreign_attempt"}}],
+        })
+        assert len(checkpoint.generated_intent_ids) == 1
+        continuation = session.get(Intent, checkpoint.generated_intent_ids[0])
+        assert set(continuation.capability_tags) == {"blackboard.query", "sandbox.exec"}
+        assert continuation.budget["continuation_attempt_id"] == attempt.id
+        assert _select_parent_attempt(session, project_id=project.id, intent=continuation).id == attempt.id
+
+
+def test_checkpoint_preserves_legacy_failure_shapes() -> None:
+    from aurora.services.round_summary import RoundReflectionService
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="failure memory", goal="avoid repeating failed experiments")
+        intent = Intent(project_id=project.id, objective="investigate")
+        attempt = Attempt(project_id=project.id, intent_id=intent.id, worker_id="worker_memory", environment_id="instance_one", status="PARTIAL")
+        session.add_all([project, intent, attempt])
+        session.commit()
+        checkpoint = RoundReflectionService().create(session, attempt=attempt, skip_planner=True, author_intents=False, budget={}, output={
+            "summary": "preserve failures",
+            "failed_attempts": [
+                {"reason": "command_timed_out", "stderr": "target connection timeout"},
+                {"approach": "decode firmware", "result": "non-ASCII output"},
+                {"reason": "flag_verification_failed", "summary": "stale evidence", "artifact_refs": ["artifact_failure"]},
+                {}, "", "already tried route",
+            ],
+        })
+        assert len(checkpoint.failed_routes) == 4
+        assert "command_timed_out" in checkpoint.failed_routes[0]
+        assert "target connection timeout" in checkpoint.failed_routes[0]
+        assert "decode firmware" in checkpoint.failed_routes[1]
+        assert "non-ASCII output" in checkpoint.failed_routes[1]
+        assert "stale evidence" in checkpoint.failed_routes[2]
+        assert "artifact_failure" in checkpoint.failed_routes[2]
+
+
 def test_parent_attempt_falls_back_to_latest_resumable_project_state() -> None:
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(engine)
@@ -135,3 +191,31 @@ def test_checkpoint_artifacts_are_pinned_outside_latest_window(tmp_path) -> None
         handoff_ids = {artifact["id"] for artifact in snapshot.sections_json["handoff_artifacts"]}
         assert pinned.id not in latest_ids
         assert handoff_ids == {pinned.id}
+
+
+def test_continuation_pins_original_checkpoint_and_dependency_facts(tmp_path) -> None:
+    from aurora.models import Fact
+
+    database = create_engine("sqlite://")
+    SQLModel.metadata.create_all(database)
+    with Session(database) as session:
+        project = Project(name="pinned branch", goal="finish file read")
+        branch = Intent(project_id=project.id, objective="establish read", status="COMPLETED")
+        attempt = Attempt(project_id=project.id, intent_id=branch.id, worker_id="worker_source", status="PARTIAL")
+        session.add_all([project, branch, attempt])
+        session.commit()
+        artifact = ArtifactStore(tmp_path).write_text(session, project_id=project.id, content="file read evidence", summary="source observation", origin_kind="target_observation")
+        fact = Fact(project_id=project.id, statement="working file read", source_attempt_id=attempt.id, evidence_refs=[artifact.id])
+        checkpoint = AttemptCheckpoint(project_id=project.id, intent_id=branch.id, attempt_id=attempt.id, summary="read confirmed", artifact_refs=[artifact.id])
+        continuation = Intent(project_id=project.id, objective="read protected file", parent_intent_id=branch.id, dependency_fact_ids=[fact.id], budget={"continuation_attempt_id": attempt.id})
+        session.add_all([fact, checkpoint, continuation])
+        session.commit()
+        for index in range(30):
+            session.add(Fact(project_id=project.id, statement=f"unrelated observation {index}"))
+        for index in range(4):
+            session.add(AttemptCheckpoint(project_id=project.id, intent_id="peer", attempt_id=f"peer_{index}", summary="other branch"))
+        session.commit()
+        snapshot = ContextBuilder().build(session, project_id=project.id, intent_id=continuation.id)
+        assert snapshot.sections_json["facts"][0]["id"] == fact.id
+        assert snapshot.sections_json["recent_checkpoints"][0]["id"] == checkpoint.id
+        assert artifact.id in {item["id"] for item in snapshot.sections_json["handoff_artifacts"]}

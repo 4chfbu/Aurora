@@ -11,6 +11,7 @@ from aurora.services.hands_free import MAX_ATTACHMENT_BYTES, HandsFreeService
 from aurora.services.challenge_group_runner import ChallengeGroupRegistry, ChallengeGroupRunner, GroupRunState
 from aurora.services.challenge_group_runner import fail_group_run, recover_interrupted_groups, recover_legacy_target_blocked_groups
 from aurora.services.harvester_runner import HarvesterResult
+from aurora.services.artifact_store import ArtifactStore
 
 
 def test_cataloger_configuration_is_optional_for_deterministic_collection(tmp_path: Path) -> None:
@@ -530,7 +531,7 @@ def test_unavailable_target_environment_warns_but_still_dispatches_solver() -> N
         assert all(event.payload_json["solver_continues"] is True for event in warnings)
 
 
-def test_competition_flag_rejection_reopens_project_with_worker_feedback() -> None:
+def test_competition_flag_rejection_reopens_project_with_worker_feedback(tmp_path) -> None:
     class RejectingAdapter:
         def submit_flag(self, session, *, project_id, value):
             return False
@@ -540,8 +541,9 @@ def test_competition_flag_rejection_reopens_project_with_worker_feedback() -> No
         session.add(project)
         session.commit()
         cancelled = Intent(project_id=project.id, objective="continue analysis", status="CANCELLED")
-        finding = Finding(project_id=project.id, title="Candidate flag: flag{wrong}", evidence_refs=["artifact_original"])
-        candidate = FlagCandidate(project_id=project.id, value="flag{wrong}", value_hash=hashlib.sha256(b"flag{wrong}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED", artifact_refs=["artifact_original"])
+        evidence = ArtifactStore(tmp_path).write_text(session, project_id=project.id, content="flag{wrong}", summary="target response", origin_kind="target_observation")
+        finding = Finding(project_id=project.id, title="Candidate flag: flag{wrong}", evidence_refs=[evidence.id])
+        candidate = FlagCandidate(project_id=project.id, value="flag{wrong}", value_hash=hashlib.sha256(b"flag{wrong}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED", artifact_refs=[evidence.id])
         item = ChallengeGroupItem(group_id="group_rejected", project_id=project.id, position=1)
         session.add_all([cancelled, finding, candidate, item])
         session.commit()
@@ -570,7 +572,7 @@ def test_competition_flag_rejection_reopens_project_with_worker_feedback() -> No
 
 
 @pytest.mark.parametrize("adapter_result", [None, RuntimeError("submission endpoint invalid")])
-def test_unavailable_submission_requires_manual_flag_validation(adapter_result: object) -> None:
+def test_unavailable_submission_requires_manual_flag_validation(adapter_result: object, tmp_path) -> None:
     class UnavailableAdapter:
         def submit_flag(self, session, *, project_id, value):
             if isinstance(adapter_result, Exception):
@@ -583,7 +585,8 @@ def test_unavailable_submission_requires_manual_flag_validation(adapter_result: 
         session.add_all([project, group])
         session.commit()
         finding = Finding(project_id=project.id, title="Candidate flag: flag{needs_review}")
-        candidate = FlagCandidate(project_id=project.id, value="flag{needs_review}", value_hash=hashlib.sha256(b"flag{needs_review}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED")
+        evidence = ArtifactStore(tmp_path).write_text(session, project_id=project.id, content="flag{needs_review}", summary="target response", origin_kind="target_observation")
+        candidate = FlagCandidate(project_id=project.id, value="flag{needs_review}", value_hash=hashlib.sha256(b"flag{needs_review}").hexdigest(), status="LOCAL_VERIFIED", provenance_kind="OBSERVED", artifact_refs=[evidence.id])
         item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="RUNNING", fused_status="RUNNING")
         session.add_all([finding, candidate, item])
         session.commit()
@@ -683,10 +686,11 @@ def test_manual_flag_acceptance_survives_environment_cleanup_failure() -> None:
         assert cleanup_event.payload_json["error"] == "container engine unavailable"
 
 
-def test_recover_interrupted_group_requeues_its_running_item() -> None:
+@pytest.mark.parametrize("group_status", ["RUNNING", "STOPPED"])
+def test_recover_interrupted_group_requeues_its_running_item(group_status) -> None:
     with Session(service_session_engine()) as session:
         project = Project(name="interrupted", goal="resume after restart")
-        group = ChallengeGroup(name="batch", status="RUNNING")
+        group = ChallengeGroup(name="batch", status=group_status)
         session.add_all([project, group])
         session.commit()
         item = ChallengeGroupItem(group_id=group.id, project_id=project.id, position=1, status="RUNNING")
@@ -697,7 +701,7 @@ def test_recover_interrupted_group_requeues_its_running_item() -> None:
         session.add_all([item, intent, worker, attempt, group])
         session.commit()
 
-        assert recover_interrupted_groups(session) == [group.id]
+        assert recover_interrupted_groups(session) == ([group.id] if group_status == "RUNNING" else [])
         session.refresh(item)
         session.refresh(intent)
         session.refresh(worker)
@@ -709,6 +713,7 @@ def test_recover_interrupted_group_requeues_its_running_item() -> None:
         assert worker.status == "INTERRUPTED"
         assert attempt.status == "INTERRUPTED"
         assert group.current_item_id is None
+        assert group.status == group_status
 
 
 def test_recover_interrupted_groups_resumes_retryable_failed_group() -> None:

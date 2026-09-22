@@ -17,6 +17,8 @@ from aurora.services.project_coordination import ProjectCoordinationService
 from aurora.services.project_reasoner import ProjectReasoner
 from aurora.services.project_run_control import project_run_control
 from aurora.services.scheduler import Scheduler
+from aurora.services.artifact_store import ArtifactStore
+from aurora.services.demo import _select_parent_attempt
 
 
 def test_multi_agent_policy_requires_global_and_project_opt_in(monkeypatch) -> None:
@@ -339,6 +341,38 @@ def test_graph_versions_fence_reason_passes() -> None:
         repository.upsert_fact(session, project_id=project_id, statement="second", confidence=0.8)
         next_claim = service.claim_reason(session, project_id=project_id)
         assert next_claim is not None and next_claim[1] == 2
+
+
+def test_reasoner_prioritizes_evidenced_continuation_and_resumes_its_branch(tmp_path, monkeypatch) -> None:
+    from aurora.models import Attempt, AttemptCheckpoint, Fact
+
+    monkeypatch.setenv("AURORA_LLM_API_KEY", "")
+    get_settings.cache_clear()
+    with Session(engine) as session:
+        project = Project(name="continuation", goal="read protected file", challenge_type="web")
+        policy = ProjectRuntimePolicy(project_id=project.id, multi_agent_exploration_enabled=True, max_parallel_explorers=2)
+        branch = Intent(project_id=project.id, objective="establish file read", status="COMPLETED")
+        attempt = Attempt(project_id=project.id, intent_id=branch.id, worker_id="worker_breakthrough", status="PARTIAL", codex_thread_id="thread_breakthrough", resume_manifest_artifact_id="manifest_breakthrough")
+        session.add_all([project, policy, branch, attempt])
+        session.commit()
+        evidence = ArtifactStore(tmp_path).write_text(session, project_id=project.id, content="/challenge", summary="directory listing", origin_kind="target_observation")
+        fact = Fact(project_id=project.id, statement="File read reproduced", category="vulnerability_confirmed", confidence=0.95, evidence_refs=[evidence.id], source_attempt_id=attempt.id)
+        checkpoint = AttemptCheckpoint(project_id=project.id, intent_id=branch.id, attempt_id=attempt.id, summary="File read established", status="PARTIAL", next_steps=["Fix JSON escaping and read the protected file"], artifact_refs=[evidence.id], fact_refs=[fact.id])
+        session.add_all([fact, checkpoint])
+        session.commit()
+        created = ProjectReasoner()._reason(session, project_id=project.id, policy=policy, facts=[fact], phase=2)
+        pending = [session.get(Intent, intent_id) for intent_id in created]
+        assert len(pending) == 2
+        continuation = pending[0]
+        assert "Fix JSON escaping" in continuation.objective
+        assert continuation.priority > pending[1].priority
+        assert continuation.dependency_fact_ids == [fact.id]
+        assert continuation.parent_intent_id == branch.id
+        assert _select_parent_attempt(session, project_id=project.id, intent=continuation).id == attempt.id
+        fact.evidence_refs = []
+        session.add(fact)
+        session.commit()
+        assert ProjectReasoner._continuation_candidates(session, facts=[fact], checkpoints=[checkpoint]) == []
 
 
 def test_reason_pass_creates_bounded_parallel_intents_once(monkeypatch) -> None:

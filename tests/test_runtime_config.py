@@ -205,6 +205,32 @@ def test_codex_harness_renders_prompt_filename_for_worker_container(monkeypatch)
     assert runtime._render_command(prompt_file) == "codex exec aurora-intent.md"
 
 
+def test_external_worker_directory_keeps_mount_labels_and_prompt_paths(monkeypatch, tmp_path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    worker_root = tmp_path / "external-workers"
+    workspace = worker_root / "proj_external" / "worker_external"
+    workspace.mkdir(parents=True)
+    prompt = workspace / "aurora-intent.md"
+    prompt.write_text("test")
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("AURORA_CODEX_WORKSPACE_DIR", str(worker_root))
+    monkeypatch.setenv("AURORA_CODEX_COMMAND_TEMPLATE", "codex exec {prompt_filename} --input {container_prompt_file}")
+    get_settings.cache_clear()
+
+    runtime = CodexHarnessRuntime(command_runner=NoopRunner())
+    assert runtime._render_command(prompt) == "codex exec aurora-intent.md --input /workspace/aurora-intent.md"
+    runner = KaliContainerRunner()
+    runner.engine = "docker"
+    command, identity, container_cwd = runner._build_command("true", workspace)
+    assert str(workspace) + ":/workspace:rw" in command
+    assert "aurora.project_id=proj_external" in command
+    assert "aurora.worker_id=worker_external" in command
+    assert "aurora-worker_external" in command
+    assert identity == Path("codex-workspaces/proj_external/worker_external")
+    assert container_cwd == Path("/workspace")
+
+
 def test_codex_harness_prefers_last_message_file(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("AURORA_WORKER_RUNTIME", "codex")
     get_settings.cache_clear()
@@ -725,6 +751,26 @@ def test_codex_resume_without_manifest_starts_new_thread(tmp_path) -> None:
     assert thread_id is None
     assert [event.event_type for event in events] == ["codex.resume_rejected"]
     assert events[0].payload_json["reason"] == "resume_manifest_missing"
+
+
+def test_parallel_runtime_never_resumes_an_unrelated_peer(tmp_path) -> None:
+    from aurora.models import ProjectRuntimePolicy
+
+    database = create_engine("sqlite://")
+    SQLModel.metadata.create_all(database)
+    runtime = CodexHarnessRuntime(artifact_store=ArtifactStore(tmp_path))
+    with Session(database) as session:
+        worker = Worker(project_id="proj_branches", intent_id="intent_current")
+        peer = Attempt(project_id=worker.project_id, intent_id="intent_peer", worker_id="worker_peer", status="PARTIAL", codex_thread_id="thread_peer", resume_manifest_artifact_id="manifest_peer")
+        current = Attempt(project_id=worker.project_id, intent_id=worker.intent_id, worker_id=worker.id)
+        policy = ProjectRuntimePolicy(project_id=worker.project_id, multi_agent_exploration_enabled=True)
+        session.add_all([worker, peer, current, policy])
+        session.commit()
+        assert runtime._prepare_attempt(session, worker=worker, attempt=current, control_token="token") is None
+        current.parent_attempt_id = peer.id
+        session.add(current)
+        session.commit()
+        assert runtime._prepare_attempt(session, worker=worker, attempt=current, control_token="token") == "thread_peer"
 
 
 def test_codex_resume_falls_back_after_invalid_parent_manifest(tmp_path) -> None:

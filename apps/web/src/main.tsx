@@ -71,6 +71,9 @@ function App() {
   const [selectedGroupId, setSelectedGroupId] = useState('');
   const [groupDetail, setGroupDetail] = useState<ChallengeGroupDetail | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState('');
+  const selectedProjectRef = useRef(selectedProjectId);
+  selectedProjectRef.current = selectedProjectId;
+  const projectLoads = useRef(new Map<string, Promise<void>>());
   const [blackboard, setBlackboard] = useState<Blackboard | null>(null);
   const [contexts, setContexts] = useState<ContextSnapshot[]>([]);
   const [traces, setTraces] = useState<LLMTrace[]>([]);
@@ -155,30 +158,46 @@ function App() {
   }, [importResult?.batch.id, importResult?.batch.status]);
 
   useEffect(() => { void loadProjects(); void loadGroups(); void loadNetworkProxy(); void loadTSecBench(); void loadSlabMatch(); void loadOpenVPN(); void loadAgentSettings(); }, []);
-  useEffect(() => { if (selectedProjectId) void loadProjectData(selectedProjectId); }, [selectedProjectId]);
+  useEffect(() => { setEvents([]); setRuntimeLogs(null); if (selectedProjectId) void loadProjectData(selectedProjectId).catch(() => {}); }, [selectedProjectId]);
   useEffect(() => { if (selectedGroupId) void loadGroup(selectedGroupId); else setGroupDetail(null); }, [selectedGroupId]);
   useEffect(() => { if (!selectedGroupId) return; const timer = window.setInterval(() => void loadGroup(selectedGroupId), 3000); return () => window.clearInterval(timer); }, [selectedGroupId]);
   useEffect(() => {
     if (!selectedProjectId) return;
-    const timer = window.setInterval(() => void loadProjectData(selectedProjectId, true), 3000);
+    const timer = window.setInterval(() => { if (!document.hidden) void loadProjectData(selectedProjectId, true).catch(() => {}); }, 30000);
     return () => window.clearInterval(timer);
   }, [selectedProjectId]);
+  useEffect(() => {
+    if (!selectedProjectId || drawerTab !== 'inspect') return;
+    let cancelled = false;
+    let loading = false;
+    async function loadLogs() {
+      if (loading || document.hidden) return;
+      loading = true;
+      try {
+        const logs = await request<RuntimeLogs>(`/api/projects/${selectedProjectId}/runtime/logs?tail=20`);
+        if (!cancelled) setRuntimeLogs(logs);
+      } catch { } finally { loading = false; }
+    }
+    void loadLogs();
+    const timer = window.setInterval(() => void loadLogs(), 15000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [selectedProjectId, drawerTab]);
   useEffect(() => {
     if (!selectedProjectId) return;
     const source = new EventSource(`${API_BASE}/api/projects/${selectedProjectId}/events/stream`);
     source.addEventListener('project-event', (event) => {
       const incoming = JSON.parse((event as MessageEvent).data) as WorkerEvent;
-      setEvents((current) => [incoming, ...current.filter((item) => item.id !== incoming.id)].sort((left, right) => right.created_at.localeCompare(left.created_at)));
+      setEvents((current) => [incoming, ...current.filter((item) => item.id !== incoming.id)].sort((left, right) => right.created_at.localeCompare(left.created_at)).slice(0, 300));
       // Events are notifications only.  Fetch the authoritative blackboard so
       // node status and newly persisted evidence never depend on UI inference.
-      if (eventRefreshTimer.current !== null) window.clearTimeout(eventRefreshTimer.current);
+      if (incoming.event_type === 'codex.progress' || eventRefreshTimer.current !== null) return;
       eventRefreshTimer.current = window.setTimeout(() => {
         eventRefreshTimer.current = null;
-        void loadProjectData(selectedProjectId, true);
-      }, 100);
+        if (!document.hidden) void loadProjectData(selectedProjectId, true).catch(() => {});
+      }, 2000);
     });
     source.onerror = () => { /* EventSource reconnects automatically; polling remains the consistency fallback. */ };
-    return () => { source.close(); if (eventRefreshTimer.current !== null) window.clearTimeout(eventRefreshTimer.current); };
+    return () => { source.close(); if (eventRefreshTimer.current !== null) window.clearTimeout(eventRefreshTimer.current); eventRefreshTimer.current = null; };
   }, [selectedProjectId]);
 
   const latestTrace = traces[0];
@@ -231,10 +250,19 @@ function App() {
     return Boolean(nextItem);
   }
   async function loadProjectData(projectId: string, silent = false) {
-    const [board, contextData, traceData, toolData, eventData, warningData, targetData, hintData, autoData, logs] = await Promise.all([
-      request<Blackboard>(`/api/projects/${projectId}/blackboard`), request<ContextSnapshot[]>(`/api/projects/${projectId}/debug/context-snapshots`), request<LLMTrace[]>(`/api/projects/${projectId}/debug/llm-traces`), request<ToolTrace[]>(`/api/projects/${projectId}/debug/tool-traces`), request<WorkerEvent[]>(`/api/projects/${projectId}/events`), request<WorkerEvent[]>(`/api/projects/${projectId}/warnings`), request<DiscoveredTarget[]>(`/api/projects/${projectId}/targets`), request<Hint[]>(`/api/projects/${projectId}/hints`), request<Record<string, unknown>>(`/api/projects/${projectId}/autorun/status`), request<RuntimeLogs>(`/api/projects/${projectId}/runtime/logs?tail=120`),
+    const pending = projectLoads.current.get(projectId);
+    if (pending) { if (silent) return pending; await pending.catch(() => {}); }
+    const loading = fetchProjectData(projectId, silent);
+    projectLoads.current.set(projectId, loading);
+    try { await loading; } finally { if (projectLoads.current.get(projectId) === loading) projectLoads.current.delete(projectId); }
+  }
+  async function fetchProjectData(projectId: string, silent: boolean) {
+    const [board, contextData, traceData, toolData, eventData, warningData, targetData, hintData, autoData] = await Promise.all([
+      request<Blackboard>(`/api/projects/${projectId}/blackboard`), request<ContextSnapshot[]>(`/api/projects/${projectId}/debug/context-snapshots?summary=true&limit=10`), request<LLMTrace[]>(`/api/projects/${projectId}/debug/llm-traces?summary=true&limit=20`), request<ToolTrace[]>(`/api/projects/${projectId}/debug/tool-traces?limit=100`), request<WorkerEvent[]>(`/api/projects/${projectId}/events`), request<WorkerEvent[]>(`/api/projects/${projectId}/warnings`), request<DiscoveredTarget[]>(`/api/projects/${projectId}/targets`), request<Hint[]>(`/api/projects/${projectId}/hints`), request<Record<string, unknown>>(`/api/projects/${projectId}/autorun/status`),
     ]);
-    setBlackboard(board); setContexts(contextData); setTraces(traceData); setToolTraces(toolData); setEvents(eventData); setWarnings(warningData); setTargets(targetData); setHints(hintData); setAutorunStatus(autoData); setRuntimeLogs(logs);
+    if (selectedProjectRef.current !== projectId) return;
+    setBlackboard(board); setContexts(contextData); setTraces(traceData); setToolTraces(toolData); setWarnings(warningData); setTargets(targetData); setHints(hintData); setAutorunStatus(autoData);
+    setEvents((current) => [...new Map([...current, ...eventData].map((event) => [event.id, event])).values()].sort((left, right) => right.created_at.localeCompare(left.created_at)).slice(0, 300));
     if (silent) setSelectedNodeId((current) => current && graphEntityExists(current, board) ? current : null);
   }
   async function guarded(action: () => Promise<void>) {

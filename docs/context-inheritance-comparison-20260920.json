@@ -1,0 +1,47 @@
+{
+  "method": "Identical deterministic fixtures; isolated SQLite and local files; no model, network or platform calls.",
+  "before": {
+    "bounded_context": {
+      "limit_bytes": 16000,
+      "actual_bytes": 372388,
+      "within_limit": false,
+      "required_facts": 12,
+      "retained_required_facts": 10,
+      "full_memory_archived": false,
+      "rendered_prompt_bytes": 398567
+    },
+    "branch_handoff": {
+      "parent_checkpoint_first": false,
+      "parent_fact_present": false,
+      "live_board_parent_first": false
+    },
+    "durable_restore": {
+      "manifest_version": 1,
+      "thread_restored": false,
+      "work_restored": false,
+      "old_input_restored": false
+    }
+  },
+  "after": {
+    "bounded_context": {
+      "limit_bytes": 16000,
+      "actual_bytes": 12607,
+      "within_limit": true,
+      "required_facts": 12,
+      "retained_required_facts": 12,
+      "full_memory_archived": true,
+      "rendered_prompt_bytes": 32191
+    },
+    "branch_handoff": {
+      "parent_checkpoint_first": true,
+      "parent_fact_present": true,
+      "live_board_parent_first": true
+    },
+    "durable_restore": {
+      "manifest_version": 2,
+      "thread_restored": true,
+      "work_restored": true,
+      "old_input_restored": true
+    }
+  }
+}

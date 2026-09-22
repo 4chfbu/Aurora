@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -63,7 +64,29 @@ def _request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]
 @mcp.tool()
 def query() -> dict[str, Any]:
     """Read the latest scoped facts and checkpoints for this project."""
-    return audited("aurora_blackboard", "query", {}, lambda: _request("/blackboard"))
+    return audited("aurora_blackboard", "query", {}, _query_with_fallback)
+
+
+def _query_with_fallback() -> dict[str, Any]:
+    try:
+        snapshot = _request("/blackboard")
+    except (RuntimeError, OSError) as exc:
+        try:
+            snapshot = json.loads(Path("runtime/blackboard.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise RuntimeError("Live blackboard unavailable and no local snapshot exists; peer state is unknown") from exc
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("Local blackboard snapshot is invalid") from exc
+        return {**snapshot, "stale": True, "sync_error": str(exc)[:300], "guidance": "This is cached evidence. Peer state may have advanced; do not conclude that no peer breakthrough exists."}
+    try:
+        snapshot_path = Path("runtime/blackboard.json")
+        snapshot_path.parent.mkdir(exist_ok=True)
+        temporary = snapshot_path.with_suffix(f".mcp-{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(snapshot_path)
+    except OSError:
+        pass
+    return snapshot
 
 
 @mcp.tool()

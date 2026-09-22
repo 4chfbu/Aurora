@@ -275,6 +275,7 @@ class KaliContainerRunner(CommandRunner):
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         captured = {"stdout": [], "stderr": []}
+        pending_lines = {"stdout": b"", "stderr": b""}
         started = time.monotonic()
         finalization_reason: str | None = None
         interrupted_at: float | None = None
@@ -300,22 +301,28 @@ class KaliContainerRunner(CommandRunner):
             now = time.monotonic()
             if soft_timeout is not None and now - started >= soft_timeout:
                 request_finalization("soft_timeout", now)
-            if timeout is not None and now - started >= timeout:
+            hard_deadline_reached = timeout is not None and now - started >= timeout
+            if hard_deadline_reached:
                 request_finalization("hard_timeout", now)
-            if finalization_reason and interrupted_at is not None and now - interrupted_at >= max(1, finalize_grace) and process.poll() is None:
+            grace_exhausted = finalization_reason and interrupted_at is not None and now - interrupted_at >= max(1, finalize_grace)
+            if (hard_deadline_reached or grace_exhausted) and process.poll() is None:
                 self._stop_container(relative_cwd)
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
             for key, _ in selector.select(timeout=0.2):
-                line = key.fileobj.readline()
-                if line:
-                    captured[key.data].append(line)
-                    callback_reason = on_output(key.data, line.rstrip("\n"))
+                chunk = os.read(key.fd, 65536)
+                pending_lines[key.data] += chunk
+                lines = pending_lines[key.data].split(b"\n")
+                pending_lines[key.data] = lines.pop() if chunk else b""
+                for raw_line in lines:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    captured[key.data].append(line + ("\n" if chunk else ""))
+                    callback_reason = on_output(key.data, line)
                     if isinstance(callback_reason, str) and callback_reason:
                         request_finalization(callback_reason, time.monotonic())
-                else:
+                if not chunk:
                     selector.unregister(key.fileobj)
             if process.poll() is not None and not selector.get_map():
                 break
@@ -350,7 +357,14 @@ class KaliContainerRunner(CommandRunner):
         # A solver only receives its own worker directory. Mounting the
         # repository root exposed unrelated challenge files to the model.
         workspace = cwd.resolve()
-        relative_cwd = workspace.relative_to(Path.cwd().resolve())
+        try:
+            worker_path = workspace.relative_to(self.settings.codex_workspace_dir.resolve())
+        except ValueError:
+            relative_cwd = Path(os.path.relpath(workspace, Path.cwd().resolve()))
+        else:
+            # Labels and timeout cleanup use a logical Worker identity, not
+            # the configured host directory's location or basename.
+            relative_cwd = Path("codex-workspaces") / worker_path
         container_cwd = Path("/workspace")
         (workspace / "runtime" / "home").mkdir(parents=True, exist_ok=True)
         workspace_stat = workspace.stat()

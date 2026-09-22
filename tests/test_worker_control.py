@@ -9,6 +9,8 @@ from aurora.db import engine as app_engine
 from aurora.models import Artifact, Attempt, Fact, ProjectCoordinationState, Worker, WorkerEvent
 from aurora.services.artifact_store import ArtifactStore
 from aurora.services.worker_control import WorkerControlService
+from aurora.services.worker_runtime import CodexHarnessRuntime
+from aurora.services.blackboard_repository import BlackboardRepository
 
 
 def test_worker_control_is_scoped_and_versions_live_updates(tmp_path) -> None:
@@ -45,6 +47,85 @@ def test_worker_control_is_scoped_and_versions_live_updates(tmp_path) -> None:
     assert board["version"] == 2
     assert board["live_checkpoints"][0]["next_step"] == "Inspect the session cookie"
     assert {event.event_type for event in events} >= {"blackboard.fact_appended", "checkpoint.saved"}
+
+
+def test_peer_updates_and_merged_evidence_advance_shared_version(tmp_path, monkeypatch) -> None:
+    import json
+    from aurora.config import get_settings
+
+    monkeypatch.setenv("AURORA_CODEX_WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    get_settings.cache_clear()
+    database = create_engine(f"sqlite:///{tmp_path / 'peers.db'}")
+    SQLModel.metadata.create_all(database)
+    service = WorkerControlService()
+    with Session(database) as reader, Session(database) as writer:
+        workers = [Worker(project_id="proj_peers", intent_id=f"intent_{index}", status="RUNNING") for index in range(2)]
+        attempts = [Attempt(project_id=worker.project_id, intent_id=worker.intent_id, worker_id=worker.id) for worker in workers]
+        reader.add_all([*workers, *attempts])
+        reader.commit()
+        runtime = tmp_path / "workspaces" / workers[0].project_id / workers[0].id / "runtime"
+        runtime.mkdir(parents=True)
+        before = service.query(reader, worker=workers[0], attempt=attempts[0])
+        evidence = ArtifactStore(tmp_path / "artifacts").write_text(writer, project_id="proj_peers", content="administrator console", summary="HTTP response", origin_kind="target_observation")
+        peer = writer.get(Worker, workers[1].id)
+        peer_attempt = writer.get(Attempt, attempts[1].id)
+        result = service.append_fact(writer, worker=peer, attempt=peer_attempt, statement="Admin authentication bypass reproduced", category="auth", confidence=0.9, evidence_refs=[evidence.id])
+        after = service.query(reader, worker=workers[0], attempt=attempts[0])
+        assert after["version"] == result["version"] > before["version"]
+        assert after["attempt_version"] == 0
+        assert after["facts"][0]["source_attempt_id"] == peer_attempt.id
+        CodexHarnessRuntime._sync_blackboard(reader, worker=workers[0], attempt=attempts[0])
+        snapshot = json.loads((runtime / "blackboard.json").read_text())
+        assert snapshot["facts"][0]["evidence_refs"] == [evidence.id]
+        second = ArtifactStore(tmp_path / "artifacts").write_text(writer, project_id="proj_peers", content="independent confirmation", summary="HTTP response", origin_kind="target_observation")
+        repository = BlackboardRepository()
+        repository.upsert_fact(writer, project_id="proj_peers", statement="Admin authentication bypass reproduced", confidence=0.95, evidence_refs=[second.id])
+        merged = service.query(reader, worker=workers[0], attempt=attempts[0])
+        assert merged["version"] > after["version"]
+        assert set(merged["facts"][0]["evidence_refs"]) == {evidence.id, second.id}
+        repository.upsert_fact(writer, project_id="proj_peers", statement="Admin authentication bypass reproduced", confidence=0.95, evidence_refs=[second.id])
+        assert service.query(reader, worker=workers[0], attempt=attempts[0])["version"] == merged["version"]
+
+
+def test_finalizing_worker_can_read_peer_evidence() -> None:
+    database = create_engine("sqlite://")
+    SQLModel.metadata.create_all(database)
+    with Session(database) as session:
+        worker = Worker(project_id="proj_finalize", intent_id="intent_finalize", status="CONCLUDING")
+        attempt = Attempt(project_id=worker.project_id, worker_id=worker.id, intent_id=worker.intent_id, status="FINALIZING", codex_control_token_hash=hashlib.sha256(b"control-token").hexdigest())
+        session.add_all([worker, attempt])
+        session.commit()
+        authenticated = WorkerControlService().authenticate(session, worker_id=worker.id, token="control-token")
+        assert authenticated[1].id == attempt.id
+
+
+def test_checkpoint_version_is_not_published_before_checkpoint(tmp_path, monkeypatch) -> None:
+    from aurora.services.project_coordination import ProjectCoordinationService
+
+    database = create_engine(f"sqlite:///{tmp_path / 'checkpoint.db'}")
+    SQLModel.metadata.create_all(database)
+    original = ProjectCoordinationService.record_graph_change
+    observed = []
+
+    def observe_before_commit(service, session, **kwargs):
+        version = original(service, session, **kwargs)
+        with Session(database) as peer:
+            state = peer.exec(select(ProjectCoordinationState)).one()
+            observed.append(state.graph_version)
+        return version
+
+    monkeypatch.setattr(ProjectCoordinationService, "record_graph_change", observe_before_commit)
+    with Session(database) as session:
+        worker = Worker(project_id="proj_atomic", intent_id="intent_atomic", status="RUNNING")
+        attempt = Attempt(project_id=worker.project_id, intent_id=worker.intent_id, worker_id=worker.id)
+        session.add_all([worker, attempt])
+        session.commit()
+        service = WorkerControlService()
+        result = service.save_checkpoint(session, worker=worker, attempt=attempt, summary="read ready", completed_steps=[], failed_routes=[], next_step="read file", artifact_refs=[])
+        board = service.query(session, worker=worker, attempt=attempt)
+        assert observed == [0]
+        assert board["version"] == result["version"] == 1
+        assert board["live_checkpoints"][0]["next_step"] == "read file"
 
 
 def test_worker_control_write_request_ids_are_idempotent(tmp_path) -> None:

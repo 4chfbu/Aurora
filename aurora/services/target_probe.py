@@ -81,6 +81,32 @@ class TargetProbeService:
         )
         self.sleep = sleep
 
+    def probe_transport(self, url: str, *, timeout: int = 5) -> TargetProbeResult:
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme)
+            if parsed.scheme not in {"http", "https", "tcp"} or not host or port is None:
+                raise ValueError("target must be an HTTP(S) or TCP URL with a port")
+            _reject_management_host(host)
+            seconds = max(1, min(timeout, 10))
+            script = (
+                "import socket; "
+                f"connection = socket.create_connection(({host!r}, {port}), timeout={seconds}); "
+                "connection.close()"
+            )
+            workspace = (get_settings().codex_workspace_dir / "_target-probe").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            result = self.command_runner.run(
+                command=f"python3 -c {shlex.quote(script)}", cwd=workspace, timeout=seconds + 2,
+            )
+            return TargetProbeResult(
+                result.exit_code == 0, "REACHABLE" if result.exit_code == 0 else "WORKER_NETWORK_FAILED",
+                "Worker TCP probe", {"url": url, "exit_code": result.exit_code, "error": result.stderr[-500:]},
+            )
+        except (ValueError, OSError, RuntimeError) as exc:
+            return TargetProbeResult(False, "TRANSPORT_PROBE_FAILED", str(exc)[:500], {"url": url})
+
     def probe(self, url: str, *, attempts: int = 3) -> TargetProbeResult:
         try:
             url = normalize_target_url(url)

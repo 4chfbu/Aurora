@@ -12,11 +12,13 @@ from aurora.models import (
     Attempt,
     AttemptCheckpoint,
     ChallengeGroup,
+    ChallengeGroupEvent,
     ChallengeGroupItem,
     EvaluationItemResult,
     EvaluationRun,
     EvaluationSuite,
     FlagCandidate,
+    LLMTrace,
     Project,
     ToolTrace,
     WorkerEvent,
@@ -27,6 +29,8 @@ from aurora.services.agent_runtime import agent_runtime_settings
 from aurora.services.flag_rejection import is_authoritative_flag_rejection
 from aurora.services.tsecbench import TSecBenchClient
 from aurora.services.tool_profiles import manifest_sha256
+from aurora.services.progress import is_sync_request, repeated_experiments, transport_failed
+from aurora.services.evaluation_metrics import candidate_latencies, handoff_metrics, runtime_metrics, scheduling_metrics
 from aurora.services.tsecbench_phase_policy import (
     TSECBENCH_MAX_MINUTES_PER_CHALLENGE,
     TSECBENCH_PHASE_MINUTES,
@@ -46,6 +50,10 @@ class EvaluationComparison:
     sample_size: int
     promotion_eligible: bool
     promoted: bool
+    paired_challenge_keys: list[str]
+    excluded_challenge_keys: list[str]
+    runs_completed: bool
+    repeated_request_metric: str
 
 
 class EvaluationService:
@@ -240,13 +248,20 @@ class EvaluationService:
             events = session.exec(select(WorkerEvent).where(WorkerEvent.project_id == result.project_id)).all() if result.project_id else []
             candidates = session.exec(select(FlagCandidate).where(FlagCandidate.project_id == result.project_id)).all() if result.project_id else []
             checkpoints = session.exec(select(AttemptCheckpoint).where(AttemptCheckpoint.project_id == result.project_id)).all() if result.project_id else []
+            llm_traces = session.exec(select(LLMTrace).where(LLMTrace.project_id == result.project_id)).all() if result.project_id else []
+            latencies = candidate_latencies(candidates, events)
+            rejections = session.exec(select(ChallengeGroupEvent).where(
+                ChallengeGroupEvent.group_id == run.group_id,
+                ChallengeGroupEvent.item_id == item.id,
+                ChallengeGroupEvent.event_type == "group.item.flag_submission_rejected",
+            )).all() if item else []
             submission_status = item.submission_status if item else "NOT_SUBMITTED"
             completed = bool(
                 project
                 and project.status == "COMPLETED"
-                and submission_status in {"SUBMITTED", "MANUALLY_ACCEPTED", "ACCEPTED", "COMPLETED"}
+                and submission_status in {"ACCEPTED", "COMPLETED"}
             )
-            platform_correct = True if completed else False if submission_status == "REJECTED" else None
+            platform_correct = True if completed or submission_status == "PARTIAL" else False if submission_status == "REJECTED" else None
             environment_error = bool(item and item.fused_status in {"WAITING_INPUT", "CRASHED"} and not attempts)
             started = min((attempt.started_at for attempt in attempts), default=None)
             finished = max((attempt.finished_at for attempt in attempts if attempt.finished_at), default=None)
@@ -256,12 +271,32 @@ class EvaluationService:
             result.environment_error = environment_error
             result.elapsed_seconds = max(0.0, (finished - started).total_seconds()) if started and finished else None
             result.metrics_json = {
+                "metrics_version": 2,
+                **handoff_metrics(attempts, checkpoints, events),
+                **runtime_metrics(llm_traces),
+                **scheduling_metrics(attempts, item),
+                "candidate_to_platform_seconds": latencies,
+                "candidate_to_platform_mean_seconds": sum(latencies) / len(latencies) if latencies else None,
+                "mid_run_environment_errors": sum(event.event_type == "autorun.environment_unavailable" for event in events),
+                "transport_failure_traces": sum(transport_failed(trace) for trace in traces),
+                "sync_reads": sum(is_sync_request(trace) for trace in traces),
+                "repeated_experiments": repeated_experiments(traces),
                 "attempts": len(attempts),
                 "shell_actions": sum(trace.tool_name == "codex.shell" for trace in traces),
                 "repeated_requests": self._repeated_requests(traces),
                 "flag_verify_calls": sum(trace.tool_name == "flag.verify" for trace in traces),
                 "wrong_candidates": sum(is_authoritative_flag_rejection(candidate) for candidate in candidates),
-                "wrong_submissions": int(submission_status in {"REJECTED", "MANUALLY_REJECTED"}),
+                # Submission status describes only the latest outcome. Keep
+                # earlier platform rejections even after a later success.
+                "wrong_submissions": len(rejections) if rejections else max(
+                    int(submission_status == "REJECTED"),
+                    sum(
+                        candidate.status == "REJECTED" and candidate.submission_count > 0
+                        and "manual validation rejected" not in (candidate.rejection_reason or "").lower()
+                        for candidate in candidates
+                    ),
+                ),
+                "manual_acceptance": submission_status == "MANUALLY_ACCEPTED",
                 "derived_candidates": sum(
                     candidate.provenance_kind.upper() in {"DERIVED_REPLAY", "VERIFIED_REPLAY"}
                     for candidate in candidates
@@ -340,6 +375,14 @@ class EvaluationService:
                 "flag_verify_calls": sum((result.metrics_json or {}).get("flag_verify_calls", 0) for result in eligible),
                 "derived_verification_coverage": verified_derived / derived if derived else 1.0,
                 "terminal_checkpoint_coverage": checkpointed / terminal_attempts if terminal_attempts else 1.0,
+                "mid_run_environment_errors": sum((result.metrics_json or {}).get("mid_run_environment_errors", 0) for result in results),
+                "repeated_experiments": sum((result.metrics_json or {}).get("repeated_experiments", 0) for result in eligible),
+                "continuations_generated": sum((result.metrics_json or {}).get("continuations_generated", 0) for result in eligible),
+                "continuations_consumed": sum((result.metrics_json or {}).get("continuations_consumed", 0) for result in eligible),
+                "runtime_input_tokens": sum((result.metrics_json or {}).get("runtime_input_tokens", 0) for result in results),
+                "runtime_output_tokens": sum((result.metrics_json or {}).get("runtime_output_tokens", 0) for result in results),
+                "runtime_usage_measured": sum((result.metrics_json or {}).get("runtime_usage_measured", 0) for result in results),
+                "runtime_traces": sum((result.metrics_json or {}).get("runtime_traces", 0) for result in results),
             },
             "strata": strata,
         }
@@ -349,12 +392,34 @@ class EvaluationService:
         candidate = self.report(session, run_id=candidate_run_id)
         if baseline["run"].suite_id != candidate["run"].suite_id:
             raise ValueError("evaluation runs must use the same frozen suite")
-        baseline_rate = float(baseline["metrics"]["success_rate"])
-        candidate_rate = float(candidate["metrics"]["success_rate"])
+        if baseline_run_id == candidate_run_id:
+            raise ValueError("evaluation comparison requires two different runs")
+        if baseline["run"].variant != "baseline" or candidate["run"].variant != "candidate":
+            raise ValueError("evaluation comparison requires baseline and candidate variants in that order")
+        baseline_items = {result.challenge_key: result for result in baseline["results"]}
+        candidate_items = {result.challenge_key: result for result in candidate["results"]}
+        paired_keys = sorted(
+            key for key in baseline_items.keys() & candidate_items.keys()
+            if not baseline_items[key].environment_error and not candidate_items[key].environment_error
+        )
+        excluded_keys = sorted((baseline_items.keys() | candidate_items.keys()) - set(paired_keys))
+        sample_size = len(paired_keys)
+        paired_baseline = [baseline_items[key] for key in paired_keys]
+        paired_candidate = [candidate_items[key] for key in paired_keys]
+        baseline_rate = sum(item.platform_completed for item in paired_baseline) / sample_size if sample_size else 0.0
+        candidate_rate = sum(item.platform_completed for item in paired_candidate) / sample_size if sample_size else 0.0
+
+        def total(items: list[EvaluationItemResult], metric: str) -> int:
+            return sum((item.metrics_json or {}).get(metric, 0) for item in items)
+
         improvement = (candidate_rate - baseline_rate) * 100
-        wrong_not_worse = candidate["metrics"]["wrong_submission_rate"] <= baseline["metrics"]["wrong_submission_rate"]
-        baseline_repeats = int(baseline["metrics"]["repeated_requests"])
-        candidate_repeats = int(candidate["metrics"]["repeated_requests"])
+        wrong_not_worse = total(paired_candidate, "wrong_submissions") <= total(paired_baseline, "wrong_submissions")
+        repeat_metric = "repeated_experiments" if paired_keys and all(
+            (item.metrics_json or {}).get("metrics_version", 0) >= 2
+            for item in [*paired_baseline, *paired_candidate]
+        ) else "repeated_requests"
+        baseline_repeats = total(paired_baseline, repeat_metric)
+        candidate_repeats = total(paired_candidate, repeat_metric)
         repeat_reduction = (
             (baseline_repeats - candidate_repeats) / baseline_repeats
             if baseline_repeats
@@ -362,12 +427,14 @@ class EvaluationService:
         )
         repeat_gate = candidate_repeats <= baseline_repeats if baseline_repeats == 0 else repeat_reduction >= 0.5
         quality_gates = (
-            candidate["metrics"]["derived_verification_coverage"] == 1.0
-            and candidate["metrics"]["terminal_checkpoint_coverage"] == 1.0
+            total(paired_candidate, "verified_derived_candidates") == total(paired_candidate, "derived_candidates")
+            and total(paired_candidate, "checkpointed_terminal_attempts") == total(paired_candidate, "terminal_attempts")
+            and total(paired_candidate, "usable_failed_routes") == total(paired_candidate, "failed_routes")
         )
-        sample_size = min(int(baseline["metrics"]["eligible"]), int(candidate["metrics"]["eligible"]))
-        promotion_eligible = sample_size >= 30
+        runs_completed = baseline["run"].status == candidate["run"].status == "COMPLETED"
+        promotion_eligible = sample_size >= 30 and runs_completed
         return EvaluationComparison(
+            repeated_request_metric=repeat_metric,
             baseline_run_id=baseline_run_id,
             candidate_run_id=candidate_run_id,
             baseline_success_rate=baseline_rate,
@@ -379,6 +446,9 @@ class EvaluationService:
             sample_size=sample_size,
             promotion_eligible=promotion_eligible,
             promoted=promotion_eligible and improvement >= 15.0 and wrong_not_worse and repeat_gate and quality_gates,
+            paired_challenge_keys=paired_keys,
+            excluded_challenge_keys=excluded_keys,
+            runs_completed=runs_completed,
         )
 
     @staticmethod

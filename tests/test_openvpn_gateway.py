@@ -166,6 +166,37 @@ def test_openvpn_timeout_without_server_reply_points_to_endpoint_or_udp() -> Non
     assert "UDP" in detail
 
 
+def test_openvpn_reports_platform_client_limit_without_blaming_credentials() -> None:
+    detail = OpenVPNGatewayRegistry._connection_failure_detail(
+        "VERIFY OK: depth=0, CN=vpn-server\n"
+        "AUTH: Received control message: AUTH_FAILED,Exceeded number of clients connecting to server\n",
+        75,
+    )
+    summary = detail.split("\n\n", 1)[0]
+    assert "connection limit" in summary
+    assert "password" not in summary
+    assert "AUTH_FAILED,Exceeded number of clients" in detail
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_gateway_disconnect_allows_exit_notification_before_removal(stop_fails) -> None:
+    class Gateway(FakeGateway):
+        def _run(self, args, *, timeout=15):
+            if args[0] == "stop" and stop_fails:
+                self.commands.append(args)
+                raise subprocess.TimeoutExpired(args, timeout)
+            return super()._run(args, timeout=timeout)
+
+    gateway = Gateway()
+    gateway.running = True
+    gateway._remove_container()
+
+    actions = [command[0] for command in gateway.commands]
+    assert "stop" in actions
+    assert actions.index("stop") < actions.index("rm")
+    assert not gateway.running
+
+
 def test_gateway_command_is_isolated_and_routes_only_selected_networks() -> None:
     gateway = FakeGateway()
     gateway._payload = {"ovpn": PROFILE.decode(), "username": "alice", "password": "vpn-secret"}

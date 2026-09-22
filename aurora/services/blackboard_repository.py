@@ -15,6 +15,17 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
+def normalize_fact_category(value: str) -> str:
+    category = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "vulnerability": "vuln", "vulnerability_confirmed": "vuln", "vulnerability_discovery": "vuln",
+        "credential_discovery": "credential", "credential_recovery": "credential", "credentials": "credential",
+        "authentication": "auth", "arbitrary_file_read": "file_read", "remote_code_execution": "rce",
+        "flag_discovery": "flag", "flag_evidence": "flag",
+    }
+    return aliases.get(category, category)
+
+
 def stable_json(value: Any) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -86,15 +97,18 @@ class BlackboardRepository:
         source_attempt_id: str | None = None,
     ) -> UpsertResult:
         normalized = normalize_text(statement)
+        category = normalize_fact_category(category)
         normalized_items = normalize_evidence_items(evidence_items)
         item_refs = [ref for item in normalized_items for ref in item["artifact_refs"]]
         all_refs = sorted(set((evidence_refs or []) + item_refs))
-        existing_facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE")).all()
+        existing_facts = session.exec(select(Fact).where(Fact.project_id == project_id, Fact.status == "ACTIVE").execution_options(populate_existing=True)).all()
         for fact in existing_facts:
             if normalize_text(fact.statement) == normalized:
                 merged_refs = sorted(set(fact.evidence_refs + all_refs))
+                merged_items = normalize_evidence_items((fact.evidence_items or []) + normalized_items)
+                changed = merged_refs != fact.evidence_refs or merged_items != fact.evidence_items or confidence > fact.confidence
                 fact.evidence_refs = merged_refs
-                fact.evidence_items = normalize_evidence_items((fact.evidence_items or []) + normalized_items)
+                fact.evidence_items = merged_items
                 fact.confidence = max(fact.confidence, confidence)
                 session.add(fact)
                 session.add(
@@ -109,6 +123,8 @@ class BlackboardRepository:
                 )
                 session.commit()
                 session.refresh(fact)
+                if changed:
+                    ProjectCoordinationService().record_graph_change(session, project_id=project_id)
                 return UpsertResult(fact, created=False)
 
         fact = Fact(

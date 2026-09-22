@@ -12,8 +12,10 @@ from pydantic import ValidationError
 from aurora.models import Attempt, AttemptCheckpoint, Fact, Intent, Project, ProjectRuntimePolicy, WorkerEvent
 from aurora.services.blackboard_repository import BlackboardRepository
 from aurora.services.intent_dsl import IntentDSL
-from aurora.services.mcp_registry import visible_mcp_tools
+from aurora.services.mcp_registry import scheduling_capabilities
+from aurora.services.deadlines import as_utc
 from aurora.services.project_coordination import ProjectCoordinationService
+from aurora.services.context_memory import select_context_memory
 
 
 class RoundReflectionService:
@@ -33,11 +35,8 @@ class RoundReflectionService:
         if existing is not None:
             return existing
         facts = session.exec(select(Fact).where(Fact.project_id == attempt.project_id, Fact.source_attempt_id == attempt.id)).all()
-        parent = session.exec(
-            select(AttemptCheckpoint)
-            .where(AttemptCheckpoint.project_id == attempt.project_id)
-            .order_by(AttemptCheckpoint.created_at.desc())
-        ).first()
+        memory = select_context_memory(session, project_id=attempt.project_id, intent=session.get(Intent, attempt.intent_id), attempt=attempt)
+        parent = next((checkpoint for checkpoint in memory.checkpoints if checkpoint.id in memory.pinned_checkpoint_ids), None)
         fallback = self._fallback(session=session, attempt=attempt, output=output, facts=facts, budget=budget)
         planned = None if skip_planner else self._planner_summary(fallback)
         data = planned or fallback
@@ -165,7 +164,7 @@ class RoundReflectionService:
             "summary": str(output.get("summary") or attempt.result_summary or "Solver round completed without a summary."),
             "conclusions": fact_lines[:8],
             "hypotheses": [self._text(item) for item in output.get("hypotheses", [])[:6]],
-            "failed_routes": [self._text(item) for item in output.get("failed_attempts", [])[:6]],
+            "failed_routes": list(dict.fromkeys(text for item in output.get("failed_attempts", [])[:10] if (text := self._text(item)))),
             "next_steps": list(dict.fromkeys([*self._next_steps(output), *blocker_steps]))[:6],
             "intents": output.get("suggested_intents", []) if isinstance(output.get("suggested_intents"), list) else [],
             "active_facts": [
@@ -200,6 +199,7 @@ class RoundReflectionService:
                 model=settings.model_for_role("reviewer"),
                 messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
                 timeout=settings.llm_timeout_seconds,
+                deadline_at=as_utc(fallback["budget"]["phase_deadline_at"]) if fallback.get("budget", {}).get("phase_deadline_at") else None,
             )
             content = body["choices"][0]["message"]["content"]
             result = json.loads(content)
@@ -230,7 +230,10 @@ class RoundReflectionService:
 
     @staticmethod
     def _text(value: Any) -> str:
-        return value.get("statement", "") if isinstance(value, dict) else str(value)
+        if isinstance(value, dict):
+            fields = ("statement", "approach", "experiment", "tool_name", "reason", "summary", "result", "observation", "stderr", "artifact_refs", "environment_id", "retryable")
+            return "; ".join(f"{key}: {value[key]}" for key in fields if value.get(key) not in (None, "", [], {}))[:2000]
+        return str(value).strip()[:2000] if value is not None else ""
 
     def _next_steps(self, output: dict[str, Any]) -> list[str]:
         decision = output.get("decision_summary") if isinstance(output.get("decision_summary"), dict) else {}
@@ -250,7 +253,7 @@ class RoundReflectionService:
         if project is None or project.status == "COMPLETED" or not isinstance(candidates, list):
             return []
         settings = get_settings()
-        allowed_capabilities = {tool["name"] for tool in visible_mcp_tools(settings, allow_subagents=False, contract=None)}
+        allowed_capabilities = scheduling_capabilities(settings)
         fact_ids = set(session.exec(select(Fact.id).where(Fact.project_id == attempt.project_id, Fact.status == "ACTIVE")).all())
         repository = BlackboardRepository()
         generated: list[str] = []
@@ -294,6 +297,7 @@ class RoundReflectionService:
                 continue
             dependency_fact_ids = [fact_id for fact_id in intent.depends_on_facts if fact_id in fact_ids]
             budget = self._intent_budget(raw_budget, intent.tool_request)
+            budget["continuation_attempt_id"] = attempt.id
             result = repository.upsert_intent(
                 session,
                 project_id=attempt.project_id,

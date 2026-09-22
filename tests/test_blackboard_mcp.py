@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 import urllib.error
+import pytest
 
 
 class _FastMCP:
@@ -73,3 +74,24 @@ def test_blackboard_control_retries_with_same_idempotency_key(monkeypatch) -> No
     assert calls[0][1] == 1
     assert calls[0][0] == calls[1][0] == calls[2][0]
     assert json.loads(calls[0][0])["request_id"]
+
+
+def test_blackboard_failure_preserves_evidence_and_marks_it_stale(monkeypatch, tmp_path) -> None:
+    module = _load_blackboard_server(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    snapshot = {"version": 7, "facts": [{"statement": "RCE reproduced", "evidence_refs": ["artifact_rce"]}], "stale": False}
+    monkeypatch.setattr(module, "_request", lambda _path: snapshot)
+    assert module.query() == snapshot
+
+    def unavailable(_path):
+        raise RuntimeError("control timeout")
+
+    monkeypatch.setattr(module, "_request", unavailable)
+    cached = module.query()
+    assert cached["version"] == 7
+    assert cached["facts"] == snapshot["facts"]
+    assert cached["stale"] is True
+    assert cached["sync_error"] == "control timeout"
+    (tmp_path / "runtime" / "blackboard.json").unlink()
+    with pytest.raises(RuntimeError, match="peer state is unknown"):
+        module.query()

@@ -22,7 +22,7 @@ class ProjectCoordinationService:
             session.refresh(state)
         return state
 
-    def record_graph_change(self, session: Session, *, project_id: str) -> int:
+    def record_graph_change(self, session: Session, *, project_id: str, commit: bool = True) -> int:
         self.ensure(session, project_id=project_id)
         session.exec(
             update(ProjectCoordinationState)
@@ -30,7 +30,10 @@ class ProjectCoordinationService:
             .values(graph_version=ProjectCoordinationState.graph_version + 1, updated_at=now_utc())
             .execution_options(synchronize_session=False)
         )
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
         state = self.ensure(session, project_id=project_id)
         session.refresh(state)
         return state.graph_version
